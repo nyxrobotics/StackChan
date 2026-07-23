@@ -414,4 +414,66 @@ private:
     std::unique_ptr<FactoryResetWorker> _worker_reset;
 };
 
+// ---------------------------------------------------------------------------
+// ConversationModeWorker
+// ---------------------------------------------------------------------------
+class ConversationModeWorker : public WorkerBase {
+public:
+    ConversationModeWorker();
+    ~ConversationModeWorker();
+    void update() override;
+
+private:
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_title;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_modes;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_auto;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_local;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_online;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_confirm;
+
+    int _selected = 0;  // 0=Auto 1=LocalOnly 2=OnlineOnly
+    bool _confirm_flag = false;
+
+    void update_button_styles();
+};
+
+// ModuleLLMSettingsWorker
+// ---------------------------------------------------------------------------
+class ModuleLLMSettingsWorker : public WorkerBase {
+public:
+    ModuleLLMSettingsWorker();
+    ~ModuleLLMSettingsWorker();
+    void update() override;
+
+private:
+    void update_lang_buttons();
+
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_title;
+
+    // Thinking toggle
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_thinking;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_thinking;
+    std::unique_ptr<uitk::lvgl_cpp::Switch>    _switch_thinking;
+
+    // VAD toggle
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_vad;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_vad;
+    std::unique_ptr<uitk::lvgl_cpp::Switch>    _switch_vad;
+
+    // TTS Language selection
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_lang;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_ja;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_zh;
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_en;
+
+    std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_confirm;
+
+    bool    _thinking     = false;
+    bool    _vad          = true;
+    uint8_t _tts_lang     = 0;  // 0=ja 1=zh 2=en
+    bool    _confirm_flag = false;
+};
+
 }  // namespace setup_workers

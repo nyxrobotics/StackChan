@@ -83,6 +83,21 @@ void AppSetup::onOpen()
                   _destroy_menu    = true;
                   _need_warm_reset = true;
                   _worker          = std::make_unique<XiaozhiPowerSavingWorker>();
+              }},
+             {"LLM Mode",
+              [&]() {
+                  _destroy_menu    = true;
+                  _need_warm_reset = true;
+                  _worker          = std::make_unique<ConversationModeWorker>();
+              }}},
+        },
+        {
+            "Module LLM",
+            {{"Settings",
+              [&]() {
+                  _destroy_menu    = true;
+                  _need_warm_reset = true;
+                  _worker          = std::make_unique<ModuleLLMSettingsWorker>();
               }}},
         },
         {
@@ -119,12 +134,7 @@ void AppSetup::onOpen()
                          _worker       = std::make_unique<FwVersionWorker>();
                      }
                  }},
-                {"Check for Updates",
-                 [&]() {
-                     _destroy_menu    = true;
-                     _need_warm_reset = true;
-                     _worker          = std::make_unique<SystemUpdateWorker>();
-                 }},
+                // {"Check for Updates", ...}  // firmware update disabled
                 //  {"Factory Reset",
                 //   [&]() {
                 //       _destroy_menu = true;
