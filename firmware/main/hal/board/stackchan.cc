@@ -19,6 +19,8 @@
 #include <algorithm>
 #include "stackchan_camera.h"
 #include "hal_bridge.h"
+#include "hal_bridge_conv.h"  // [ADD] ConversationManager イベントブリッジ
+#include <lvgl.h>
 
 #define TAG "M5Stack-StackChan-Board"
 
@@ -116,13 +118,42 @@ public:
 
     bool IsExternalPowerConnected()
     {
-        const uint8_t power_status      = ReadReg(0x01);
+        uint8_t power_status = 0;
+        esp_err_t err = i2c_master_transmit_receive(i2c_device_, (uint8_t[]){0x01}, 1, &power_status, 1, 100);
+        if (err != ESP_OK) {
+            return true;  // I2C error: assume plugged in to avoid unsafe shutdown
+        }
         const uint8_t current_direction = (power_status & 0b01100000) >> 5;
         const bool is_charging_done     = (power_status & 0b00000111) == 0b00000100;
-
-        // Treat any non-discharging state as externally powered so a plugged-in cable
-        // still counts even after the battery is full.
         return current_direction != 2 || is_charging_done;
+    }
+
+    int GetBatteryCurrentDirectionSafe()
+    {
+        uint8_t val = 0;
+        if (i2c_master_transmit_receive(i2c_device_, (uint8_t[]){0x01}, 1, &val, 1, 100) != ESP_OK) {
+            return -1;
+        }
+        return (val & 0b01100000) >> 5;
+    }
+
+    bool IsCharging()
+    {
+        return GetBatteryCurrentDirectionSafe() == 1;
+    }
+
+    bool IsDischarging()
+    {
+        return GetBatteryCurrentDirectionSafe() == 2;
+    }
+
+    int GetBatteryLevel()
+    {
+        uint8_t val = 0;
+        if (i2c_master_transmit_receive(i2c_device_, (uint8_t[]){0xA4}, 1, &val, 1, 100) != ESP_OK) {
+            return -1;
+        }
+        return val;
     }
 };
 
@@ -188,6 +219,11 @@ public:
         uint8_t chip_id = ReadReg(0xA3);
         ESP_LOGI(TAG, "Get chip ID: 0x%02X", chip_id);
         read_buffer_ = new uint8_t[6];
+    }
+
+    // ESP_ERROR_CHECK せずエラーコードを返す版（切断検知用）
+    esp_err_t TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms = 10) {
+        return i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, timeout_ms);
     }
 
     ~Ft6336()
@@ -366,9 +402,18 @@ private:
             return;
         }
         auto& touch_point = ft6336_->GetTouchPoint();
-
-        // Update hal touch point
         hal_bridge::set_touch_point(touch_point.num, touch_point.x, touch_point.y);
+
+        // [ADD] TTS 再生中のタッチで中断（立ち上がりエッジのみ、下端スワイプは除外）
+        static bool lastTouched = false;
+        bool touching = (touch_point.num > 0);
+        // 画面下端 1/4 はホームスワイプ領域のため abort しない
+        int screen_h = (int)lv_display_get_vertical_resolution(lv_display_get_default());
+        bool isBottomSwipe = (touch_point.num > 0 && touch_point.y > screen_h * 3 / 4);
+        if (touching && !lastTouched && !isBottomSwipe && hal_bridge::is_local_tts_active()) {
+            hal_bridge::notify_local_abort();
+        }
+        lastTouched = touching;
     }
 
     void InitializeFt6336TouchPad()
@@ -556,6 +601,24 @@ public:
     {
         return i2c_bus_;
     }
+
+    // [ADD] ネットワークイベントを ConversationManager にも転送する。
+    // Application が SetNetworkEventCallback() でコールバックを登録してくるので、
+    // それをラップして hal_bridge_conv の notify_* も併せて呼ぶ。
+    void SetNetworkEventCallback(std::function<void(NetworkEvent, const std::string&)> cb) override
+    {
+        WifiBoard::SetNetworkEventCallback([cb](NetworkEvent event, const std::string& data) {
+            // 元の Application コールバックを先に呼ぶ（既存動作を維持）
+            cb(event, data);
+
+            // ConversationManager へ転送
+            if (event == NetworkEvent::Connected) {
+                hal_bridge::notify_xiaozhi_connected();   // Wi-Fi 接続 = Xiaozhi 接続可能とみなす
+            } else if (event == NetworkEvent::Disconnected) {
+                hal_bridge::notify_xiaozhi_disconnected(); // Wi-Fi 断 = Xiaozhi 断
+            }
+        });
+    }
 };
 
 DECLARE_BOARD(M5StackCoreS3Board);
@@ -654,3 +717,22 @@ void hal_bridge::toggle_xiaozhi_chat_state()
     }
     app.ToggleChatState();
 }
+
+// ---------------------------------------------------------------------------
+// [ADD] application.cc に追加が必要なフック（このファイルでは不要）
+//
+// notify_xiaozhi_connected / notify_xiaozhi_disconnected は上の
+// SetNetworkEventCallback ラッパーから呼ばれる。
+//
+// 残り3つ (error / turn_start / turn_end) は application.cc の
+// 該当箇所に以下を追記する:
+//
+//   [InitializeProtocol — OnNetworkError コールバック内]
+//       hal_bridge::notify_xiaozhi_error();
+//
+//   [HandleStateChangedEvent — case kDeviceStateListening:]
+//       hal_bridge::notify_turn_start();
+//
+//   [HandleStateChangedEvent — case kDeviceStateIdle:]
+//       hal_bridge::notify_turn_end();
+// ---------------------------------------------------------------------------

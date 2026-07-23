@@ -63,4 +63,9 @@ uint8_t board_get_speaker_volume();
 
 void app_play_sound(const std::string_view& sound);
 
+// [ADD] Output raw 16-bit PCM to speaker (used by Module LLM TTS playback).
+// pcm    : pointer to int16_t samples
+// samples: number of int16_t samples (not bytes)
+void app_output_pcm(const int16_t* pcm, size_t samples);
+
 }  // namespace hal_bridge

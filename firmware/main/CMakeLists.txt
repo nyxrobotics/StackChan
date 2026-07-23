@@ -14,9 +14,15 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
     "stackchan/*.c"
     "stackchan/*.cc"
     "stackchan/*.cpp"
+    # [ADD] Hybrid conversation backend (Xiaozhi + Module LLM local fallback)
+    "conversation/*.c"
+    "conversation/*.cc"
+    "conversation/*.cpp"
 )
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
+    "conversation"   # [ADD] conversation_manager.h / module_llm_client.h etc.
+    "hal"            # [ADD] hal_bridge_conv.h
 )
 list(APPEND STACK_CHAN_SOURCES main.cpp)
 
@@ -316,6 +322,9 @@ idf_component_register(SRCS ${SOURCES}
                         mooncake
                         mooncake_log
                         smooth_ui_toolkit
+                        nvs_flash         # [ADD] AgentConfigStore (NVS キャッシュ)
+                        esp_http_client   # [ADD] AgentConfigProvider (HTTP GET)
+                        json              # [ADD] cJSON (StackFlow JSON-RPC / AgentConfig パース)
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME

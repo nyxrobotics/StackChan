@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal.h"
+#include "application.h"       // IsNetworkRequired
 #include <stackchan/stackchan.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
@@ -28,6 +29,12 @@ static void time_sync_notification_cb(struct timeval* tv)
 
 void Hal::startSntp()
 {
+    // Wi-Fi が無効な場合（LocalOnly モード等）は lwIP が未初期化なので SNTP をスキップする
+    if (!Application::GetInstance().IsNetworkRequired()) {
+        mclog::tagInfo(_tag, "SNTP skipped (network not required)");
+        return;
+    }
+
     mclog::tagInfo(_tag, "SNTP init");
 
     if (esp_sntp_enabled()) {

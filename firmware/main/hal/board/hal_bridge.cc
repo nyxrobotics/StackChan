@@ -147,4 +147,15 @@ void app_play_sound(const std::string_view& sound)
     app.PlaySound(sound);
 }
 
+void app_output_pcm(const int16_t* pcm, size_t samples)
+{
+    auto& board = Board::GetInstance();
+    auto* codec  = board.GetAudioCodec();
+    if (!codec || samples == 0) return;
+
+    // OutputData takes a non-const vector<int16_t> by reference
+    std::vector<int16_t> buf(pcm, pcm + samples);
+    codec->OutputData(buf);
+}
+
 }  // namespace hal_bridge

@@ -46,7 +46,14 @@ CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rat
     aw88298_cfg.hw_gain.pa_voltage = 5.0;
     aw88298_cfg.hw_gain.codec_dac_voltage = 3.3;
     aw88298_cfg.hw_gain.pa_gain = 1;
-    out_codec_if_ = aw88298_codec_new(&aw88298_cfg);
+
+    // Retry AW88298 init in case FT6336 I2C timer caused bus contention
+    for (int retry = 0; retry < 5; retry++) {
+        out_codec_if_ = aw88298_codec_new(&aw88298_cfg);
+        if (out_codec_if_ != NULL) break;
+        ESP_LOGW(TAG, "AW88298 init failed (attempt %d/5), retrying...", retry + 1);
+        esp_rom_delay_us(20000);  // 20ms
+    }
     assert(out_codec_if_ != NULL);
 
     esp_codec_dev_cfg_t dev_cfg = {
