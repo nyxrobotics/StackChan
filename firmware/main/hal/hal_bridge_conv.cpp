@@ -34,45 +34,77 @@ int get_conversation_mode() {
 }
 
 void notify_xiaozhi_connected() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onXiaozhiConnected) s_cbs.onXiaozhiConnected();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onXiaozhiConnected;
+    }
+    if (cb) cb();
 }
 
 void notify_xiaozhi_disconnected() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onXiaozhiDisconnected) s_cbs.onXiaozhiDisconnected();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onXiaozhiDisconnected;
+    }
+    if (cb) cb();
 }
 
 void notify_xiaozhi_error() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onXiaozhiError) s_cbs.onXiaozhiError();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onXiaozhiError;
+    }
+    if (cb) cb();
 }
 
 void notify_turn_start() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onTurnStart) s_cbs.onTurnStart();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onTurnStart;
+    }
+    if (cb) cb();
 }
 
 void notify_turn_end() {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onTurnEnd) s_cbs.onTurnEnd();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onTurnEnd;
+    }
+    if (cb) cb();
 }
 
 void notify_audio_chunk(const uint8_t* pcm, size_t len) {
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onAudioChunk) s_cbs.onAudioChunk(pcm, len);
+    std::function<void(const uint8_t*, size_t)> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onAudioChunk;
+    }
+    if (cb) cb(pcm, len);
 }
 
 void notify_local_tts_start() {
     s_localTtsActive.store(true);
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onLocalTtsStart) s_cbs.onLocalTtsStart();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onLocalTtsStart;
+    }
+    if (cb) cb();
 }
 
 void notify_local_tts_end() {
     s_localTtsActive.store(false);
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onLocalTtsEnd) s_cbs.onLocalTtsEnd();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onLocalTtsEnd;
+    }
+    if (cb) cb();
 }
 
 bool is_local_tts_active() {
@@ -88,9 +120,12 @@ bool is_conv_ready() {
 }
 
 void notify_local_abort() {
-    s_localTtsActive.store(false);
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (s_cbs.onLocalAbort) s_cbs.onLocalAbort();
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onLocalAbort;
+    }
+    if (cb) cb();
 }
 
 } // namespace hal_bridge

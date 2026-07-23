@@ -136,14 +136,19 @@ void AppAiAgent::onOpen()
     });
 
     // 顔を先に表示（ActivationTask が is_conv_ready() を待つ間 kDeviceStateActivating）
+    hal_bridge::set_conv_ready(false);
     GetHAL().requestXiaozhiStart();
 
     // モデル読み込みはバックグラウンドタスクで実行
-    xTaskCreate([](void*) {
+    BaseType_t created = xTaskCreate([](void*) {
         if (s_conv) s_conv->start();
         hal_bridge::set_conv_ready(true);  // ActivationTask のブロック解除 → popup 再生
         vTaskDelete(nullptr);
     }, "conv_start", 32768, nullptr, 5, nullptr);
+    if (created != pdPASS) {
+        mclog::tagError(getAppInfo().name, "failed to create conv_start task");
+        hal_bridge::set_conv_ready(true);
+    }
 }
 
 // Called repeatedly while the App is running
