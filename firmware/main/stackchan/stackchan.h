@@ -57,13 +57,39 @@ public:
     }
 
     /**
-     * @brief Get motion instance
+     * @brief Get motion instance.
      *
-     * @return motion::Motion&
+     * Always returns a valid reference. Motion is attached at boot even when
+     * no servos are detected (the instance becomes a no-op in that case).
      */
     motion::Motion& motion() override
     {
         return *_motion;
+    }
+
+    /**
+     * @brief Returns true when at least one servo axis is physically present.
+     */
+    bool hasMotion() const
+    {
+        if (!_motion) return false;
+        return _motion->hasYaw() || _motion->hasPitch();
+    }
+
+    /**
+     * @brief Returns true when the yaw servo is physically present.
+     */
+    bool hasYawServo() const
+    {
+        return _motion && _motion->hasYaw();
+    }
+
+    /**
+     * @brief Returns true when the pitch servo is physically present.
+     */
+    bool hasPitchServo() const
+    {
+        return _motion && _motion->hasPitch();
     }
 
     /**

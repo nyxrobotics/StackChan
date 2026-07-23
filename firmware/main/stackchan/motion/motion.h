@@ -17,8 +17,16 @@ namespace stackchan::motion {
  */
 class Motion {
 public:
+    /**
+     * @brief Construct Motion.  Either or both servo pointers may be nullptr
+     *        when the corresponding axis is not physically present.
+     *        Methods for absent axes become no-ops automatically.
+     */
     Motion(std::unique_ptr<Servo> yawServo, std::unique_ptr<Servo> pitchServo)
-        : _yaw_servo(std::move(yawServo)), _pitch_servo(std::move(pitchServo))
+        : _yaw_servo(std::move(yawServo))
+        , _pitch_servo(std::move(pitchServo))
+        , _hasYaw(_yaw_servo != nullptr)
+        , _hasPitch(_pitch_servo != nullptr)
     {
     }
 
@@ -159,10 +167,23 @@ public:
     void setModifyLock(bool locked);
     bool isModifyLocked();
 
+    // ── Capability accessors (§6.4.2) ────────────────────────────────────────
+    /** Returns true when a physical yaw servo was found at boot. */
+    bool hasYaw() const { return _hasYaw; }
+    /** Returns true when a physical pitch servo was found at boot. */
+    bool hasPitch() const { return _hasPitch; }
+
 private:
     std::unique_ptr<Servo> _yaw_servo;
     std::unique_ptr<Servo> _pitch_servo;
+    bool _hasYaw        = false;
+    bool _hasPitch      = false;
     bool _is_modify_locked = false;
+
+    // Cached "last commanded" angles – returned by getCurrent*Angle() when
+    // the corresponding servo is absent, so avatar animations stay coherent.
+    int _last_yaw_target   = 0;
+    int _last_pitch_target = 0;
 
     static constexpr float RAD_TO_DEG = 180.0f / M_PI;
 

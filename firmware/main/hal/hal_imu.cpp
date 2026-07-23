@@ -22,7 +22,6 @@ static void _imu_task(void* param)
     while (1) {
         if (_bmi270 && _bmi270->update()) {
             auto& data = _bmi270->getData();
-            // mclog::debug("IMU Accel: {:.2f}\t{:.2f}\t{:.2f}", data.accel_x, data.accel_y, data.accel_z);
 
             motion_detector->update(data.accel_x, data.accel_y, data.accel_z);
 
@@ -30,29 +29,76 @@ static void _imu_task(void* param)
                 mclog::tagInfo(_tag, "Shake Detected!");
                 GetHAL().onImuMotionEvent.emit(ImuMotionEvent::Shake);
             }
-            // if (motion_detector->isPickUpDetected()) {
-            //     mclog::tagInfo(_tag, "Pick Up Detected!");
-            //     GetHAL().onImuMotionEvent.emit(ImuMotionEvent::PickUp);
-            // }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-void Hal::imu_init()
+// ---------------------------------------------------------------------------
+// Hal::imu_init_impl – returns true if BMI270 was found and initialised
+// ---------------------------------------------------------------------------
+bool Hal::imu_init_impl()
 {
-    mclog::tagInfo(_tag, "init");
-
     auto i2c_bus = hal_bridge::board_get_i2c_bus();
+    _bmi270      = std::make_unique<BMI270>(i2c_bus, 0x69);
 
-    _bmi270 = std::make_unique<BMI270>(i2c_bus, 0x69);
     if (!_bmi270->begin()) {
         _bmi270.reset();
-        mclog::tagError(_tag, "BMI270 init failed");
-        return;
+        mclog::tagWarn(_tag, "BMI270 init failed");
+        return false;
     }
-    mclog::tagInfo(_tag, "BMI270 init ok");
 
-    // xTaskCreateWithCaps(_imu_task, "imu", 4096, NULL, 2, NULL, MALLOC_CAP_SPIRAM);
+    mclog::tagInfo(_tag, "BMI270 init ok");
     xTaskCreatePinnedToCoreWithCaps(_imu_task, "imu", 4096, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Hal::initI2cSensors – dispatcher for IMU / RTC / HeadTouch (§6.6-6.5)
+// ---------------------------------------------------------------------------
+void Hal::initI2cSensors()
+{
+    mclog::tagInfo(_tag, "initI2cSensors");
+
+    // ── IMU ──────────────────────────────────────────────────────────────────
+    if (_registry.isAvailable(DeviceCapability::Imu)) {
+        bool ok = imu_init_impl();
+        if (!ok) {
+            _registry.set(DeviceCapability::Imu, false);
+            _registry.setUnavailableReason(DeviceCapability::Imu, "BMI270 begin failed");
+        }
+        // If ok, leave as Available (already set during force_disabled pass)
+        // But we need to explicitly set it Available if it wasn't pre-set:
+        if (ok) {
+            _registry.set(DeviceCapability::Imu, true);
+        }
+    } else {
+        mclog::tagInfo(_tag, "IMU skipped (force-disabled)");
+    }
+
+    // ── RTC ──────────────────────────────────────────────────────────────────
+    if (_registry.isAvailable(DeviceCapability::Rtc)) {
+        bool ok = rtc_init_impl();
+        if (ok) {
+            _registry.set(DeviceCapability::Rtc, true);
+        } else {
+            _registry.set(DeviceCapability::Rtc, false);
+            _registry.setUnavailableReason(DeviceCapability::Rtc, "PCF8563 begin failed");
+        }
+    } else {
+        mclog::tagInfo(_tag, "RTC skipped (force-disabled)");
+    }
+
+    // ── Head Touch ───────────────────────────────────────────────────────────
+    if (_registry.isAvailable(DeviceCapability::HeadTouch)) {
+        bool ok = head_touch_init_impl();
+        if (ok) {
+            _registry.set(DeviceCapability::HeadTouch, true);
+        } else {
+            _registry.set(DeviceCapability::HeadTouch, false);
+            _registry.setUnavailableReason(DeviceCapability::HeadTouch, "SI12T init failed");
+        }
+    } else {
+        mclog::tagInfo(_tag, "HeadTouch skipped (force-disabled)");
+    }
 }

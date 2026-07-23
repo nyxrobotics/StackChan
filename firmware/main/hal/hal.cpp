@@ -7,6 +7,7 @@
 #include <memory>
 #include <mooncake_log.h>
 #include <nvs_flash.h>
+#include <nvs.h>
 
 static std::unique_ptr<Hal> _hal_instance;
 static const std::string_view _tag = "HAL";
@@ -24,7 +25,24 @@ void Hal::init()
 {
     mclog::tagInfo(_tag, "init");
 
-    // Initialize NVS
+    initCoreSystem();           // NVS + board bridge + force_disabled
+    initIoExpander();           // IO Expander → ServoPower / RgbLed
+    initPowerRails();           // Servo 5V rail (if ServoPower available)
+    initI2cSensors();           // IMU / RTC / HeadTouch
+    initServos();               // UART probe + per-axis detection
+    initCommunicationServices();// Wi-Fi / BLE / ESP-NOW / OTA
+    printCapabilitySummary();   // Log capability table
+    lvgl_init();                // Display / LVGL (required – after board init)
+}
+
+// ---------------------------------------------------------------------------
+// initCoreSystem
+// ---------------------------------------------------------------------------
+void Hal::initCoreSystem()
+{
+    mclog::tagInfo(_tag, "initCoreSystem");
+
+    // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -32,14 +50,83 @@ void Hal::init()
     }
     ESP_ERROR_CHECK(ret);
 
+    // Board / Xiaozhi bridge (also initialises I2C, Display, Audio)
     xiaozhi_board_init();
     xiaozhi_mcp_init();
-    head_touch_init();
-    io_expander_init();
-    rtc_init();
-    imu_init();
-    servo_init();
-    lvgl_init();
+
+    // Register required devices as Available
+    _registry.set(DeviceCapability::Display,    true);
+    _registry.set(DeviceCapability::Microphone, true);
+    _registry.set(DeviceCapability::Speaker,    true);
+
+    // Read NVS force_disabled table (§6.2, §9.2)
+    // A key set to 1 means the capability is pre-registered as Unavailable
+    // and its probe step will be skipped.
+    static const struct {
+        const char* key;
+        DeviceCapability cap;
+    } kForceDisabledKeys[] = {
+        { "cap_fd_servo_yaw",   DeviceCapability::ServoYaw   },
+        { "cap_fd_servo_pitch", DeviceCapability::ServoPitch  },
+        { "cap_fd_rgb",         DeviceCapability::RgbLed      },
+        { "cap_fd_head_touch",  DeviceCapability::HeadTouch   },
+        { "cap_fd_imu",         DeviceCapability::Imu         },
+        { "cap_fd_rtc",         DeviceCapability::Rtc         },
+        { "cap_fd_camera",      DeviceCapability::Camera      },
+        { "cap_fd_ir_tx",       DeviceCapability::IrTx        },
+        { "cap_fd_ir_rx",       DeviceCapability::IrRx        },
+        { "cap_fd_nfc",         DeviceCapability::Nfc         },
+    };
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open("cap_config", NVS_READONLY, &nvs_handle) == ESP_OK) {
+        for (auto& entry : kForceDisabledKeys) {
+            uint8_t disabled = 0;
+            if (nvs_get_u8(nvs_handle, entry.key, &disabled) == ESP_OK && disabled) {
+                _registry.set(entry.cap, false);
+                _registry.setUnavailableReason(entry.cap, "disabled by config");
+                mclog::tagInfo(_tag, "force_disabled: {}", entry.key);
+            }
+        }
+        nvs_close(nvs_handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initPowerRails
+// ---------------------------------------------------------------------------
+void Hal::initPowerRails()
+{
+    mclog::tagInfo(_tag, "initPowerRails");
+    if (hasCapability(DeviceCapability::ServoPower)) {
+        setServoPowerEnabled(true);
+        delay(200);  // Allow servo PSU to stabilise
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initCommunicationServices  (Wi-Fi / BLE / ESP-NOW / OTA)
+// ---------------------------------------------------------------------------
+void Hal::initCommunicationServices()
+{
+    // Communication subsystems are initialised lazily by startNetwork(),
+    // startBleServer(), startEspNow() etc.  We mark them provisionally
+    // Available here; each start*() call handles double-init gracefully.
+    _registry.set(DeviceCapability::Wifi,   true);
+    _registry.set(DeviceCapability::Ble,    true);
+    _registry.set(DeviceCapability::EspNow, true);
+    _registry.set(DeviceCapability::Ota,    true);
+
+    // Lock registry – no more writes allowed after this point.
+    _registry.lock();
+}
+
+// ---------------------------------------------------------------------------
+// printCapabilitySummary
+// ---------------------------------------------------------------------------
+void Hal::printCapabilitySummary()
+{
+    _registry.printSummary();
 }
 
 /* -------------------------------------------------------------------------- */

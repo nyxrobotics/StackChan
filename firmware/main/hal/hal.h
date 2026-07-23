@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #pragma once
+#include "device_capability.h"
 #include <memory>
 #include <cstdint>
 #include <string>
@@ -169,6 +170,18 @@ class Hal {
 public:
     void init();
 
+    /* ----------------------------- Device Capability -------------------------- */
+    /**
+     * @brief Query device capability (HAL / StackChan internal use only).
+     *
+     * Application code must NOT call this directly; capability absorption is
+     * handled inside HAL / StackChan so apps remain unaware of partial configs.
+     */
+    bool hasCapability(DeviceCapability cap) const
+    {
+        return _registry.isAvailable(cap);
+    }
+
     /* --------------------------------- System --------------------------------- */
     void delay(std::uint32_t ms);
     std::uint32_t millis();
@@ -286,17 +299,34 @@ public:
     uint8_t getSpeakerVolume();
 
 private:
+    void ble_init(bool useAltUuid);
     bool _xiaozhi_start_requested = false;
 
+    // ── Device Capability Registry ──────────────────────────────────────────
+    // Written only during staged init; read-only after initCommunicationServices().
+    DeviceRegistry _registry;
+
+    // ── Staged Initialisation (§6.1) ────────────────────────────────────────
+    void initCoreSystem();            // NVS, board/bridge, force_disabled NVS read
+    void initDisplay();               // Display / LVGL / touch (required)
+    void initAudio();                 // Microphone / Speaker (required)
+    void initIoExpander();            // IO Expander → ServoPower / RgbLed capability
+    void initPowerRails();            // ServoPower on if Available
+    void initI2cSensors();            // IMU / RTC / HeadTouch
+    void initServos();                // UART probe + per-axis detection
+    void initCommunicationServices(); // Wi-Fi / BLE / ESP-NOW / OTA
+    void printCapabilitySummary();    // Log capability table
+
+    // ── Internal helpers ─────────────────────────────────────────────────────
     void xiaozhi_board_init();
-    void lvgl_init();
     void xiaozhi_mcp_init();
-    void ble_init(bool useAltUuid);
-    void servo_init();
-    void head_touch_init();
-    void io_expander_init();
-    void imu_init();
-    void rtc_init();
+    void lvgl_init();
+
+    // Per-device init helpers called by initI2cSensors() and initServos().
+    // Each returns true on success.
+    bool imu_init_impl();
+    bool rtc_init_impl();
+    bool head_touch_init_impl();
 };
 
 Hal& GetHAL();

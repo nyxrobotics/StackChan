@@ -144,7 +144,7 @@ static void _head_touch_update_task(void* param)
     }
 }
 
-void Hal::head_touch_init()
+bool Hal::head_touch_init_impl()
 {
     mclog::tagInfo(_tag, "init");
 
@@ -154,11 +154,26 @@ void Hal::head_touch_init()
         .i2c_bus  = i2c_bus,
         .dev_addr = SI12T_GND_ADDRESS,
     };
-    static si12t_handle_t si12t;
-    si12t_init(&si12t_cfg, &si12t);
-    si12t_setup(si12t, SI12T_TYPE_LOW, SI12T_SENSITIVITY_LEVEL_3);
 
-    // xTaskCreateWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, MALLOC_CAP_SPIRAM);
+    // Allocate handle on heap so it survives after this function returns
+    static si12t_handle_t si12t = nullptr;
+
+    esp_err_t err = si12t_init(&si12t_cfg, &si12t);
+    if (err != ESP_OK) {
+        mclog::tagWarn(_tag, "SI12T init failed (err={})", static_cast<int>(err));
+        return false;
+    }
+
+    err = si12t_setup(si12t, SI12T_TYPE_LOW, SI12T_SENSITIVITY_LEVEL_3);
+    if (err != ESP_OK) {
+        mclog::tagWarn(_tag, "SI12T setup failed (err={})", static_cast<int>(err));
+        return false;
+    }
+
+    // Start update task only when hardware is confirmed present
     xTaskCreatePinnedToCoreWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, 1,
                                     MALLOC_CAP_SPIRAM);
+
+    mclog::tagInfo(_tag, "SI12T init ok, update task started");
+    return true;
 }

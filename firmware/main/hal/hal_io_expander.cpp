@@ -13,9 +13,17 @@ static const std::string_view _tag = "HAL-IOE";
 
 static std::unique_ptr<m5::PY32IOExpander_Class> _io_expander;
 
-void Hal::io_expander_init()
+void Hal::initIoExpander()
 {
     mclog::tagInfo(_tag, "init");
+
+    // Skip if force_disabled by config
+    if (!_registry.isAvailable(DeviceCapability::ServoPower) &&
+        !_registry.isAvailable(DeviceCapability::RgbLed)) {
+        // Both were already pre-registered Unavailable by force_disabled
+        mclog::tagInfo(_tag, "IO Expander skipped (both ServoPower and RgbLed force-disabled)");
+        return;
+    }
 
     auto i2c_bus        = hal_bridge::board_get_i2c_bus();
     _io_expander        = std::make_unique<m5::PY32IOExpander_Class>(i2c_bus);
@@ -41,8 +49,7 @@ void Hal::io_expander_init()
         // VM EN
         _io_expander->setDirection(0, true);  // Output
         _io_expander->setPullMode(0, true);   // Pull-up
-        GetHAL().setServoPowerEnabled(true);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        // Power rail is turned on by initPowerRails() – not here
 
         // RGB
         _io_expander->setDirection(13, true);   // Output
@@ -54,7 +61,18 @@ void Hal::io_expander_init()
         vTaskDelay(pdMS_TO_TICKS(50));
         GetHAL().showRgbColor(0, 0, 0);
 
+        // Register capabilities
+        _registry.set(DeviceCapability::ServoPower, true);
+        _registry.set(DeviceCapability::RgbLed,     true);
+
         mclog::tagInfo(_tag, "init done");
+    } else {
+        // IO Expander absent: servo power control and RGB unavailable
+        _registry.set(DeviceCapability::ServoPower, false);
+        _registry.set(DeviceCapability::RgbLed,     false);
+        _registry.setUnavailableReason(DeviceCapability::ServoPower, "IO expander not found");
+        _registry.setUnavailableReason(DeviceCapability::RgbLed,     "IO expander not found");
+        mclog::tagWarn(_tag, "IO Expander not found – ServoPower and RgbLed unavailable");
     }
 }
 

@@ -17,7 +17,7 @@ static const std::string_view _tag = "HAL-RTC";
 
 static std::unique_ptr<m5::PCF8563_Class> _pcf8563;
 
-void Hal::rtc_init()
+bool Hal::rtc_init_impl()
 {
     mclog::tagInfo(_tag, "init");
 
@@ -26,8 +26,8 @@ void Hal::rtc_init()
     _pcf8563 = std::make_unique<m5::PCF8563_Class>(i2c_bus);
     if (!_pcf8563->begin()) {
         _pcf8563.reset();
-        mclog::tagError(_tag, "PCF8563 init failed");
-        return;
+        mclog::tagWarn(_tag, "PCF8563 init failed – using system time only");
+        return false;
     }
     mclog::tagInfo(_tag, "PCF8563 init ok");
 
@@ -38,6 +38,7 @@ void Hal::rtc_init()
     mclog::tagInfo(_tag, "load timezone from nvs: {}", tz);
 
     syncRtcTimeToSystem();
+    return true;
 }
 
 void Hal::syncRtcTimeToSystem()
