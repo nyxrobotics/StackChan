@@ -40,6 +40,21 @@ using namespace smooth_ui_toolkit::lvgl_cpp;
 // [ADD] Module-level ConversationManager (lives for the lifetime of the app)
 static ConversationManager* s_conv = nullptr;
 
+static void setLocalResponseState(DeviceState target, const char* phase)
+{
+    auto& app = Application::GetInstance();
+    DeviceState before = app.GetDeviceState();
+    if (before == target) {
+        mclog::tagInfo("AI.AGENT", "local response {}: already state={}", phase, static_cast<int>(target));
+        return;
+    }
+
+    bool ok = app.SetDeviceState(target);
+    mclog::tagInfo("AI.AGENT", "local response {}: state {} -> {} {}",
+                   phase, static_cast<int>(before), static_cast<int>(target),
+                   ok ? "ok" : "rejected");
+}
+
 AppAiAgent::AppAiAgent()
 {
     // Configure App name
@@ -111,20 +126,17 @@ void AppAiAgent::onOpen()
                 s_conv->processAudio(pcm, len);
             }
         },
-        // [ADD] Local mode: TTS 開始 → Speaking アニメ開始（口パク）
+        // [ADD] Local mode: response generation start -> speaking animation.
+        // This is intentionally earlier than audio playback, matching cloud mode.
         .onLocalTtsStart = []() {
-            Application::GetInstance().Schedule([]() {
-                Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
-            });
+            setLocalResponseState(kDeviceStateSpeaking, "start");
         },
-        // [ADD] Local mode: TTS 終了 → Listening 状態に戻す
+        // [ADD] Local mode: response generation/playback end -> Listening state.
         .onLocalTtsEnd = []() {
-            Application::GetInstance().Schedule([]() {
-                auto state = Application::GetInstance().GetDeviceState();
-                if (state == kDeviceStateSpeaking) {
-                    Application::GetInstance().SetDeviceState(kDeviceStateListening);
-                }
-            });
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state == kDeviceStateSpeaking) {
+                setLocalResponseState(kDeviceStateListening, "end");
+            }
         },
         // [ADD] Local mode: 顔タッチ中断 → backend に abort 通知
         .onLocalAbort = []() {

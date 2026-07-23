@@ -771,6 +771,7 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     micMuted_         = true;
     ttsDispatched_    = false;
     client_->pauseWhisper();   // LLM推論〜TTS完了まで Whisper を停止
+    ESP_LOGI(TAG, "Local response start: begin mouth animation before LLM inference");
     hal_bridge::notify_local_tts_start();  // LLM推論開始時点で口パクアニメ開始
     currentLlmRequestId_ = nextRequestId("llm_");
     ESP_LOGI(TAG, "LLM inference: %s (llmWorkId=%s request_id=%s)",
