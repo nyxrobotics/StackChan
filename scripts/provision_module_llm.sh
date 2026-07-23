@@ -41,8 +41,12 @@ PACKAGES_MODEL=(
 )
 
 # --- ADB ラッパー (エラー時に分かりやすいメッセージを出す) -------------------
+ADB_RETRY_COUNT=10
+ADB_RETRY_DELAY=2
+
 adb_shell() {
-    adb shell "$@" 2>&1
+    local cmd="$*"
+    adb shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; ${cmd}" 2>&1
 }
 
 # =============================================================================
@@ -59,8 +63,21 @@ command -v adb >/dev/null 2>&1 || die "adb が見つかりません。インス�
 
 # デバイスが繋がっているか
 info "ADB デバイスを確認中..."
-sleep 1
-ADB_DEVICES=$(adb devices | grep -v "List of" | grep -v "^$" | grep "device$" || true)
+adb kill-server >/dev/null 2>&1 || true
+adb start-server >/dev/null 2>&1 || true
+
+ADB_DEVICES=""
+for attempt in $(seq 1 "$ADB_RETRY_COUNT"); do
+    ADB_DEVICES=$(adb devices | grep -v "List of" | grep -v "^$" | grep "device$" || true)
+    if [ -n "$ADB_DEVICES" ]; then
+        break
+    fi
+    if [ "$attempt" -lt "$ADB_RETRY_COUNT" ]; then
+        info "  接続待ち (${attempt}/${ADB_RETRY_COUNT})..."
+        sleep "$ADB_RETRY_DELAY"
+    fi
+done
+
 if [ -z "$ADB_DEVICES" ]; then
     echo ""
     error "Module LLM が ADB で認識されていません。"
@@ -122,7 +139,7 @@ fi
 # 3. apt update
 # =============================================================================
 info "apt update 中... (時間がかかることがあります)"
-adb_shell "apt update -q" || die "apt update に失敗しました"
+adb_shell "apt-get update -y -qq" || die "apt update に失敗しました"
 ok "apt update 完了"
 
 # =============================================================================
@@ -140,7 +157,7 @@ install_package() {
     fi
 
     info "  $pkg をインストール中..."
-    if adb_shell "apt install -y '$pkg' 2>&1"; then
+    if adb_shell "apt-get install -y -qq '$pkg'"; then
         ok "  $pkg"
     else
         error "  $pkg のインストールに失敗しました"
