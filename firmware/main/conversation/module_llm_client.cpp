@@ -110,6 +110,23 @@ bool ModuleLLMClient::stackflowSend(const std::string& jsonMsg)
     return written == static_cast<int>(line.size());
 }
 
+bool ModuleLLMClient::sendAction(const std::string& reqId,
+                                 const std::string& workId,
+                                 const char* action)
+{
+    if (workId.empty() || action == nullptr) return false;
+
+    cJSON* msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "request_id", reqId.c_str());
+    cJSON_AddStringToObject(msg, "work_id",    workId.c_str());
+    cJSON_AddStringToObject(msg, "action",     action);
+    char* s = cJSON_PrintUnformatted(msg);
+    bool ok = s && stackflowSend(s);
+    if (s) free(s);
+    cJSON_Delete(msg);
+    return ok;
+}
+
 std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
 {
     std::string result;
@@ -305,8 +322,17 @@ bool ModuleLLMClient::connect()
 {
     if (uartFd_ >= 0) return true;  // already open
 
+    auto close_uart = [this]() {
+        if (uartFd_ >= 0) {
+            uart_driver_delete(static_cast<uart_port_t>(kUartNum));
+            uartFd_ = -1;
+        }
+        state_ = ModuleLLMState::NotConnected;
+    };
+
     if (!uartInit(kUartNum, kTxPin, kRxPin, kBaud)) {
         ESP_LOGE(TAG, "UART init failed");
+        close_uart();
         return false;
     }
     uartFd_ = kUartNum;
@@ -323,12 +349,14 @@ bool ModuleLLMClient::connect()
 
     if (!sent) {
         ESP_LOGE(TAG, "ping send failed");
+        close_uart();
         return false;
     }
 
     bool ack = waitForAck("sys.ping", 3000);
     if (!ack) {
         ESP_LOGW(TAG, "Module LLM did not respond to ping");
+        close_uart();
         return false;
     }
 
@@ -629,10 +657,10 @@ void ModuleLLMClient::runLlm(const std::string& prompt, LlmCallback cb)
     }
 }
 
-void ModuleLLMClient::sendToTts(const std::string& text, bool finish)
+bool ModuleLLMClient::sendToTts(const std::string& text, bool finish)
 {
-    if (melottsWorkId_.empty()) return;
-    if (text.empty()) return;
+    if (melottsWorkId_.empty()) return false;
+    if (text.empty()) return false;
 
     // Streaming 形式: object="tts.utf-8.stream", data={delta, index, finish}
     // setup の input="tts.utf-8.stream" と一致させる
@@ -645,12 +673,13 @@ void ModuleLLMClient::sendToTts(const std::string& text, bool finish)
     cJSON* d = cJSON_AddObjectToObject(msg, "data");
     cJSON_AddStringToObject(d, "delta",  text.c_str());
     cJSON_AddNumberToObject(d, "index",  0);
-    cJSON_AddBoolToObject(  d, "finish", true);
+    cJSON_AddBoolToObject(  d, "finish", finish);
 
     char* s = cJSON_PrintUnformatted(msg);
-    stackflowSend(s);
-    free(s);
+    bool ok = s && stackflowSend(s);
+    if (s) free(s);
     cJSON_Delete(msg);
+    return ok;
 }
 
 // Whisper を一時停止する（TTS 再生中に自分の声を拾わないため）
@@ -703,6 +732,34 @@ void ModuleLLMClient::resumeWhisper()
     stackflowSend(s);
     free(s);
     cJSON_Delete(msg);
+}
+
+bool ModuleLLMClient::pauseLlm()
+{
+    bool ok = sendAction("41", llmWorkId_, "pause");
+    ESP_LOGI(TAG, "llm pause: %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+bool ModuleLLMClient::resumeLlm()
+{
+    bool ok = sendAction("42", llmWorkId_, "work");
+    ESP_LOGI(TAG, "llm work: %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+bool ModuleLLMClient::pauseTts()
+{
+    bool ok = sendAction("43", melottsWorkId_, "pause");
+    ESP_LOGI(TAG, "melotts pause: %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+bool ModuleLLMClient::resumeTts()
+{
+    bool ok = sendAction("44", melottsWorkId_, "work");
+    ESP_LOGI(TAG, "melotts work: %s", ok ? "sent" : "failed");
+    return ok;
 }
 
 

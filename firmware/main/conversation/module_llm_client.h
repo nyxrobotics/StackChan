@@ -107,9 +107,13 @@ public:
     bool        stackflowSend(const std::string& jsonMsg);
 
     // Send filtered text to MeloTTS manually
-    void sendToTts(const std::string& text, bool finish = false);
+    bool sendToTts(const std::string& text, bool finish = false);
     void pauseWhisper();         // TTS再生中はASRを停止
     void resumeWhisper();        // TTS完了後にASR再開
+    bool pauseLlm();             // 顔タッチ中断: 生成中のLLM unitを停止
+    bool resumeLlm();            // 次ターン開始前にLLM unitを再開
+    bool pauseTts();             // 顔タッチ中断: 再生中のMeloTTS unitを停止
+    bool resumeTts();            // 次のTTS送信前にMeloTTS unitを再開
 
     // Work ID accessors for backend use
     const std::string& llmWorkId()     const { return llmWorkId_; }
@@ -143,6 +147,9 @@ private:
                           const std::string& action,
                           cJSON*             dataObj,
                           int                timeoutMs = 10000);
+    bool sendAction(const std::string& reqId,
+                    const std::string& workId,
+                    const char* action);
 
     // UART configuration (Section 9.1)
     static constexpr int  kRxPin   = 18;
