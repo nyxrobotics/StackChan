@@ -5,6 +5,7 @@
 #include "module_llm_client.h"
 #include <atomic>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <freertos/FreeRTOS.h>
@@ -36,16 +37,25 @@ private:
 
     // LLM → TTS pipeline
     void runLlmTts(const std::string& userText);
+    void handleAbortRequest();
+    void finishLocalTurn(const char* reason);
+    void resumePausedUnitsForNextTurn();
+    std::string nextRequestId(const char* prefix);
     void playback(const uint8_t* pcm, size_t len);
 
     std::shared_ptr<ModuleLLMClient> client_;
     CachedAgentConfig                config_;
-    bool                             active_      = false;
+    std::atomic<bool>                active_          {false};
+    std::atomic<bool>                taskRunning_     {false};
     bool                             inThinkBlock_ = false;
     bool                             micMuted_         = false;
     bool                             ttsDispatched_    = false;
+    bool                             llmPausedForAbort_ = false;
+    bool                             ttsPausedForAbort_ = false;
     std::atomic<bool>                abortRequested_   {false};  // 顔タッチ中断フラグ
+    std::atomic<uint32_t>            requestSeq_        {0};
     int                              lastVadSpeech_    = -1;  // -1=未初期化, 0=silence, 1=speech
     std::string                      pendingTts_;
+    std::string                      currentLlmRequestId_;
     TaskHandle_t                     pollTask_    = nullptr;
 };

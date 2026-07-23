@@ -7,6 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <cJSON.h>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
@@ -22,6 +23,10 @@ ModuleLLMBackend::ModuleLLMBackend(std::shared_ptr<ModuleLLMClient> client)
 
 ModuleLLMBackend::~ModuleLLMBackend() {
     stop();
+    taskRunning_.store(false);
+    for (int i = 0; pollTask_ != nullptr && i < 10; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -29,22 +34,42 @@ ModuleLLMBackend::~ModuleLLMBackend() {
 // ---------------------------------------------------------------------------
 
 void ModuleLLMBackend::start() {
-    active_ = true;
-    ESP_LOGI(TAG, "start");
+    if (active_.exchange(true)) {
+        ESP_LOGD(TAG, "start ignored: already active");
+        return;
+    }
+
+    if (pollTask_ != nullptr) {
+        ESP_LOGI(TAG, "start: reusing existing pollLoop task");
+        return;
+    }
 
     // Launch UART polling task — reads Whisper ASR results and drives LLM
-    xTaskCreate([](void* arg) {
+    taskRunning_.store(true);
+    BaseType_t created = xTaskCreate([](void* arg) {
         static_cast<ModuleLLMBackend*>(arg)->pollLoop();
         vTaskDelete(nullptr);
     }, "modllm_poll", 8192, this, 5, &pollTask_);
 
-    ESP_LOGI(TAG, "pollLoop task created: %s", pollTask_ ? "ok" : "FAILED");
+    if (created != pdPASS) {
+        active_.store(false);
+        taskRunning_.store(false);
+        pollTask_ = nullptr;
+        ESP_LOGE(TAG, "pollLoop task creation failed");
+        if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+        return;
+    }
+
+    ESP_LOGI(TAG, "pollLoop task created");
 }
 
 void ModuleLLMBackend::stop() {
-    active_ = false;
-    ESP_LOGI(TAG, "stop");
-    // Task will exit on next loop iteration
+    if (!active_.exchange(false)) {
+        ESP_LOGD(TAG, "stop ignored: already inactive");
+        return;
+    }
+    ESP_LOGI(TAG, "stop requested");
+    // The poll task remains alive and idles until start() activates it again.
 }
 
 void ModuleLLMBackend::beginTurn() { ESP_LOGD(TAG, "beginTurn"); }
@@ -53,6 +78,49 @@ void ModuleLLMBackend::endTurn() {
     // ここで resumeWhisper すると LLM/TTS 完了前に Whisper が再開してしまう。
     // resume は MeloTTS の UART 応答のみで行う。
     ESP_LOGD(TAG, "endTurn (whisper resume deferred to MeloTTS response)");
+}
+
+std::string ModuleLLMBackend::nextRequestId(const char* prefix) {
+    char buf[32];
+    uint32_t seq = requestSeq_.fetch_add(1) + 1;
+    snprintf(buf, sizeof(buf), "%s%lu", prefix, static_cast<unsigned long>(seq));
+    return std::string(buf);
+}
+
+void ModuleLLMBackend::resumePausedUnitsForNextTurn() {
+    if (!client_) return;
+
+    if (llmPausedForAbort_) {
+        client_->resumeLlm();
+        llmPausedForAbort_ = false;
+    }
+}
+
+void ModuleLLMBackend::finishLocalTurn(const char* reason) {
+    ESP_LOGI(TAG, "Local turn finished: %s", reason ? reason : "done");
+    hal_bridge::notify_local_tts_end();
+    pendingTts_.clear();
+    inThinkBlock_ = false;
+    currentLlmRequestId_.clear();
+    if (client_) client_->resumeWhisper();
+    micMuted_      = false;
+    ttsDispatched_ = false;
+}
+
+void ModuleLLMBackend::handleAbortRequest() {
+    ESP_LOGI(TAG, "Abort requested by touch");
+
+    if (client_) {
+        if (ttsDispatched_) {
+            client_->pauseTts();
+            ttsPausedForAbort_ = true;
+        } else if (!currentLlmRequestId_.empty()) {
+            client_->pauseLlm();
+            llmPausedForAbort_ = true;
+        }
+    }
+
+    finishLocalTurn("abort");
 }
 
 // ---------------------------------------------------------------------------
@@ -71,13 +139,20 @@ void ModuleLLMBackend::applyConfig(const CachedAgentConfig& cfg) {
 // chunk は in-place で書き換えられる。戻り値は新しい inBlock 状態。
 // ---------------------------------------------------------------------------
 
+static bool isEnglishTtsLang(uint8_t lang)
+{
+    return lang == 2 || lang == 3;
+}
+
 // sanitizeTtsText — TTS に送る前に読み上げ不可能な記法を除去する
 // 処理順:
 //   1. LaTeX コマンド・Markdown 記号を除去
 //   2. 括弧（ASCII/全角/【】/「」等）とその内容を除去
 //   3. 文末の記号を除去（! ? ！ ？ は1個まで残す）
-static void sanitizeTtsText(std::string& text)
+static void sanitizeTtsText(std::string& text, uint8_t lang)
 {
+    const bool english = isEnglishTtsLang(lang);
+
     // --- Step 1: LaTeX・Markdown 除去 ---
     {
         std::string r;
@@ -108,10 +183,20 @@ static void sanitizeTtsText(std::string& text)
                 for (int i = 0; i < len && *p; i++) r += (char)*p++;
                 continue;
             }
-            // ASCII: 句読点・数字・空白・改行のみ通す。英字・記号はスキップ
-            if ((*p >= '0' && *p <= '9') ||
-                *p == ',' || *p == '.' || *p == '!' || *p == '?' ||
-                *p == '\n' || *p == ' ') {
+            // ASCII: 日本語/中国語 TTS では英字を落とし、英語 TTS では英字を保持する。
+            if (english &&
+                (((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) ||
+                 (*p >= '0' && *p <= '9') ||
+                 *p == ',' || *p == '.' || *p == '!' || *p == '?' ||
+                 *p == ';' || *p == ':' || *p == '\'' || *p == '"' ||
+                 *p == '-' || *p == '\n' || *p == ' ')) {
+                r += (char)*p++;
+                continue;
+            }
+            if (!english &&
+                ((*p >= '0' && *p <= '9') ||
+                 *p == ',' || *p == '.' || *p == '!' || *p == '?' ||
+                 *p == '\n' || *p == ' ')) {
                 r += (char)*p++;
                 continue;
             }
@@ -238,7 +323,7 @@ static void sanitizeTtsText(std::string& text)
 
     // --- Step 4: 日本語（3バイトUTF-8）を含まない行を除去 ---
     // 英語 thinking が本文に漏れた場合の残骸（", . , ."等）を除去
-    {
+    if (!english) {
         std::string result;
         std::istringstream ss(text);
         std::string line;
@@ -334,58 +419,38 @@ void ModuleLLMBackend::pollLoop() {
         return false;
     };
 
-    while (active_) {
+    while (taskRunning_.load()) {
+        if (!active_.load()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         if (!client_ || !client_->isReady()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
-        // TTS送信済みかつ micMuted_ 中は タイムアウトまたは中断で Whisper resume
+        bool abortRequested = abortRequested_.exchange(false);
+        if (abortRequested) {
+            if (micMuted_) {
+                handleAbortRequest();
+                ttsDispatchedMs = 0;
+                continue;
+            }
+            ESP_LOGD(TAG, "abort ignored: local turn is not active");
+        }
+
+        // TTS送信済みかつ micMuted_ 中は タイムアウトで Whisper resume
         if (micMuted_ && ttsDispatched_) {
             int64_t now = esp_timer_get_time() / 1000;
             if (ttsDispatchedMs == 0) {
                 ttsDispatchedMs = now;  // 初回: 送信時刻を記録
-            } else if (abortRequested_.exchange(false) ||
-                       now - ttsDispatchedMs >= ttsTimeoutMs) {
-                ESP_LOGI(TAG, "TTS end (abort or timeout) → resuming whisper");
-                hal_bridge::notify_local_tts_end();  // 口パクアニメ停止
-                pendingTts_.clear();
-                inThinkBlock_ = false;
-                client_->resumeWhisper();
-                micMuted_       = false;
-                ttsDispatched_  = false;
+            } else if (now - ttsDispatchedMs >= ttsTimeoutMs) {
+                finishLocalTurn("tts timeout");
                 ttsDispatchedMs = 0;
             }
         } else {
             ttsDispatchedMs = 0;
-            // LLM thinking 中でも abort をチェック
-            if (micMuted_ && abortRequested_.exchange(false)) {
-                ESP_LOGI(TAG, "Abort during LLM thinking → flushing LLM stream...");
-                hal_bridge::notify_local_tts_end();  // 口パクアニメ停止
-                pendingTts_.clear();
-                inThinkBlock_ = false;
-                // "finish":true が来るまで LLM ストリームを読み捨て
-                while (true) {
-                    std::string flush = client_->stackflowReceive(200);
-                    if (flush.empty()) continue;
-                    cJSON* froot = cJSON_Parse(flush.c_str());
-                    if (froot) {
-                        cJSON* fdata = cJSON_GetObjectItemCaseSensitive(froot, "data");
-                        if (cJSON_IsObject(fdata)) {
-                            cJSON* fin = cJSON_GetObjectItemCaseSensitive(fdata, "finish");
-                            if (cJSON_IsBool(fin) && cJSON_IsTrue(fin)) {
-                                cJSON_Delete(froot);
-                                break;  // LLM 応答完了
-                            }
-                        }
-                        cJSON_Delete(froot);
-                    }
-                }
-                ESP_LOGI(TAG, "Abort: LLM stream flushed → resuming whisper");
-                client_->resumeWhisper();
-                micMuted_      = false;
-                ttsDispatched_ = false;
-            }
         }
 
         // Block up to 200ms waiting for a UART message
@@ -397,6 +462,7 @@ void ModuleLLMBackend::pollLoop() {
         cJSON* root = cJSON_Parse(msg.c_str());
         if (!root) continue;
 
+        cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
         cJSON* wid = cJSON_GetObjectItemCaseSensitive(root, "work_id");
         cJSON* obj = cJSON_GetObjectItemCaseSensitive(root, "object");
         cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
@@ -456,6 +522,15 @@ void ModuleLLMBackend::pollLoop() {
             strncmp(wid->valuestring, "llm.", 4) == 0 &&
             strcmp(obj->valuestring, "llm.utf-8.stream") == 0)
         {
+            if (!cJSON_IsString(rid) || currentLlmRequestId_.empty() ||
+                currentLlmRequestId_ != rid->valuestring) {
+                ESP_LOGD(TAG, "LLM stream ignored: request_id=%s current=%s",
+                         cJSON_IsString(rid) ? rid->valuestring : "(none)",
+                         currentLlmRequestId_.c_str());
+                cJSON_Delete(root);
+                continue;
+            }
+
             cJSON* data_node = cJSON_GetObjectItemCaseSensitive(root, "data");
             if (cJSON_IsObject(data_node)) {
                 cJSON* delta  = cJSON_GetObjectItemCaseSensitive(data_node, "delta");
@@ -475,20 +550,22 @@ void ModuleLLMBackend::pollLoop() {
                     pendingTts_ += chunk;
                 }
                 if (done) {
+                    currentLlmRequestId_.clear();
                     if (!pendingTts_.empty()) {
+                        uint8_t lang = client_->getTtsLang();
+                        if (lang >= 4) lang = 0;
+
                         // TTS送信前に読み上げ不可能な記法を除去
-                        sanitizeTtsText(pendingTts_);
-                        // 日本語文字が含まれていない（英語コードの残骸等）場合はスキップ
-                        // sanitize後: 空白・改行を除いたバイト数に対する日本語比率を確認
-                        // 英語混じり回答（"Okay, the user wrote..."等）を弾くため
-                        // しきい値: 日本語バイト数 >= 非空白バイト数の80%
+                        sanitizeTtsText(pendingTts_, lang);
+                        // JA/ZH では英語 thinking の残骸を弾くため CJK 比率を確認する。
+                        // EN では ASCII 英字を正規の発話として許可する。
                         int nonSpaceBytes = 0;
-                        int japaneseBytes = 0;
+                        int cjkBytes = 0;
                         {
                             const unsigned char* cp2 = reinterpret_cast<const unsigned char*>(pendingTts_.c_str());
                             while (*cp2) {
                                 if ((*cp2 & 0xF0) == 0xE0) {
-                                    japaneseBytes += 3; nonSpaceBytes += 3; cp2 += 3;
+                                    cjkBytes += 3; nonSpaceBytes += 3; cp2 += 3;
                                 } else if (*cp2 & 0x80) {
                                     nonSpaceBytes += 2; cp2 += 2;
                                 } else {
@@ -498,23 +575,20 @@ void ModuleLLMBackend::pollLoop() {
                                 }
                             }
                         }
-                        bool hasJapanese = (nonSpaceBytes > 0) &&
-                                           (japaneseBytes * 10 >= nonSpaceBytes * 8);  // 80%以上
-                        if (pendingTts_.empty() || !hasJapanese) {
-                            ESP_LOGW(TAG, "LLM→TTS: skipped (ja=%d%% of %d non-space bytes)",
-                                     nonSpaceBytes > 0 ? japaneseBytes * 100 / nonSpaceBytes : 0,
+                        bool languageOk = nonSpaceBytes > 0;
+                        if (languageOk && !isEnglishTtsLang(lang)) {
+                            languageOk = cjkBytes * 10 >= nonSpaceBytes * 8;  // 80%以上
+                        }
+                        if (pendingTts_.empty() || !languageOk) {
+                            ESP_LOGW(TAG, "LLM→TTS: skipped (lang=%u cjk=%d%% of %d non-space bytes)",
+                                     lang,
+                                     nonSpaceBytes > 0 ? cjkBytes * 100 / nonSpaceBytes : 0,
                                      nonSpaceBytes);
-                            hal_bridge::notify_local_tts_end();  // 口パクアニメ停止
-                            pendingTts_.clear();
-                            client_->resumeWhisper();
-                            micMuted_      = false;
-                            ttsDispatched_ = false;
+                            finishLocalTurn("tts skipped");
                             goto skip_tts_dispatch;
                         }
                         // 言語別・句読点考慮タイムアウト計算
                         {
-                            uint8_t lang = client_->getTtsLang();
-                            if (lang >= 4) lang = 0;
                             const auto& tp = kTtsParams[lang];
 
                             int64_t totalBytes = 0;
@@ -545,11 +619,19 @@ void ModuleLLMBackend::pollLoop() {
                                      (int)totalBytes, (int)punctCount,
                                      (int)ttsTimeoutMs);
                         }
+                        if (ttsPausedForAbort_) {
+                            client_->resumeTts();
+                            ttsPausedForAbort_ = false;
+                        }
                         ttsDispatched_ = true;
-                        client_->sendToTts(pendingTts_, true);
+                        if (!client_->sendToTts(pendingTts_, true)) {
+                            ESP_LOGE(TAG, "LLM→TTS send failed");
+                            finishLocalTurn("tts send failed");
+                            goto skip_tts_dispatch;
+                        }
                         pendingTts_.clear();
                     } else {
-                        client_->sendToTts("", true);
+                        finishLocalTurn("empty llm response");
                     }
                 }
             }
@@ -561,6 +643,8 @@ void ModuleLLMBackend::pollLoop() {
         cJSON_Delete(root);
     }
 
+    active_.store(false);
+    pollTask_ = nullptr;
     ESP_LOGI(TAG, "pollLoop exit");
 }
 
@@ -618,7 +702,7 @@ static bool isAsrNoise(const std::string& text) {
 
 void ModuleLLMBackend::onAsrResult(const std::string& text) {
     ESP_LOGI(TAG, "onAsrResult: %s", text.c_str());
-    if (!active_) {
+    if (!active_.load()) {
         ESP_LOGI(TAG, "onAsrResult: backend inactive, skipping");
         return;
     }
@@ -671,15 +755,7 @@ void ModuleLLMBackend::processAudio(const uint8_t* /*pcm*/, size_t /*len*/) {
 
 void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     if (!client_) { ESP_LOGE(TAG, "runLlmTts: client_ null"); return; }
-    inThinkBlock_ = false;
-    pendingTts_.clear();
-    micMuted_         = true;
-    ttsDispatched_    = false;
-    client_->pauseWhisper();   // LLM推論〜TTS完了まで Whisper を停止
-    hal_bridge::notify_local_tts_start();  // LLM推論開始時点で口パクアニメ開始
-    ESP_LOGI(TAG, "LLM inference: %s (llmWorkId=%s)", userText.c_str(), client_->llmWorkId().c_str());
 
-    // LLM へ inference リクエスト送信（レスポンスは pollLoop で処理）
     const std::string& llmWorkId = client_->llmWorkId();
     if (llmWorkId.empty()) {
         ESP_LOGW(TAG, "LLM work_id empty");
@@ -687,8 +763,22 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
         return;
     }
 
+    resumePausedUnitsForNextTurn();
+    abortRequested_.store(false);
+
+    inThinkBlock_ = false;
+    pendingTts_.clear();
+    micMuted_         = true;
+    ttsDispatched_    = false;
+    client_->pauseWhisper();   // LLM推論〜TTS完了まで Whisper を停止
+    hal_bridge::notify_local_tts_start();  // LLM推論開始時点で口パクアニメ開始
+    currentLlmRequestId_ = nextRequestId("llm_");
+    ESP_LOGI(TAG, "LLM inference: %s (llmWorkId=%s request_id=%s)",
+             userText.c_str(), client_->llmWorkId().c_str(), currentLlmRequestId_.c_str());
+
+    // LLM へ inference リクエスト送信（レスポンスは pollLoop で処理）
     cJSON* msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "request_id", "10");
+    cJSON_AddStringToObject(msg, "request_id", currentLlmRequestId_.c_str());
     cJSON_AddStringToObject(msg, "work_id",    llmWorkId.c_str());
     cJSON_AddStringToObject(msg, "action",     "inference");
     cJSON_AddStringToObject(msg, "object",     "llm.utf-8");
@@ -696,9 +786,15 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     cJSON_AddStringToObject(msg, "data", userText.c_str());
 
     char* s = cJSON_PrintUnformatted(msg);
-    client_->stackflowSend(s);
-    free(s);
+    bool sent = s && client_->stackflowSend(s);
+    if (s) free(s);
     cJSON_Delete(msg);
+
+    if (!sent) {
+        ESP_LOGE(TAG, "LLM inference send failed");
+        finishLocalTurn("llm send failed");
+        if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+    }
 }
 
 // ---------------------------------------------------------------------------
