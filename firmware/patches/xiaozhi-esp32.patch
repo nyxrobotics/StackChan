@@ -1,93 +1,239 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..3b6f07e 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -610,33 +610,36 @@ void Application::InitializeProtocol() {
+@@ -9,6 +9,7 @@
+ #include "mcp_server.h"
+ #include "assets.h"
+ #include "settings.h"
++#include "hal/hal_bridge_conv.h"  // [ADD] ConversationMode gating
+ 
+ #include <cstring>
+ #include <esp_log.h>
+@@ -156,7 +157,13 @@
+     });
+ 
+     // Start network asynchronously
+-    board.StartNetwork();
++    if (network_required_) {
++        board.StartNetwork();
++    } else {
++        ESP_LOGI(TAG, "network_required_=false: skipping Wi-Fi start");
++        // Trigger activation directly so the main loop doesn't wait forever
++        xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
++    }
+ 
+     // Update the status bar immediately to show the network state
+     display->UpdateStatusBar(true);
+@@ -218,9 +225,19 @@
+         }
+ 
+         if (bits & MAIN_EVENT_SEND_AUDIO) {
++            const bool local_only =
++                hal_bridge::get_conversation_mode() == hal_bridge::kModeLocalOnly;
+             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+-                    break;
++                // [ADD] always forward raw PCM to ConversationManager (Module LLM backend)
++                if (!packet->payload.empty()) {
++                    hal_bridge::notify_audio_chunk(
++                        packet->payload.data(), packet->payload.size());
++                }
++                // [ADD] skip Xiaozhi in LocalOnly mode
++                if (!local_only && protocol_) {
++                    if (!protocol_->SendAudio(std::move(packet))) {
++                        break;
++                    }
+                 }
+             }
+         }
+@@ -324,6 +341,17 @@
+     // Create OTA object for activation process
+     ota_ = std::make_unique<Ota>();
+ 
++    // [ADD] LocalOnly: show face (activating state) until conv pipeline is ready
++    if (!network_required_) {
++        ESP_LOGI(TAG, "network_required_=false: waiting for conv pipeline...");
++        while (!hal_bridge::is_conv_ready()) {
++            vTaskDelay(pdMS_TO_TICKS(100));
++        }
++        ESP_LOGI(TAG, "Conv pipeline ready, activation done");
++        xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
++        return;
++    }
++
+     // Check for new assets version
+     CheckAssetsVersion();
+ 
+@@ -396,6 +424,8 @@
  }
  
- void Application::ShowActivationCode(const std::string& code, const std::string& message) {
--    struct digit_sound {
--        char digit;
--        const std::string_view& sound;
--    };
--    static const std::array<digit_sound, 10> digit_sounds{{
--        digit_sound{'0', Lang::Sounds::OGG_0},
--        digit_sound{'1', Lang::Sounds::OGG_1}, 
--        digit_sound{'2', Lang::Sounds::OGG_2},
--        digit_sound{'3', Lang::Sounds::OGG_3},
--        digit_sound{'4', Lang::Sounds::OGG_4},
--        digit_sound{'5', Lang::Sounds::OGG_5},
--        digit_sound{'6', Lang::Sounds::OGG_6},
--        digit_sound{'7', Lang::Sounds::OGG_7},
--        digit_sound{'8', Lang::Sounds::OGG_8},
--        digit_sound{'9', Lang::Sounds::OGG_9}
--    }};
--
--    // This sentence uses 9KB of SRAM, so we need to wait for it to finish
--    Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
--
--    for (const auto& digit : code) {
--        auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
--            [digit](const digit_sound& ds) { return ds.digit == digit; });
--        if (it != digit_sounds.end()) {
--            audio_service_.PlaySound(it->sound);
--        }
--    }
-+    // struct digit_sound {
-+    //     char digit;
-+    //     const std::string_view& sound;
-+    // };
-+    // static const std::array<digit_sound, 10> digit_sounds{{
-+    //     digit_sound{'0', Lang::Sounds::OGG_0},
-+    //     digit_sound{'1', Lang::Sounds::OGG_1}, 
-+    //     digit_sound{'2', Lang::Sounds::OGG_2},
-+    //     digit_sound{'3', Lang::Sounds::OGG_3},
-+    //     digit_sound{'4', Lang::Sounds::OGG_4},
-+    //     digit_sound{'5', Lang::Sounds::OGG_5},
-+    //     digit_sound{'6', Lang::Sounds::OGG_6},
-+    //     digit_sound{'7', Lang::Sounds::OGG_7},
-+    //     digit_sound{'8', Lang::Sounds::OGG_8},
-+    //     digit_sound{'9', Lang::Sounds::OGG_9}
-+    // }};
-+
-+    // // This sentence uses 9KB of SRAM, so we need to wait for it to finish
-+    // Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
-+
-+    // for (const auto& digit : code) {
-+    //     auto it = std::find_if(digit_sounds.begin(), digit_sounds.end(),
-+    //         [digit](const digit_sound& ds) { return ds.digit == digit; });
-+    //     if (it != digit_sounds.end()) {
-+    //         audio_service_.PlaySound(it->sound);
-+    //     }
-+    // }
-+
-+    auto display = Board::GetInstance().GetDisplay();
-+    display->SetChatMessage("system", "Please bind and set up in the mobile app.");
+ void Application::CheckNewVersion() {
++    ESP_LOGI(TAG, "Firmware auto-update disabled");
++    return;
+     const int MAX_RETRY = 10;
+     int retry_count = 0;
+     int retry_delay = 10; // Initial retry delay in seconds
+@@ -688,7 +718,11 @@
+     }
+ 
+     if (!protocol_) {
+-        ESP_LOGE(TAG, "Protocol not initialized");
++        if (network_required_) {
++            ESP_LOGE(TAG, "Protocol not initialized");
++        } else if (state == kDeviceStateSpeaking) {
++            AbortSpeaking(kAbortReasonNone);  // LocalOnly: abort TTS on touch
++        }
+         return;
+     }
+ 
+@@ -738,7 +772,11 @@
+     }
+ 
+     if (!protocol_) {
+-        ESP_LOGE(TAG, "Protocol not initialized");
++        if (network_required_) {
++            ESP_LOGE(TAG, "Protocol not initialized");
++        } else if (state == kDeviceStateSpeaking) {
++            AbortSpeaking(kAbortReasonNone);  // LocalOnly: abort TTS on touch
++        }
+         return;
+     }
+     
+@@ -803,11 +841,13 @@
+         while (audio_service_.PopPacketFromSendQueue());
+ 
+         if (state == kDeviceStateListening) {
+-            protocol_->SendStartListening(GetDefaultListeningMode());
++            if (protocol_) {
++                protocol_->SendStartListening(GetDefaultListeningMode());
++            }
+             audio_service_.ResetDecoder();
+             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+             // Re-enable wake word detection as it was stopped by the detection itself
+-            audio_service_.EnableWakeWordDetection(true);
++            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
+         } else {
+             // Play popup sound and start listening again
+             play_popup_on_listening_ = true;
+@@ -827,7 +867,7 @@
+ 
+     if (!protocol_->IsAudioChannelOpened()) {
+         if (!protocol_->OpenAudioChannel()) {
+-            audio_service_.EnableWakeWordDetection(true);
++            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
+             return;
+         }
+     }
+@@ -867,8 +907,9 @@
+             display->SetStatus(Lang::Strings::STANDBY);
+             display->ClearChatMessages();  // Clear messages first
+             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+-            audio_service_.EnableVoiceProcessing(false);
+-            audio_service_.EnableWakeWordDetection(true);
++            if (audio_service_.IsAudioProcessorRunning()) { audio_service_.EnableVoiceProcessing(false); }
++            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
++            hal_bridge::notify_turn_end();  // [ADD] notify ConversationManager
+             break;
+         case kDeviceStateConnecting:
+             display->SetStatus(Lang::Strings::CONNECTING);
+@@ -878,9 +919,13 @@
+         case kDeviceStateListening:
+             display->SetStatus(Lang::Strings::LISTENING);
+             display->SetEmotion("neutral");
++            hal_bridge::notify_turn_start();  // [ADD] notify ConversationManager
+ 
+             // Make sure the audio processor is running
+-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
++            // LocalOnly: Module LLM handles audio  skip AFE init to avoid freezing LVGL
++            if (!network_required_) {
++                play_popup_on_listening_ = false;
++            } else if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+                 // For auto mode, wait for playback queue to be empty before enabling voice processing
+                 // This prevents audio truncation when STOP arrives late due to network jitter
+                 if (listening_mode_ == kListeningModeAutoStop) {
+@@ -888,13 +933,15 @@
+                 }
+                 
+                 // Send the start listening command
+-                protocol_->SendStartListening(listening_mode_);
++                if (protocol_) {
++                    protocol_->SendStartListening(listening_mode_);
++                }
+                 audio_service_.EnableVoiceProcessing(true);
+             }
+ 
+ #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+             // Enable wake word detection in listening mode (configured via Kconfig)
+-            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++            if (network_required_) { audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord()); }
+ #else
+             // Disable wake word detection in listening mode
+             audio_service_.EnableWakeWordDetection(false);
+@@ -910,9 +957,9 @@
+             display->SetStatus(Lang::Strings::SPEAKING);
+ 
+             if (listening_mode_ != kListeningModeRealtime) {
+-                audio_service_.EnableVoiceProcessing(false);
++                if (audio_service_.IsAudioProcessorRunning()) { audio_service_.EnableVoiceProcessing(false); }
+                 // Only AFE wake word can be detected in speaking mode
+-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++                if (network_required_) { audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord()); }
+             }
+             audio_service_.ResetDecoder();
+             break;
+@@ -940,6 +987,10 @@
+     if (protocol_) {
+         protocol_->SendAbortSpeaking(reason);
+     }
++    // [ADD] LocalOnly  backend Whisper  resume
++    if (!network_required_) {
++        hal_bridge::notify_local_abort();
++    }
  }
  
- void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+ void Application::SetListeningMode(ListeningMode mode) {
+
+diff --git a/main/application.h b/main/application.h
+--- a/main/application.h
++++ b/main/application.h
+@@ -56,6 +56,10 @@
+      */
+     void Initialize();
+ 
++    // [ADD] Call before Initialize() to skip Wi-Fi and Xiaozhi protocol (LocalOnly mode).
++    void SetNetworkRequired(bool required) { network_required_ = required; }
++    bool IsNetworkRequired() const { return network_required_; }
++
+     /**
+      * Run the main event loop
+      * This function runs in the main task and never returns.
+@@ -140,6 +144,7 @@
+     bool aborted_ = false;
+     bool assets_version_checked_ = false;
+     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
++    bool network_required_ = true;          // [ADD] set false to skip Wi-Fi + Xiaozhi (LocalOnly mode)
+     int clock_ticks_ = 0;
+     TaskHandle_t activation_task_handle_ = nullptr;
+ 
 diff --git a/main/assets.cc b/main/assets.cc
-index ad61944..6b84daf 100644
 --- a/main/assets.cc
 +++ b/main/assets.cc
-@@ -3,8 +3,8 @@
- #include "display.h"
- #include "application.h"
- #include "lvgl_theme.h"
--#include "emote_display.h"
--#include "expression_emote.h"
-+// #include "emote_display.h"
-+// #include "expression_emote.h"
+@@ -31,7 +31,7 @@
  #if HAVE_LVGL
- #include "display/lcd_display.h"
- #include <spi_flash_mmap.h>
-@@ -356,72 +356,72 @@ bool Assets::LvglStrategy::Apply(Assets* assets) {
+     strategy_ = std::make_unique<Assets::LvglStrategy>();
+ #else
+-    strategy_ = std::make_unique<Assets::EmoteStrategy>();
++    strategy_ = std::make_unique<Assets::LittleFsStrategy>();
+ #endif
+     // Initialize the partition
+     InitializePartition();
+@@ -356,72 +356,9 @@
  }
  #endif // HAVE_LVGL
  
 -bool Assets::EmoteStrategy::InitializePartition(Assets* assets) {
 -    assets->partition_valid_ = false;
--
+ 
 -    if (!Assets::FindPartition(assets)) {
 -        return false;
 -    }
@@ -112,7 +258,7 @@ index ad61944..6b84daf 100644
 -    assets->partition_valid_ = ((ret == ESP_OK) ? true : false);
 -    return assets->partition_valid_;
 -}
--
+ 
 -void Assets::EmoteStrategy::UnApplyPartition(Assets* assets) {
 -    auto display = Board::GetInstance().GetDisplay();
 -    auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
@@ -121,7 +267,7 @@ index ad61944..6b84daf 100644
 -    }
 -    (void)assets; // Unused parameter
 -}
--
+ 
 -bool Assets::EmoteStrategy::GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) {
 -    auto display = Board::GetInstance().GetDisplay();
 -    auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
@@ -151,80 +297,14 @@ index ad61944..6b84daf 100644
 -    }
 -    return true;
 -}
-+// bool Assets::EmoteStrategy::InitializePartition(Assets* assets) {
-+//     assets->partition_valid_ = false;
-+
-+//     if (!Assets::FindPartition(assets)) {
-+//         return false;
-+//     }
-+
-+//     esp_err_t ret = ESP_ERR_INVALID_STATE;
-+//     auto display = Board::GetInstance().GetDisplay();
-+//     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
-+//     if (emote_display && emote_display->GetEmoteHandle() != nullptr) {
-+//         const emote_data_t data = {
-+//             .type = EMOTE_SOURCE_PARTITION,
-+//             .source = {
-+//                 .partition_label = PARTITION_LABEL,
-+//             },
-+//             .flags = {
-+//                 .mmap_enable = true, //must be true here!!!
-+//             },
-+//         };
-+//         ret = emote_mount_assets(emote_display->GetEmoteHandle(), &data);
-+//     } else {
-+//         ESP_LOGE(TAG, "Emote display is not initialized");
-+//     }
-+//     assets->partition_valid_ = ((ret == ESP_OK) ? true : false);
-+//     return assets->partition_valid_;
-+// }
-+
-+// void Assets::EmoteStrategy::UnApplyPartition(Assets* assets) {
-+//     auto display = Board::GetInstance().GetDisplay();
-+//     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
-+//     if (emote_display && emote_display->GetEmoteHandle() != nullptr) {
-+//         emote_unmount_assets(emote_display->GetEmoteHandle());
-+//     }
-+//     (void)assets; // Unused parameter
-+// }
-+
-+// bool Assets::EmoteStrategy::GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) {
-+//     auto display = Board::GetInstance().GetDisplay();
-+//     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
-+//     if (emote_display && emote_display->GetEmoteHandle() != nullptr) {
-+//         const uint8_t* data = nullptr;
-+//         size_t data_size = 0;
-+//         if (ESP_OK == emote_get_asset_data_by_name(emote_display->GetEmoteHandle(), name.c_str(), &data, &data_size)) {
-+//             ptr = const_cast<void*>(static_cast<const void*>(data));
-+//             size = data_size;
-+//             return true;
-+//         }
-+//         ESP_LOGE(TAG, "Failed to get asset data by name: %s", name.c_str());
-+//         return false;
-+//     }
-+//     (void)assets; // Unused parameter
-+//     return false;
-+// }
-+
-+// bool Assets::EmoteStrategy::Apply(Assets* assets) {
-+//     Assets::LoadSrmodelsFromIndex(assets);
-+
-+//     auto display = Board::GetInstance().GetDisplay();
-+//     auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display);
-+
-+//     if (emote_display && emote_display->GetEmoteHandle() != nullptr) {
-+//         emote_load_assets(emote_display->GetEmoteHandle());
-+//     }
-+//     return true;
-+// }
  
  bool Assets::Download(std::string url, std::function<void(int progress, size_t speed)> progress_callback) {
      ESP_LOGI(TAG, "Downloading new version of assets from %s", url.c_str());
+
 diff --git a/main/assets.h b/main/assets.h
-index 3692e0c..7bfbc5c 100644
 --- a/main/assets.h
 +++ b/main/assets.h
-@@ -68,13 +68,13 @@ private:
+@@ -68,14 +68,6 @@
          bool checksum_valid_ = false;
      };
      
@@ -235,39 +315,8 @@ index 3692e0c..7bfbc5c 100644
 -        void UnApplyPartition(Assets* assets) override;
 -        bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) override;
 -    };
-+    // class EmoteStrategy : public AssetStrategy {
-+    // public:
-+    //     bool Apply(Assets* assets) override;
-+    //     bool InitializePartition(Assets* assets) override;
-+    //     void UnApplyPartition(Assets* assets) override;
-+    //     bool GetAssetData(Assets* assets, const std::string& name, void*& ptr, size_t& size) override;
-+    // };
-     
+-    
      // Strategy instance
      std::unique_ptr<AssetStrategy> strategy_;
-diff --git a/main/boards/common/i2c_device.cc b/main/boards/common/i2c_device.cc
-index 835997d..ea50d51 100644
---- a/main/boards/common/i2c_device.cc
-+++ b/main/boards/common/i2c_device.cc
-@@ -32,4 +32,8 @@ uint8_t I2cDevice::ReadReg(uint8_t reg) {
  
- void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
-     ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100));
-+}
-+
-+esp_err_t I2cDevice::TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms) {
-+    return i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, timeout_ms);
- }
-\ No newline at end of file
-diff --git a/main/boards/common/i2c_device.h b/main/boards/common/i2c_device.h
-index 7bc917b..874b137 100644
---- a/main/boards/common/i2c_device.h
-+++ b/main/boards/common/i2c_device.h
-@@ -13,6 +13,7 @@ protected:
-     void WriteReg(uint8_t reg, uint8_t value);
-     uint8_t ReadReg(uint8_t reg);
-     void ReadRegs(uint8_t reg, uint8_t* buffer, size_t length);
-+    esp_err_t TryReadRegs(uint8_t reg, uint8_t* buffer, size_t length, int timeout_ms = 100);
- };
- 
- #endif // I2C_DEVICE_H
+

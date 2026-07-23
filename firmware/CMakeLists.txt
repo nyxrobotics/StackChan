@@ -10,3 +10,5 @@ add_compile_options(-Wno-missing-field-initializers)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(stack-chan)
+# qrcodegen is bundled in both lvgl and esp_emote_gfx; allow duplicate symbols
+target_link_options(stack-chan.elf PRIVATE -Wl,--allow-multiple-definition)
