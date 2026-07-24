@@ -9,6 +9,7 @@
 #include "axp2101.h"
 #include "settings.h"
 
+#include <esp_err.h>
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <wifi_station.h>
@@ -51,34 +52,21 @@ public:
     // Power Init
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr)
     {
-        uint8_t data = ReadReg(0x90);
-        data |= 0b10110100;
-        WriteReg(0x90, data);
-        // WriteReg(0x99, (0b11110 - 5));
-        WriteReg(0x97, (0b11110 - 2));
-        WriteReg(0x69, 0b00110101);
-        WriteReg(0x30, 0b111111);
-        WriteReg(0x90, 0xBF);
-        WriteReg(0x94, 33 - 5);
-        WriteReg(0x95, 33 - 5);
-        WriteReg(0x27, 0x00);
-
-        auto ret = setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_700MA);
-        if (!ret) {
-            ESP_LOGE(TAG, "Set charge current failed");
-        } else {
-            ESP_LOGI(TAG, "Set charge current success");
+        initialized_ = ConfigurePowerRails();
+        if (!initialized_) {
+            ESP_LOGW(TAG, "AXP2101 init incomplete; continuing with safe PMIC fallbacks");
         }
-
-        SetBrightness(0);
     }
 
-    void SetBrightness(uint8_t brightness)
+    bool SetBrightness(uint8_t brightness)
     {
         if (brightness == 0) {
             // DLDO1 off
-            uint8_t val = ReadReg(0x90);
-            WriteReg(0x90, val & 0x7F);
+            uint8_t val = 0;
+            if (!ReadPmicReg(0x90, val)) {
+                return false;
+            }
+            return WritePmicReg(0x90, val & 0x7F);
         } else {
             // 映射计算：将 1~100 映射到 寄存器值 20~28
             // 公式：MinReg + (input * (MaxReg - MinReg) / MaxInput)
@@ -87,13 +75,19 @@ public:
                 brightness = 100;
             }
             uint8_t reg_val = 20 + ((uint16_t)brightness * 8 / 100);
-            WriteReg(0x99, reg_val);
+            if (!WritePmicReg(0x99, reg_val)) {
+                return false;
+            }
 
             // Make sure DLDO1 on
-            uint8_t val = ReadReg(0x90);
-            if (!(val & 0x80)) {
-                WriteReg(0x90, val | 0x80);
+            uint8_t val = 0;
+            if (!ReadPmicReg(0x90, val)) {
+                return false;
             }
+            if (!(val & 0x80)) {
+                return WritePmicReg(0x90, val | 0x80);
+            }
+            return true;
         }
     }
 
@@ -107,13 +101,12 @@ public:
         if (opt > XPOWERS_AXP2101_CHG_CUR_1000MA) {
             return false;
         }
-        int val = ReadReg(XPOWERS_AXP2101_ICC_CHG_SET);
-        if (val == -1) {
+        uint8_t val = 0;
+        if (!ReadPmicReg(XPOWERS_AXP2101_ICC_CHG_SET, val)) {
             return false;
         }
         val &= 0xE0;
-        WriteReg(XPOWERS_AXP2101_ICC_CHG_SET, val | opt);
-        return true;
+        return WritePmicReg(XPOWERS_AXP2101_ICC_CHG_SET, val | opt);
     }
 
     bool IsExternalPowerConnected()
@@ -154,6 +147,87 @@ public:
             return -1;
         }
         return val;
+    }
+
+    void PowerOff()
+    {
+        uint8_t value = 0;
+        if (!ReadPmicReg(0x10, value)) {
+            ESP_LOGW(TAG, "AXP2101 power off skipped because PMIC read failed");
+            return;
+        }
+        WritePmicReg(0x10, value | 0x01);
+    }
+
+private:
+    static constexpr int kPmicI2cRetries      = 5;
+    static constexpr int kPmicI2cRetryDelayMs = 20;
+
+    bool initialized_ = false;
+
+    esp_err_t TryReadPmicReg(uint8_t reg, uint8_t& value)
+    {
+        return i2c_master_transmit_receive(i2c_device_, &reg, 1, &value, 1, 100);
+    }
+
+    esp_err_t TryWritePmicReg(uint8_t reg, uint8_t value)
+    {
+        uint8_t buffer[2] = {reg, value};
+        return i2c_master_transmit(i2c_device_, buffer, 2, 100);
+    }
+
+    bool ReadPmicReg(uint8_t reg, uint8_t& value)
+    {
+        for (int attempt = 1; attempt <= kPmicI2cRetries; attempt++) {
+            esp_err_t err = TryReadPmicReg(reg, value);
+            if (err == ESP_OK) {
+                return true;
+            }
+            ESP_LOGW(TAG, "AXP2101 read 0x%02X failed: %s (%d/%d)", reg, esp_err_to_name(err), attempt,
+                     kPmicI2cRetries);
+            vTaskDelay(pdMS_TO_TICKS(kPmicI2cRetryDelayMs * attempt));
+        }
+        return false;
+    }
+
+    bool WritePmicReg(uint8_t reg, uint8_t value)
+    {
+        for (int attempt = 1; attempt <= kPmicI2cRetries; attempt++) {
+            esp_err_t err = TryWritePmicReg(reg, value);
+            if (err == ESP_OK) {
+                return true;
+            }
+            ESP_LOGW(TAG, "AXP2101 write 0x%02X failed: %s (%d/%d)", reg, esp_err_to_name(err), attempt,
+                     kPmicI2cRetries);
+            vTaskDelay(pdMS_TO_TICKS(kPmicI2cRetryDelayMs * attempt));
+        }
+        return false;
+    }
+
+    bool ConfigurePowerRails()
+    {
+        uint8_t data = 0;
+        if (!ReadPmicReg(0x90, data)) {
+            return false;
+        }
+        data |= 0b10110100;
+        if (!WritePmicReg(0x90, data)) {
+            return false;
+        }
+        // WriteReg(0x99, (0b11110 - 5));
+        if (!WritePmicReg(0x97, (0b11110 - 2)) || !WritePmicReg(0x69, 0b00110101) ||
+            !WritePmicReg(0x30, 0b111111) || !WritePmicReg(0x90, 0xBF) || !WritePmicReg(0x94, 33 - 5) ||
+            !WritePmicReg(0x95, 33 - 5) || !WritePmicReg(0x27, 0x00)) {
+            return false;
+        }
+
+        if (!setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_700MA)) {
+            ESP_LOGE(TAG, "Set charge current failed");
+        } else {
+            ESP_LOGI(TAG, "Set charge current success");
+        }
+
+        return SetBrightness(0);
     }
 };
 
@@ -386,6 +460,14 @@ private:
     void InitializeAxp2101()
     {
         ESP_LOGI(TAG, "Init AXP2101");
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            esp_err_t err = i2c_master_probe(i2c_bus_, 0x34, pdMS_TO_TICKS(100));
+            if (err == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "AXP2101 probe failed: %s (%d/5)", esp_err_to_name(err), attempt);
+            vTaskDelay(pdMS_TO_TICKS(20 * attempt));
+        }
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
 
