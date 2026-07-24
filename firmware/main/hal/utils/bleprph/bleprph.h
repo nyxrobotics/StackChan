@@ -163,6 +163,13 @@ void stackchan_ble_set_conn_handle(uint16_t conn_handle);
  */
 bool stackchan_ble_is_connected(void);
 
+/**
+ * Get the current ATT notification payload size.
+ *
+ * @return  Current negotiated MTU minus the ATT notification header size.
+ */
+uint16_t stackchan_ble_get_notify_payload_len(void);
+
 void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg);
 int gatt_svr_init(bool use_alt_uuid);
 

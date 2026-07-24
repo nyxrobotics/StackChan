@@ -20,7 +20,7 @@ static const uint8_t _ble_fragment_magic1       = 0x55;
 static const uint8_t _ble_fragment_magic2       = 0xC3;
 static const uint8_t _ble_fragment_version      = 1;
 static const uint16_t _ble_fragment_header_len  = 10;
-static const uint16_t _ble_fallback_payload_len = 20;
+static const uint16_t _ble_fallback_payload_len = 23 - 3;
 static uint16_t _ble_dynamic_payload            = _ble_fallback_payload_len;
 
 using BleNotifyCallback = int (*)(const char*, uint16_t);
@@ -34,7 +34,7 @@ static void _recordIncomingWritePayload(uint16_t len)
 
 static bool _sendFragmentedNotify(BleNotifyCallback notify, const char* json_data, uint16_t json_len, const char* tag)
 {
-    const uint16_t usable_payload = _ble_dynamic_payload;
+    const uint16_t usable_payload = std::max(_ble_dynamic_payload, stackchan_ble_get_notify_payload_len());
 
     if (json_data == nullptr || json_len == 0) {
         return true;

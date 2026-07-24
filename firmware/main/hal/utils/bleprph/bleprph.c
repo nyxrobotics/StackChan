@@ -78,6 +78,7 @@ static uint16_t bearers;
 #endif
 
 static bool s_use_alt_uuid = false;
+static uint16_t s_notify_payload_len = 20;
 
 void ble_store_config_init(void);
 
@@ -360,6 +361,7 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
                 assert(rc == 0);
                 bleprph_print_conn_desc(&desc);
                 stackchan_ble_set_conn_handle(event->connect.conn_handle);
+                s_notify_payload_len = 20;
             }
             MODLOG_DFLT(INFO, "\n");
 
@@ -381,6 +383,7 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
             MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
             bleprph_print_conn_desc(&event->disconnect.conn);
             stackchan_ble_set_conn_handle(BLE_HS_CONN_HANDLE_NONE);
+            s_notify_payload_len = 20;
             MODLOG_DFLT(INFO, "\n");
 
             /* Connection terminated; resume advertising. */
@@ -438,6 +441,9 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
         case BLE_GAP_EVENT_MTU:
             MODLOG_DFLT(INFO, "mtu update event; conn_handle=%d cid=%d mtu=%d\n", event->mtu.conn_handle,
                         event->mtu.channel_id, event->mtu.value);
+            if (event->mtu.value > 3) {
+                s_notify_payload_len = event->mtu.value - 3;
+            }
             return 0;
 
         case BLE_GAP_EVENT_REPEAT_PAIRING:
@@ -716,4 +722,9 @@ void ble_prph_init(bool use_alt_uuid)
         cids[i] = 0;
     }
 #endif
+}
+
+uint16_t stackchan_ble_get_notify_payload_len(void)
+{
+    return s_notify_payload_len;
 }
