@@ -1,10 +1,17 @@
 #include "cores3_audio_codec.h"
 
+#include <esp_err.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
 #define TAG "CoreS3AudioCodec"
+
+namespace {
+constexpr int64_t kInputRestartTimeoutUs = 5 * 1000 * 1000;
+}
 
 CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
@@ -209,10 +216,45 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
-        ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
-        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+
+        esp_err_t ret = ESP_FAIL;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            ret = esp_codec_dev_open(input_dev_, &fs);
+            if (ret == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "Failed to open ES7210 input (attempt %d/3): %s",
+                     attempt, esp_err_to_name(ret));
+            esp_rom_delay_us(20000);
+        }
+        if (ret != ESP_OK) {
+            int64_t now = esp_timer_get_time();
+            if (input_open_failed_since_us_ == 0) {
+                input_open_failed_since_us_ = now;
+            }
+            int64_t elapsed_us = now - input_open_failed_since_us_;
+            ESP_LOGE(TAG, "ES7210 input remains disabled: %s", esp_err_to_name(ret));
+            if (elapsed_us >= kInputRestartTimeoutUs) {
+                ESP_LOGE(TAG, "ES7210 input failed for %lld ms; restarting",
+                         static_cast<long long>(elapsed_us / 1000));
+                esp_restart();
+            }
+            return;
+        }
+
+        ret = esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set ES7210 input gain: %s", esp_err_to_name(ret));
+            esp_codec_dev_close(input_dev_);
+            return;
+        }
+        input_open_failed_since_us_ = 0;
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+        esp_err_t ret = esp_codec_dev_close(input_dev_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to close ES7210 input: %s", esp_err_to_name(ret));
+        }
+        input_open_failed_since_us_ = 0;
     }
     AudioCodec::EnableInput(enable);
 }
@@ -239,8 +281,14 @@ void CoreS3AudioCodec::EnableOutput(bool enable) {
 }
 
 int CoreS3AudioCodec::Read(int16_t* dest, int samples) {
-    if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
+    if (!input_enabled_) {
+        return 0;
+    }
+
+    esp_err_t ret = esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ES7210 read failed: %s", esp_err_to_name(ret));
+        return 0;
     }
     return samples;
 }
