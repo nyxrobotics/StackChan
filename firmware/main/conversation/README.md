@@ -83,7 +83,28 @@ Xiaozhi Online  →  Module LLM Local  →  Static Fallback
 ./scripts/provision_module_llm.sh
 ```
 
-このスクリプトは apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+
+個別に実行したい場合も、PC側から同じ入口を使います。
+
+```bash
+./scripts/provision_module_llm.sh qwen3 --no-reboot
+./scripts/provision_module_llm.sh openjtalk --no-reboot
+./scripts/provision_module_llm.sh verify --no-reboot
+```
+
+内部では、Module LLM上に転送された以下の機能別スクリプトが実行されます。
+
+| スクリプト | 内容 |
+|---|---|
+| `setup_repo.sh` | StackFlow aptリポジトリ登録と `apt update` |
+| `setup_runtime.sh` | Module LLM共通ランタイム |
+| `setup_whisper.sh` | Whisper ASR機能とモデル |
+| `setup_qwen3.sh` | Qwen3 LLM機能とモデル |
+| `setup_vad.sh` | VAD機能とSileroモデル |
+| `setup_melotts.sh` | MeloTTS機能とフォールバック用モデル |
+| `setup_openjtalk.sh` | Open JTalk、tohoku voice、TTS helper |
+| `verify_setup.sh` | パッケージとOpen JTalk helperの確認 |
 
 以降の手順は、スクリプトを使わず手動でセットアップする場合の代替手順です。
 
@@ -134,68 +155,102 @@ apt update
 
 ---
 
-### 2-4. 必要なパッケージを一括インストール
+### 2-4. Module LLM 共通ランタイム
 
-#### ベースライブラリ・機能モジュール
+対応スクリプト: `setup_runtime.sh`
 
 ```bash
 apt install lib-llm      # 実行環境ベースライブラリ
 apt install llm-sys      # StackFlow 基盤
 apt install llm-audio    # サウンドカード管理
-apt install llm-whisper  # Whisper ASR 機能モジュール
-apt install llm-llm      # LLM テキスト生成機能モジュール
-apt install llm-melotts  # MeloTTS TTS 機能モジュール
-apt install llm-vad      # VAD 機能モジュール
-apt install open-jtalk open-jtalk-mecab-naist-jdic alsa-utils  # Open JTalk 日本語TTS
 ```
-
-#### モデルファイル (容量大・要時間)
-
-```bash
-apt install llm-model-whisper-tiny          # Whisper Tiny (~数十MB)
-apt install llm-model-qwen3-0.6b-ax630c     # Qwen3-0.6B (~数百MB)
-apt install llm-model-melotts-ja-jp         # MeloTTS 日本語モデル
-apt install llm-model-silero-vad            # VAD モデル
-```
-
-日本語TTSはOpen JTalk + tohoku-f01 neutral voiceを優先します。
-Open JTalk helperが見つからない場合はMeloTTSへフォールバックします。
-
-> **注意:** モデルはストレージを大量に消費します。  
-> `df -h` で空き容量を確認してからインストールしてください。
 
 ---
 
-### 2-5. インストール確認
+### 2-5. Whisper ASR
+
+対応スクリプト: `setup_whisper.sh`
 
 ```bash
-# インストール済みパッケージを確認
-apt list --installed | grep llm
-
-# StackFlow サービスが動いているか確認
-ps aux | grep stackflow
+apt install llm-whisper  # Whisper ASR 機能モジュール
+apt install llm-model-whisper-tiny  # Whisper Tiny モデル
 ```
 
-以下が全て表示されれば OK です:
+---
 
-```
-lib-llm
-llm-sys
-llm-audio
-llm-whisper
-llm-llm
-llm-melotts
-llm-vad
-llm-model-whisper-tiny
-llm-model-qwen3-0.6b-ax630c
-llm-model-melotts-ja-jp
-llm-model-silero-vad
-open-jtalk
-open-jtalk-mecab-naist-jdic
-alsa-utils
+### 2-6. Qwen3 LLM
+
+対応スクリプト: `setup_qwen3.sh`
+
+```bash
+apt install llm-llm      # LLM テキスト生成機能モジュール
+apt install llm-model-qwen3-0.6b-ax630c  # Qwen3-0.6B モデル
 ```
 
-Open JTalk helperの確認:
+---
+
+### 2-7. VAD
+
+対応スクリプト: `setup_vad.sh`
+
+```bash
+apt install llm-vad                # VAD 機能モジュール
+apt install llm-model-silero-vad   # VAD モデル
+```
+
+---
+
+### 2-8. MeloTTS fallback
+
+対応スクリプト: `setup_melotts.sh`
+
+Open JTalk helperが見つからない場合のフォールバックTTSとして使います。
+
+```bash
+apt install llm-melotts             # MeloTTS TTS 機能モジュール
+apt install llm-model-melotts-ja-jp # MeloTTS 日本語モデル
+```
+
+オプションのTTS言語モデル:
+
+```bash
+apt install llm-model-melotts-zh-cn
+apt install llm-model-melotts-en-default llm-model-melotts-en-us
+```
+
+---
+
+### 2-9. Open JTalk / tohoku voice
+
+対応スクリプト: `setup_openjtalk.sh`
+
+日本語TTSはOpen JTalk + tohoku-f01 neutral voiceを優先します。
+
+```bash
+apt install open-jtalk open-jtalk-mecab-naist-jdic alsa-utils
+mkdir -p /opt/stackchan/voices
+wget -O /opt/stackchan/voices/tohoku-f01-neutral.htsvoice \
+  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice
+wget -O /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt \
+  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt
+```
+
+---
+
+### 2-10. インストール確認
+
+対応スクリプト: `verify_setup.sh`
+
+以下が全て `install ok installed` になれば OK です。
+
+```bash
+dpkg -s lib-llm llm-sys llm-audio \
+  llm-whisper llm-model-whisper-tiny \
+  llm-llm llm-model-qwen3-0.6b-ax630c \
+  llm-vad llm-model-silero-vad \
+  llm-melotts llm-model-melotts-ja-jp \
+  open-jtalk open-jtalk-mecab-naist-jdic alsa-utils
+```
 
 ```bash
 /opt/stackchan/openjtalk_tts.sh --check
@@ -203,7 +258,7 @@ Open JTalk helperの確認:
 
 ---
 
-### 2-6. Module LLM を再起動
+### 2-11. Module LLM を再起動
 
 インストール完了後、Module LLM を再起動してサービスを有効化します。
 

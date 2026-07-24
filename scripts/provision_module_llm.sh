@@ -1,297 +1,358 @@
 #!/usr/bin/env bash
 # =============================================================================
 # provision_module_llm.sh
-# M5Stack Module LLM セットアップスクリプト
+# Host-side ADB wrapper for StackChan Module LLM setup.
 #
-# 使い方:
-#   1. Module LLM の USB-C ポートを PC に接続する
-#   2. ./scripts/provision_module_llm.sh
+# Usage:
+#   1. Connect the Module LLM USB-C port to this PC.
+#   2. Connect the Module LLM Ethernet port to the internet.
+#   3. ./scripts/provision_module_llm.sh
 #
-# 必要なもの:
-#   - adb (Android Debug Bridge)
-#       macOS  : brew install android-platform-tools
-#       Ubuntu : sudo apt install adb
-#       Windows: https://developer.android.com/tools/releases/platform-tools
-#   - インターネット接続 (Module LLM 側で apt するため)
+# The actual setup logic lives in scripts/module_llm/ and runs on the Module LLM
+# itself. This host-side wrapper transfers those scripts over ADB and invokes the
+# selected setup target.
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODULE_SCRIPT_DIR="${SCRIPT_DIR}/module_llm"
+REMOTE_DIR="/tmp/stackchan_module_llm_setup"
 
-# --- カラー出力 ---------------------------------------------------------------
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERR ]${NC}  $*"; }
-die()     { error "$*"; exit 1; }
-
-# --- インストールするパッケージ一覧 -------------------------------------------
-PACKAGES_BASE=(
-    lib-llm
-    llm-sys
-    llm-audio
-    llm-whisper
-    llm-llm
-    llm-melotts
-    llm-vad
-)
-PACKAGES_MODEL=(
-    llm-model-whisper-tiny
-    llm-model-qwen3-0.6b-ax630c
-    llm-model-melotts-ja-jp
-    llm-model-silero-vad
-)
-PACKAGES_OPENJTALK=(
-    open-jtalk
-    open-jtalk-mecab-naist-jdic
-    alsa-utils
-)
-
-TOHOKU_VOICE_URL="${TOHOKU_VOICE_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice}"
-TOHOKU_COPYRIGHT_URL="${TOHOKU_COPYRIGHT_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt}"
-
-# --- ADB ラッパー (エラー時に分かりやすいメッセージを出す) -------------------
+ADB="${ADB:-adb}"
 ADB_RETRY_COUNT=10
 ADB_RETRY_DELAY=2
 
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info() { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok() { echo -e "${GREEN}[ OK ]${NC}  $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error() { echo -e "${RED}[ERR ]${NC}  $*"; }
+die() { error "$*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/provision_module_llm.sh [target] [options]
+
+Targets:
+  all        Run the full Module LLM setup. This is the default.
+  repo       Register the StackFlow apt repository and run apt update.
+  runtime    Install shared Module LLM runtime packages.
+  whisper    Install Whisper ASR support and model.
+  qwen3      Install Qwen3 local LLM support and model.
+  vad        Install VAD support and model.
+  melotts    Install MeloTTS fallback support and models.
+  openjtalk  Install OpenJTalk, tohoku voice, and StackChan TTS helper.
+  verify     Verify installed packages and the OpenJTalk helper.
+
+Options:
+  --with-zh-tts    Install the optional Chinese MeloTTS model.
+  --with-en-tts    Install the optional English MeloTTS models.
+  --with-all-tts   Install all optional MeloTTS language models.
+  --upgrade        Run apt upgrade during Module LLM setup.
+  --reboot         Reboot automatically after setup.
+  --no-reboot      Do not reboot after setup.
+  -h, --help       Show this help.
+
+Examples:
+  ./scripts/provision_module_llm.sh
+  ./scripts/provision_module_llm.sh qwen3 --no-reboot
+  ./scripts/provision_module_llm.sh openjtalk --no-reboot
+  ./scripts/provision_module_llm.sh melotts --with-en-tts
+
+This script is the normal entry point from the host PC. It transfers the
+module-side setup scripts over ADB and runs the selected target on the
+Module LLM.
+EOF
+}
+
+TARGET="all"
+RUN_UPGRADE=0
+INSTALL_ZH_TTS=0
+INSTALL_EN_TTS=0
+REBOOT_MODE="ask"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --with-zh-tts)
+            INSTALL_ZH_TTS=1
+            ;;
+        --with-en-tts)
+            INSTALL_EN_TTS=1
+            ;;
+        --with-all-tts)
+            INSTALL_ZH_TTS=1
+            INSTALL_EN_TTS=1
+            ;;
+        --upgrade)
+            RUN_UPGRADE=1
+            ;;
+        --reboot)
+            REBOOT_MODE="yes"
+            ;;
+        --no-reboot)
+            REBOOT_MODE="no"
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            usage
+            die "Unknown option: $1"
+            ;;
+        *)
+            if [ "$TARGET" != "all" ]; then
+                usage
+                die "Multiple targets were specified: $TARGET and $1"
+            fi
+            TARGET="$1"
+            ;;
+    esac
+    shift
+done
+
 adb_shell() {
-    local cmd="$*"
-    adb shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; ${cmd}" 2>&1
+    "$ADB" shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; $*" 2>&1
 }
 
-# =============================================================================
-# 0. 事前確認
-# =============================================================================
-echo ""
-echo "======================================================"
-echo " M5Stack Module LLM プロビジョニングスクリプト"
-echo "======================================================"
-echo ""
-
-# adb がインストールされているか
-command -v adb >/dev/null 2>&1 || die "adb が見つかりません。インストールしてから再実行してください。"
-
-# デバイスが繋がっているか
-info "ADB デバイスを確認中..."
-adb kill-server >/dev/null 2>&1 || true
-adb start-server >/dev/null 2>&1 || true
-
-ADB_DEVICES=""
-for attempt in $(seq 1 "$ADB_RETRY_COUNT"); do
-    ADB_DEVICES=$(adb devices | grep -v "List of" | grep -v "^$" | grep "device$" || true)
-    if [ -n "$ADB_DEVICES" ]; then
-        break
-    fi
-    if [ "$attempt" -lt "$ADB_RETRY_COUNT" ]; then
-        info "  接続待ち (${attempt}/${ADB_RETRY_COUNT})..."
-        sleep "$ADB_RETRY_DELAY"
-    fi
-done
-
-if [ -z "$ADB_DEVICES" ]; then
-    echo ""
-    error "Module LLM が ADB で認識されていません。"
-    echo ""
-    echo "  チェックリスト:"
-    echo "  1. Module LLM の USB-C ポート (Type-C) に接続していますか？"
-    echo "     (CoreS3 側の USB-C ではありません)"
-    echo "  2. データ転送対応のケーブルを使っていますか？"
-    echo "  3. Linux/macOS の場合: udev ルールや権限を確認してください"
-    echo "     sudo adb kill-server && sudo adb start-server"
-    echo ""
-    exit 1
-fi
-ok "Module LLM を検出しました"
-
-# =============================================================================
-# 1. ディスク容量確認
-# =============================================================================
-info "ディスク空き容量を確認中..."
-DISK_INFO=$(adb_shell df -h / | tail -1)
-echo "  $DISK_INFO"
-
-# 空き容量を MB で取得 (busybox df の出力形式に合わせた簡易チェック)
-AVAIL_KB=$(adb_shell df / | tail -1 | awk '{print $4}' | tr -d 'G\r\n' || echo "0")
-# 数値でなければスキップ
-if [[ "$AVAIL_KB" =~ ^[0-9]+$ ]] && [ "$AVAIL_KB" -lt 1048576 ]; then
-    warn "空き容量が 1GB 未満です (${AVAIL_KB}KB)。モデルのインストールに失敗する可能性があります。"
-    read -rp "  続行しますか？ [y/N]: " CONT
-    [[ "${CONT,,}" == "y" ]] || die "中断しました。"
-fi
-
-# =============================================================================
-# 2. apt ソース登録 (初回のみ)
-# =============================================================================
-info "M5Stack apt リポジトリを確認中..."
-
-SOURCES_FILE="/etc/apt/sources.list.d/StackFlow.list"
-ALREADY_REGISTERED=$(adb_shell "[ -f $SOURCES_FILE ] && echo yes || echo no")
-ALREADY_REGISTERED=$(echo "$ALREADY_REGISTERED" | tr -d '\r\n')
-
-if [ "$ALREADY_REGISTERED" = "yes" ]; then
-    ok "apt ソースは登録済みです"
-else
-    info "GPG キーを取得中..."
-    adb_shell "wget -qO /etc/apt/keyrings/StackFlow.gpg \
-        https://repo.llm.m5stack.com/m5stack-apt-repo/key/StackFlow.gpg" \
-        || die "GPG キーの取得に失敗しました (インターネット接続を確認してください)"
-
-    info "apt ソースリストを登録中..."
-    adb_shell "echo 'deb [arch=arm64 signed-by=/etc/apt/keyrings/StackFlow.gpg] \
-        https://repo.llm.m5stack.com/m5stack-apt-repo jammy ax630c' \
-        > $SOURCES_FILE" \
-        || die "ソースリストの書き込みに失敗しました"
-
-    ok "apt ソースを登録しました"
-fi
-
-# =============================================================================
-# 3. apt update
-# =============================================================================
-info "apt update 中... (時間がかかることがあります)"
-adb_shell "apt-get update -y -qq" || die "apt update に失敗しました"
-ok "apt update 完了"
-
-# =============================================================================
-# 4. パッケージインストール
-# =============================================================================
-
-install_package() {
-    local pkg="$1"
-    # すでにインストール済みか確認
-    local STATUS
-    STATUS=$(adb_shell "dpkg -s '$pkg' 2>/dev/null | grep '^Status:'" | tr -d '\r\n')
-    if echo "$STATUS" | grep -q "installed"; then
-        ok "  $pkg (スキップ: インストール済み)"
-        return 0
-    fi
-
-    info "  $pkg をインストール中..."
-    if adb_shell "apt-get install -y -qq '$pkg'"; then
-        ok "  $pkg"
-    else
-        error "  $pkg のインストールに失敗しました"
-        return 1
-    fi
+remote_quote_args() {
+    local arg
+    for arg in "$@"; do
+        printf ' %q' "$arg"
+    done
 }
 
-echo ""
-info "=== ベースライブラリ・機能モジュール ==="
-FAILED_BASE=()
-for pkg in "${PACKAGES_BASE[@]}"; do
-    install_package "$pkg" || FAILED_BASE+=("$pkg")
-done
+target_script() {
+    case "$TARGET" in
+        all|module|llm-module)
+            echo "setup_llm_module.sh"
+            ;;
+        repo)
+            echo "setup_repo.sh"
+            ;;
+        runtime)
+            echo "setup_runtime.sh"
+            ;;
+        whisper)
+            echo "setup_whisper.sh"
+            ;;
+        qwen3)
+            echo "setup_qwen3.sh"
+            ;;
+        vad)
+            echo "setup_vad.sh"
+            ;;
+        melotts)
+            echo "setup_melotts.sh"
+            ;;
+        openjtalk)
+            echo "setup_openjtalk.sh"
+            ;;
+        verify)
+            echo "verify_setup.sh"
+            ;;
+        *)
+            usage
+            die "Unknown target: $TARGET"
+            ;;
+    esac
+}
 
-echo ""
-info "=== モデルファイル (大容量・時間がかかります) ==="
-FAILED_MODEL=()
-for pkg in "${PACKAGES_MODEL[@]}"; do
-    install_package "$pkg" || FAILED_MODEL+=("$pkg")
-done
+build_target_args() {
+    TARGET_ARGS=()
 
-echo ""
-info "=== Open JTalk / tohoku voice ==="
-FAILED_OPENJTALK=()
-for pkg in "${PACKAGES_OPENJTALK[@]}"; do
-    install_package "$pkg" || FAILED_OPENJTALK+=("$pkg")
-done
+    case "$TARGET" in
+        all|module|llm-module)
+            TARGET_ARGS+=(--no-reboot)
+            if [ "$RUN_UPGRADE" -eq 1 ]; then
+                TARGET_ARGS+=(--upgrade)
+            fi
+            if [ "$INSTALL_ZH_TTS" -eq 1 ]; then
+                TARGET_ARGS+=(--with-zh-tts)
+            fi
+            if [ "$INSTALL_EN_TTS" -eq 1 ]; then
+                TARGET_ARGS+=(--with-en-tts)
+            fi
+            ;;
+        repo)
+            if [ "$RUN_UPGRADE" -eq 1 ]; then
+                TARGET_ARGS+=(--upgrade)
+            fi
+            if [ "$INSTALL_ZH_TTS" -eq 1 ] || [ "$INSTALL_EN_TTS" -eq 1 ]; then
+                die "TTS language model options are only valid for all, melotts, or verify targets."
+            fi
+            ;;
+        melotts|verify)
+            if [ "$INSTALL_ZH_TTS" -eq 1 ]; then
+                TARGET_ARGS+=(--with-zh-tts)
+            fi
+            if [ "$INSTALL_EN_TTS" -eq 1 ]; then
+                TARGET_ARGS+=(--with-en-tts)
+            fi
+            if [ "$RUN_UPGRADE" -eq 1 ]; then
+                die "--upgrade is only valid for all or repo targets."
+            fi
+            ;;
+        runtime|whisper|qwen3|vad|openjtalk)
+            if [ "$RUN_UPGRADE" -eq 1 ]; then
+                die "--upgrade is only valid for all or repo targets."
+            fi
+            if [ "$INSTALL_ZH_TTS" -eq 1 ] || [ "$INSTALL_EN_TTS" -eq 1 ]; then
+                die "TTS language model options are only valid for all, melotts, or verify targets."
+            fi
+            ;;
+    esac
+}
 
-if [ ${#FAILED_OPENJTALK[@]} -eq 0 ]; then
-    info "StackChan Open JTalk helper を配置中..."
-    adb push "$SCRIPT_DIR/module_llm/openjtalk_tts.sh" /tmp/stackchan_openjtalk_tts.sh >/dev/null \
-        || die "openjtalk_tts.sh の転送に失敗しました"
-    adb_shell "mkdir -p /opt/stackchan/voices && install -m 0755 /tmp/stackchan_openjtalk_tts.sh /opt/stackchan/openjtalk_tts.sh" \
-        || die "openjtalk_tts.sh の配置に失敗しました"
+check_adb() {
+    command -v "$ADB" >/dev/null 2>&1 \
+        || die "adb was not found. Install Android platform-tools and rerun this script."
 
-    info "tohoku-f01 neutral voice を確認中..."
-    if adb_shell "[ -f /opt/stackchan/voices/tohoku-f01-neutral.htsvoice ]"; then
-        ok "  tohoku-f01-neutral.htsvoice (スキップ: 配置済み)"
-    else
-        info "  tohoku-f01-neutral.htsvoice を取得中..."
-        adb_shell "wget -qO /opt/stackchan/voices/tohoku-f01-neutral.htsvoice '$TOHOKU_VOICE_URL'" \
-            || die "tohoku voice の取得に失敗しました"
-        adb_shell "wget -qO /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt '$TOHOKU_COPYRIGHT_URL'" \
-            || warn "tohoku voice COPYRIGHT.txt の取得に失敗しました"
-        ok "  tohoku-f01-neutral.htsvoice"
-    fi
+    info "Checking ADB device..."
+    "$ADB" start-server >/dev/null 2>&1 || true
 
-    info "Open JTalk helper の動作確認中..."
-    adb_shell "/opt/stackchan/openjtalk_tts.sh --check" \
-        || die "Open JTalk helper の確認に失敗しました"
-fi
+    local devices=""
+    local denied=""
+    local unauthorized=""
+    local count=0
+    local attempt
+    for attempt in $(seq 1 "$ADB_RETRY_COUNT"); do
+        local adb_list
+        adb_list="$("$ADB" devices | grep -v "List of" | grep -v '^$' || true)"
+        devices="$(printf '%s\n' "$adb_list" | grep 'device$' || true)"
+        denied="$(printf '%s\n' "$adb_list" | grep 'no permissions' || true)"
+        unauthorized="$(printf '%s\n' "$adb_list" | grep 'unauthorized' || true)"
+        count="$(printf '%s\n' "$devices" | grep -c 'device$' || true)"
+        if [ "$count" -eq 1 ]; then
+            ok "Module LLM detected"
+            return
+        elif [ "$count" -gt 1 ]; then
+            error "Multiple ADB devices were detected. Disconnect other devices or set ANDROID_SERIAL."
+            printf '%s\n' "$devices"
+            exit 1
+        elif [ -n "$denied" ]; then
+            error "ADB can see the Module LLM, but this user has no USB permission."
+            printf '%s\n' "$denied"
+            echo ""
+            echo "On Linux, start the ADB server with sufficient permission or add a udev rule."
+            echo "Temporary workaround:"
+            echo "  sudo adb kill-server && sudo adb start-server"
+            exit 1
+        elif [ -n "$unauthorized" ]; then
+            error "ADB device is unauthorized."
+            printf '%s\n' "$unauthorized"
+            echo ""
+            echo "Reconnect the Module LLM or confirm the authorization prompt if one appears."
+            exit 1
+        fi
 
-# =============================================================================
-# 5. インストール結果サマリー
-# =============================================================================
-echo ""
-echo "======================================================"
-echo " インストール結果"
-echo "======================================================"
+        if [ "$attempt" -lt "$ADB_RETRY_COUNT" ]; then
+            info "  Waiting for device (${attempt}/${ADB_RETRY_COUNT})..."
+            sleep "$ADB_RETRY_DELAY"
+        fi
+    done
 
-ALL_PKGS=("${PACKAGES_BASE[@]}" "${PACKAGES_MODEL[@]}" "${PACKAGES_OPENJTALK[@]}")
-FAILED_ALL=("${FAILED_BASE[@]}" "${FAILED_MODEL[@]}" "${FAILED_OPENJTALK[@]}")
-
-for pkg in "${ALL_PKGS[@]}"; do
-    STATUS=$(adb_shell "dpkg -s '$pkg' 2>/dev/null | grep '^Status:'" | tr -d '\r\n')
-    if echo "$STATUS" | grep -q "installed"; then
-        echo -e "  ${GREEN}✓${NC} $pkg"
-    else
-        echo -e "  ${RED}✗${NC} $pkg"
-    fi
-done
-
-echo ""
-
-if [ ${#FAILED_ALL[@]} -gt 0 ]; then
-    error "以下のパッケージのインストールに失敗しました:"
-    for pkg in "${FAILED_ALL[@]}"; do echo "    - $pkg"; done
     echo ""
-    echo "  手動で確認してください:"
-    echo "    adb shell"
-    echo "    apt install ${FAILED_ALL[*]}"
+    error "Module LLM was not detected over ADB."
+    echo ""
+    echo "Checklist:"
+    echo "  1. Is the cable connected to the Module LLM USB-C port, not the CoreS3 port?"
+    echo "  2. Is the USB-C cable data-capable?"
+    echo "  3. On Linux/macOS, try: sudo adb kill-server && sudo adb start-server"
     echo ""
     exit 1
-fi
+}
 
-# =============================================================================
-# 6. StackFlow 動作確認
-# =============================================================================
-info "StackFlow サービスの状態を確認中..."
-SF_PROC=$(adb_shell "ps aux | grep stackflow | grep -v grep" | tr -d '\r\n' || true)
-if [ -n "$SF_PROC" ]; then
-    ok "StackFlow プロセスが動作しています"
-else
-    warn "StackFlow プロセスが見つかりません (reboot 後に起動します)"
-fi
+push_module_scripts() {
+    [ -f "${MODULE_SCRIPT_DIR}/setup_llm_module.sh" ] \
+        || die "Missing ${MODULE_SCRIPT_DIR}/setup_llm_module.sh"
+    [ -f "${MODULE_SCRIPT_DIR}/openjtalk_tts.sh" ] \
+        || die "Missing ${MODULE_SCRIPT_DIR}/openjtalk_tts.sh"
 
-# =============================================================================
-# 7. 再起動
-# =============================================================================
-echo ""
-ok "全パッケージのインストールが完了しました！"
-echo ""
-read -rp "Module LLM を再起動しますか？ [Y/n]: " DO_REBOOT
-DO_REBOOT="${DO_REBOOT:-y}"
+    info "Transferring Module LLM setup scripts..."
+    adb_shell "rm -rf '$REMOTE_DIR' && mkdir -p '$REMOTE_DIR'" >/dev/null \
+        || die "Failed to prepare $REMOTE_DIR on the Module LLM."
+    "$ADB" push "${MODULE_SCRIPT_DIR}/." "${REMOTE_DIR}/" >/dev/null \
+        || die "Failed to transfer Module LLM setup scripts."
+    adb_shell "chmod 0755 '$REMOTE_DIR'/*.sh" >/dev/null \
+        || die "Failed to chmod setup scripts on the Module LLM."
+    ok "Setup scripts transferred"
+}
 
-if [[ "${DO_REBOOT,,}" == "y" ]]; then
-    info "Module LLM を再起動中..."
-    adb_shell "reboot" || true
+run_module_setup() {
+    local script
+    local args
+    script="$(target_script)"
+    build_target_args
+    args="$(remote_quote_args "${TARGET_ARGS[@]}")"
+
+    info "Running ${TARGET} setup on the Module LLM..."
+    adb_shell "bash '$REMOTE_DIR/$script'${args}" \
+        || die "Module LLM setup failed."
+    ok "Module LLM ${TARGET} setup finished"
+}
+
+maybe_reboot() {
     echo ""
-    ok "再起動コマンドを送信しました。"
-    echo "  30秒ほど待ってから StackChan を起動してください。"
-else
-    warn "再起動をスキップしました。手動で 'adb shell reboot' を実行してください。"
-fi
+    case "$REBOOT_MODE" in
+        yes)
+            info "Rebooting Module LLM..."
+            adb_shell "reboot" || true
+            ok "Reboot command sent"
+            ;;
+        no)
+            warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
+            ;;
+        ask)
+            if [ -t 0 ]; then
+                local answer
+                read -r -p "Reboot Module LLM now? [Y/n]: " answer
+                answer="${answer:-y}"
+                case "${answer,,}" in
+                    y|yes)
+                        info "Rebooting Module LLM..."
+                        adb_shell "reboot" || true
+                        ok "Reboot command sent"
+                        ;;
+                    *)
+                        warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
+                        ;;
+                esac
+            else
+                warn "Non-interactive shell: reboot skipped. Run 'adb shell reboot' before starting StackChan."
+            fi
+            ;;
+    esac
+}
 
-echo ""
-echo "======================================================"
-echo " セットアップ完了！"
-echo "======================================================"
-echo ""
-echo "  次のステップ:"
-echo "  1. Module LLM が再起動したら CoreS3 に取り付ける"
-echo "  2. StackChan ファームウェアを書き込む"
-echo "  3. 電源を入れると Module LLM を自動検出して起動します"
-echo ""
+main() {
+    echo ""
+    echo "======================================================"
+    echo " M5Stack Module LLM provisioning"
+    echo "======================================================"
+    echo ""
+
+    check_adb
+    push_module_scripts
+    run_module_setup
+    maybe_reboot
+
+    echo ""
+    echo "======================================================"
+    echo " Setup complete"
+    echo "======================================================"
+    echo ""
+    echo "Next steps:"
+    echo "  1. After the Module LLM reboots, attach it to the CoreS3."
+    echo "  2. Flash the StackChan firmware."
+    echo "  3. Power on StackChan; the Module LLM pipeline will start automatically."
+    echo ""
+}
+
+main "$@"
