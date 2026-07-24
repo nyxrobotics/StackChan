@@ -184,13 +184,6 @@ private:
     // the corresponding servo is absent, so avatar animations stay coherent.
     int _last_yaw_target   = 0;
     int _last_pitch_target = 0;
-
-    static constexpr float RAD_TO_DEG = 180.0f / M_PI;
-
-    inline float to_degrees(float radians)
-    {
-        return radians * RAD_TO_DEG;
-    }
 };
 
 }  // namespace stackchan::motion

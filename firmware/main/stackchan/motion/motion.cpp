@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "motion.h"
-#include <cmath>
+#include "motion_math.h"
 
 using namespace uitk;
 using namespace stackchan::motion;
@@ -96,32 +96,16 @@ void Motion::stop()
 
 void Motion::lookAtNormalized(float x, float y, int speed)
 {
-    int yaw_angle   = 0;
-    int pitch_angle = 0;
-
-    if (_yaw_servo) {
-        yaw_angle = uitk::map_range(x, -1.0f, 1.0f,
-                                    (float)_yaw_servo->getAngleLimit().x,
-                                    (float)_yaw_servo->getAngleLimit().y);
-    }
-    if (_pitch_servo) {
-        pitch_angle = uitk::map_range(y, -1.0f, 1.0f,
-                                      (float)_pitch_servo->getAngleLimit().x,
-                                      (float)_pitch_servo->getAngleLimit().y);
-    }
-    moveWithSpeed(yaw_angle, pitch_angle, speed);
+    auto yaw_limit   = _yaw_servo ? _yaw_servo->getAngleLimit() : Vector2i(-1280, 1280);
+    auto pitch_limit = _pitch_servo ? _pitch_servo->getAngleLimit() : Vector2i(30, 870);
+    auto angles = calculateNormalizedLookAngles(x, y, yaw_limit.x, yaw_limit.y, pitch_limit.x, pitch_limit.y);
+    moveWithSpeed(angles.yaw, angles.pitch, speed);
 }
 
 void Motion::lookAtPoint(float x, float y, float z, int speed)
 {
-    float yaw_rad     = std::atan2(y, x);
-    float ground_dist = std::sqrt(x * x + y * y);
-    float pitch_rad   = std::atan2(z, ground_dist);
-
-    int yaw_angle   = static_cast<int>(to_degrees(yaw_rad) * 10);
-    int pitch_angle = static_cast<int>(to_degrees(pitch_rad) * 10);
-
-    moveWithSpeed(yaw_angle, pitch_angle, speed);
+    auto angles = calculatePointLookAngles(x, y, z);
+    moveWithSpeed(angles.yaw, angles.pitch, speed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
