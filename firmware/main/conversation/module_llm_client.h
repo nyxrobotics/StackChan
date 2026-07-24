@@ -125,8 +125,6 @@ public:
 private:
     // Low-level StackFlow JSON-RPC helpers
     bool waitForAck(const std::string& method, int timeoutMs = 10000);
-    void killStaleTasks();  // sys.tasklist で残留タスクを exit する
-
     // UART handle (platform-specific)
     int          uartFd_    = -1;
     ModuleLLMState state_   = ModuleLLMState::NotConnected;

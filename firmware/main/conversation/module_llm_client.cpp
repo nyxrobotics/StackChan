@@ -9,6 +9,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -275,8 +276,8 @@ std::string ModuleLLMClient::sfCommand(const std::string& reqId,
     }
 
     char* s = cJSON_PrintUnformatted(msg);
-    bool sent = stackflowSend(s);
-    free(s);
+    bool sent = s && stackflowSend(s);
+    if (s) free(s);
     // dataObj ownership transferred to msg
     cJSON_Delete(msg);
 
@@ -285,21 +286,42 @@ std::string ModuleLLMClient::sfCommand(const std::string& reqId,
         return "";
     }
 
-    // Drain any buffered async messages until we find ours
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        std::string resp = stackflowReceive(timeoutMs);
-        if (resp.empty()) {
-            ESP_LOGW(TAG, "sfCommand(%s.%s): timeout", workId.c_str(), action.c_str());
-            return "";
-        }
+    int ignored = 0;
+    int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+    while (esp_timer_get_time() / 1000 < deadline) {
+        int remaining = static_cast<int>(deadline - esp_timer_get_time() / 1000);
+        if (remaining < 1) break;
+
+        std::string resp = stackflowReceive(remaining > 500 ? 500 : remaining);
+        if (resp.empty()) continue;
 
         cJSON* root = cJSON_Parse(resp.c_str());
-        if (!root) continue;
+        if (!root) {
+            ESP_LOGW(TAG, "sfCommand(%s.%s): non-json rx: %.200s",
+                     workId.c_str(), action.c_str(), resp.c_str());
+            continue;
+        }
 
         // Check request_id matches
         cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
-        if (!cJSON_IsString(rid) || reqId != rid->valuestring) {
-            // Async message from another unit — ignore and keep waiting
+        bool matches = false;
+        char ridBuf[16] = {};
+        const char* ridText = "<none>";
+        if (cJSON_IsString(rid)) {
+            ridText = rid->valuestring;
+            matches = reqId == rid->valuestring;
+        } else if (cJSON_IsNumber(rid)) {
+            snprintf(ridBuf, sizeof(ridBuf), "%d", rid->valueint);
+            ridText = ridBuf;
+            matches = reqId == ridBuf;
+        }
+        if (!matches) {
+            cJSON* wid = cJSON_GetObjectItemCaseSensitive(root, "work_id");
+            const char* widText = cJSON_IsString(wid) ? wid->valuestring : "<none>";
+            if (++ignored <= 5) {
+                ESP_LOGI(TAG, "sfCommand(%s.%s): ignoring rx request_id=%s work_id=%s",
+                         workId.c_str(), action.c_str(), ridText, widText);
+            }
             cJSON_Delete(root);
             continue;
         }
@@ -325,6 +347,8 @@ std::string ModuleLLMClient::sfCommand(const std::string& reqId,
         return retWorkId;
     }
 
+    ESP_LOGW(TAG, "sfCommand(%s.%s): timeout after %d ms",
+             workId.c_str(), action.c_str(), timeoutMs);
     return "";
 }
 
@@ -360,52 +384,6 @@ bool ModuleLLMClient::waitForAck(const std::string& method, int timeoutMs)
 
     cJSON_Delete(root);
     return ok;
-}
-
-// ---------------------------------------------------------------------------
-// killStaleTasks — sys.tasklist で残留タスクを取得して exit する
-// sys.reset より大幅に高速（リセット待ち不要）
-// ---------------------------------------------------------------------------
-
-void ModuleLLMClient::killStaleTasks()
-{
-    // sys.tasklist が使えないため、既知の work_id パターンに exit を送る
-    // StackFlow は work_id が存在しなければ無視するので安全
-    static const char* kUnits[] = {"whisper", "vad", "llm", "melotts", "audio", nullptr};
-    // インスタンス番号は通常 1001 から始まり、リセットするたびに +1 ずつ増える
-    // 1001 〜 1030 の範囲を試せば十分（複数セッション分をカバー）
-    static const int kIdMin = 1000;
-    static const int kIdMax = 1030;
-
-    int reqId = 100;
-    for (int i = 0; kUnits[i]; ++i) {
-        for (int id = kIdMin; id <= kIdMax; ++id) {
-            char wid[32];
-            snprintf(wid, sizeof(wid), "%s.%d", kUnits[i], id);
-
-            char ridStr[16];
-            snprintf(ridStr, sizeof(ridStr), "%d", reqId++);
-
-            cJSON* ex = cJSON_CreateObject();
-            cJSON_AddStringToObject(ex, "request_id", ridStr);
-            cJSON_AddStringToObject(ex, "work_id",    wid);
-            cJSON_AddStringToObject(ex, "action",     "exit");
-            char exitObj[48];
-            snprintf(exitObj, sizeof(exitObj), "%s.exit", kUnits[i]);
-            cJSON_AddStringToObject(ex, "object", exitObj);
-            char* s = cJSON_PrintUnformatted(ex);
-            stackflowSend(s);
-            free(s);
-            cJSON_Delete(ex);
-        }
-        // 各ユニットの exit が処理されるのを少し待つ
-        vTaskDelay(pdMS_TO_TICKS(200));
-        // バッファを読み捨てる
-        while (!stackflowReceive(100).empty()) {}
-    }
-
-    ESP_LOGI(TAG, "killStaleTasks: done");
-    vTaskDelay(pdMS_TO_TICKS(300));
 }
 
 // ---------------------------------------------------------------------------
@@ -475,40 +453,112 @@ bool ModuleLLMClient::loadModelsAndPipeline()
     state_ = ModuleLLMState::ModelLoading;
     ESP_LOGI(TAG, "Setting up StackFlow units...");
 
+    auto waitForRequest = [this](const char* requestId, int timeoutMs, const char* label) -> bool {
+        int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+        while (esp_timer_get_time() / 1000 < deadline) {
+            int remaining = static_cast<int>(deadline - esp_timer_get_time() / 1000);
+            if (remaining < 1) break;
+
+            std::string resp = stackflowReceive(remaining > 500 ? 500 : remaining);
+            if (resp.empty()) continue;
+
+            cJSON* root = cJSON_Parse(resp.c_str());
+            if (!root) continue;
+
+            cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+            bool matches = false;
+            if (cJSON_IsString(rid)) {
+                matches = strcmp(rid->valuestring, requestId) == 0;
+            } else if (cJSON_IsNumber(rid)) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%d", rid->valueint);
+                matches = strcmp(buf, requestId) == 0;
+            }
+
+            if (!matches) {
+                cJSON_Delete(root);
+                continue;
+            }
+
+            bool ok = false;
+            cJSON* errObj = cJSON_GetObjectItemCaseSensitive(root, "error");
+            if (cJSON_IsObject(errObj)) {
+                cJSON* code = cJSON_GetObjectItemCaseSensitive(errObj, "code");
+                ok = cJSON_IsNumber(code) && code->valueint == 0;
+            }
+
+            if (ok) {
+                ESP_LOGI(TAG, "%s done", label);
+            } else {
+                ESP_LOGW(TAG, "%s failed: %s", label, resp.c_str());
+            }
+            cJSON_Delete(root);
+            return ok;
+        }
+
+        ESP_LOGW(TAG, "%s timeout", label);
+        return false;
+    };
+
     // sys.reset でサービスをクリーンな状態に戻す（公式 Arduino ライブラリと同じ）
     {
         cJSON* msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "request_id", "1");
+        cJSON_AddStringToObject(msg, "request_id", "sys_reset");
         cJSON_AddStringToObject(msg, "work_id",    "sys");
         cJSON_AddStringToObject(msg, "action",     "reset");
-        cJSON_AddStringToObject(msg, "object",     "sys.reset");
-        cJSON_AddNullToObject(  msg, "data");
+        cJSON_AddStringToObject(msg, "object",     "None");
+        cJSON_AddStringToObject(msg, "data",       "None");
         char* s = cJSON_PrintUnformatted(msg);
-        stackflowSend(s);
+        bool sent = s && stackflowSend(s);
         free(s);
         cJSON_Delete(msg);
-        // reset 完了を待つ（最大 10 秒）
-        int64_t t0 = esp_timer_get_time() / 1000;
-        while (esp_timer_get_time() / 1000 - t0 < 10000) {
-            std::string rx = stackflowReceive(500);
-            if (rx.find("\"sys.reset\"") != std::string::npos) {
-                ESP_LOGI(TAG, "sys.reset done");
-                break;
-            }
+
+        if (!sent) {
+            ESP_LOGE(TAG, "sys.reset send failed");
+            state_ = ModuleLLMState::Error;
+            return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
+
+        if (!waitForRequest("sys_reset", 2000, "sys.reset ack")) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
+
+        if (!waitForRequest("0", 15000, "sys.reset finish")) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
     }
 
-    // 残留タスクを念のため exit する
-    killStaleTasks();
+    {
+        std::string output;
+        bool ok = sysBashExec("svc_start",
+                              "systemctl start llm-audio.service llm-vad.service "
+                              "llm-whisper.service llm-llm.service llm-melotts.service 2>&1 || true",
+                              20000,
+                              &output);
+        if (ok) {
+            ESP_LOGI(TAG, "StackFlow services ensured");
+        } else {
+            ESP_LOGW(TAG, "StackFlow service start command did not complete: %s", output.c_str());
+        }
+    }
+
+    // sys.reset already releases existing StackFlow units. Sending many exit
+    // commands immediately after reset can race with the Module LLM services as
+    // systemd restarts them, so let the reset be the single cleanup path.
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     // 2. Audio setup
     {
+        ESP_LOGI(TAG, "audio.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddNumberToObject(data, "capcard",   0);
         cJSON_AddNumberToObject(data, "capdevice", 0);
+        cJSON_AddNumberToObject(data, "capVolume", 0.5);
         cJSON_AddNumberToObject(data, "playcard",  0);
         cJSON_AddNumberToObject(data, "playdevice", 1);
+        cJSON_AddNumberToObject(data, "playVolume", 0.15);
         std::string wid = sfCommand("3", "audio", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "audio.setup failed");
@@ -521,6 +571,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
 
     // 3. VAD setup (Silero VAD — vadEnabled_ が true の場合のみ)
     if (vadEnabled_) {
+        ESP_LOGI(TAG, "vad.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "silero-vad");
         cJSON_AddStringToObject(data, "response_format", "vad.bool");
@@ -543,6 +594,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
 
     // 4. Whisper ASR setup (VAD あり: sys.pcm + vad_work_id、なし: sys.pcm のみ)
     {
+        ESP_LOGI(TAG, "whisper.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "whisper-tiny");
         cJSON_AddStringToObject(data, "response_format", "asr.utf-8");
@@ -566,6 +618,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
 
     // 4. LLM setup
     {
+        ESP_LOGI(TAG, "llm.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "qwen3-0.6B-ax630c");
         cJSON_AddStringToObject(data, "response_format", "llm.utf-8.stream");
@@ -591,7 +644,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
             : basePrompt + " /no_think";
         cJSON_AddStringToObject(data, "prompt", prompt.c_str());
 
-        std::string wid = sfCommand("6", "llm", "setup", data, 60000);
+        std::string wid = sfCommand("6", "llm", "setup", data, 180000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "llm.setup failed");
             state_ = ModuleLLMState::Error;
@@ -617,6 +670,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
             (ttsLang_ == 3) ? "melotts-en-default" :
                               "melotts-ja-jp";
         ESP_LOGI(TAG, "MeloTTS model=%s", ttsModel);
+        ESP_LOGI(TAG, "melotts.setup starting");
 
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           ttsModel);
