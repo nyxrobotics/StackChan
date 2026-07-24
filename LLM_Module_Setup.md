@@ -6,10 +6,25 @@ StackChan で Module LLM Kit を使うための初期セットアップ手順で
 
 ## 必要なもの
 
-- PC（Windows）
+- PC（Windows / macOS / Linux）
 - **データ転送対応の USB-C ケーブル**（充電専用不可）
-- シリアルターミナル：[Tera Term](https://ttssh2.osdn.jp/)
+- 自動セットアップを使う場合: `adb`
+- 手動セットアップを使う場合: シリアルターミナル（例: [Tera Term](https://ttssh2.osdn.jp/)）
 - **LAN ケーブル**（Module LLM Kit の Ethernet ポートをインターネットに接続するため）
+
+---
+
+## 推奨 — 自動セットアップ
+
+通常はこちらを使います。Module LLM の USB-C ポートをPCへ接続し、Ethernetでインターネットへ接続してから、リポジトリのルートで実行してください。
+
+```bash
+./scripts/provision_module_llm.sh
+```
+
+このスクリプトが、StackFlow aptリポジトリ登録、必要パッケージ、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+
+以降のStep 1〜Step 6は、スクリプトを使わずに手動でセットアップする場合の手順です。
 
 ---
 
@@ -75,6 +90,20 @@ apt install -y lib-llm llm-sys llm-audio llm-whisper llm-llm llm-melotts llm-vad
 
 > `llm-vad` は音声区間検出（VAD）に必要です。設定画面で VAD を有効にする場合は必須です。
 
+### Open JTalk / tohoku voice（日本語TTS推奨）
+
+このブランチでは、日本語TTSにOpen JTalk + tohoku-f01 neutral voiceを優先して使います。
+初回セットアップ時だけインターネット接続が必要ですが、発話時はModule LLM内だけで完結します。
+
+```bash
+apt install -y open-jtalk open-jtalk-mecab-naist-jdic alsa-utils
+mkdir -p /opt/stackchan/voices
+wget -O /opt/stackchan/voices/tohoku-f01-neutral.htsvoice \
+  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice
+wget -O /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt \
+  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt
+```
+
 ---
 
 ## Step 5 — モデルをインストール
@@ -112,7 +141,7 @@ reboot
 ## Step 7 — CoreS3 に取り付けて起動
 
 再起動完了後、USB-C ケーブルを外してから Module LLM を CoreS3 に取り付け、電源を入れます。  
-起動時に Module LLM が自動で検出され、Whisper → Qwen3 → MeloTTS のパイプラインが構築されます。
+起動時に Module LLM が自動で検出され、Whisper → Qwen3 → Open JTalk（未セットアップ時はMeloTTS）のパイプラインが構築されます。
 
 ---
 

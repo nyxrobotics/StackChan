@@ -17,6 +17,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # --- カラー出力 ---------------------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
@@ -33,12 +35,22 @@ PACKAGES_BASE=(
     llm-whisper
     llm-llm
     llm-melotts
+    llm-vad
 )
 PACKAGES_MODEL=(
     llm-model-whisper-tiny
     llm-model-qwen3-0.6b-ax630c
     llm-model-melotts-ja-jp
+    llm-model-silero-vad
 )
+PACKAGES_OPENJTALK=(
+    open-jtalk
+    open-jtalk-mecab-naist-jdic
+    alsa-utils
+)
+
+TOHOKU_VOICE_URL="${TOHOKU_VOICE_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice}"
+TOHOKU_COPYRIGHT_URL="${TOHOKU_COPYRIGHT_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt}"
 
 # --- ADB ラッパー (エラー時に分かりやすいメッセージを出す) -------------------
 ADB_RETRY_COUNT=10
@@ -179,6 +191,37 @@ for pkg in "${PACKAGES_MODEL[@]}"; do
     install_package "$pkg" || FAILED_MODEL+=("$pkg")
 done
 
+echo ""
+info "=== Open JTalk / tohoku voice ==="
+FAILED_OPENJTALK=()
+for pkg in "${PACKAGES_OPENJTALK[@]}"; do
+    install_package "$pkg" || FAILED_OPENJTALK+=("$pkg")
+done
+
+if [ ${#FAILED_OPENJTALK[@]} -eq 0 ]; then
+    info "StackChan Open JTalk helper を配置中..."
+    adb push "$SCRIPT_DIR/module_llm/openjtalk_tts.sh" /tmp/stackchan_openjtalk_tts.sh >/dev/null \
+        || die "openjtalk_tts.sh の転送に失敗しました"
+    adb_shell "mkdir -p /opt/stackchan/voices && install -m 0755 /tmp/stackchan_openjtalk_tts.sh /opt/stackchan/openjtalk_tts.sh" \
+        || die "openjtalk_tts.sh の配置に失敗しました"
+
+    info "tohoku-f01 neutral voice を確認中..."
+    if adb_shell "[ -f /opt/stackchan/voices/tohoku-f01-neutral.htsvoice ]"; then
+        ok "  tohoku-f01-neutral.htsvoice (スキップ: 配置済み)"
+    else
+        info "  tohoku-f01-neutral.htsvoice を取得中..."
+        adb_shell "wget -qO /opt/stackchan/voices/tohoku-f01-neutral.htsvoice '$TOHOKU_VOICE_URL'" \
+            || die "tohoku voice の取得に失敗しました"
+        adb_shell "wget -qO /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt '$TOHOKU_COPYRIGHT_URL'" \
+            || warn "tohoku voice COPYRIGHT.txt の取得に失敗しました"
+        ok "  tohoku-f01-neutral.htsvoice"
+    fi
+
+    info "Open JTalk helper の動作確認中..."
+    adb_shell "/opt/stackchan/openjtalk_tts.sh --check" \
+        || die "Open JTalk helper の確認に失敗しました"
+fi
+
 # =============================================================================
 # 5. インストール結果サマリー
 # =============================================================================
@@ -187,8 +230,8 @@ echo "======================================================"
 echo " インストール結果"
 echo "======================================================"
 
-ALL_PKGS=("${PACKAGES_BASE[@]}" "${PACKAGES_MODEL[@]}")
-FAILED_ALL=("${FAILED_BASE[@]}" "${FAILED_MODEL[@]}")
+ALL_PKGS=("${PACKAGES_BASE[@]}" "${PACKAGES_MODEL[@]}" "${PACKAGES_OPENJTALK[@]}")
+FAILED_ALL=("${FAILED_BASE[@]}" "${FAILED_MODEL[@]}" "${FAILED_OPENJTALK[@]}")
 
 for pkg in "${ALL_PKGS[@]}"; do
     STATUS=$(adb_shell "dpkg -s '$pkg' 2>/dev/null | grep '^Status:'" | tr -d '\r\n')

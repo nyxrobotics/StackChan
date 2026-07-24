@@ -75,7 +75,19 @@ Xiaozhi Online  →  Module LLM Local  →  Static Fallback
 
 ---
 
-### 2-1. Module LLM のターミナルに接続する
+### 2-1. 推奨: 自動セットアップ
+
+通常はリポジトリルートから自動セットアップスクリプトを実行します。
+
+```bash
+./scripts/provision_module_llm.sh
+```
+
+このスクリプトは apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+
+以降の手順は、スクリプトを使わず手動でセットアップする場合の代替手順です。
+
+### 2-2. 手動: Module LLM のターミナルに接続する
 
 以下のいずれかの方法で Module LLM のシェルに入ります。
 
@@ -104,7 +116,7 @@ ssh root@<Module_LLM_の_IP>
 
 ---
 
-### 2-2. apt ソースの登録 (初回のみ)
+### 2-3. apt ソースの登録 (初回のみ)
 
 ```bash
 # GPG キーを追加
@@ -122,7 +134,7 @@ apt update
 
 ---
 
-### 2-3. 必要なパッケージを一括インストール
+### 2-4. 必要なパッケージを一括インストール
 
 #### ベースライブラリ・機能モジュール
 
@@ -133,6 +145,8 @@ apt install llm-audio    # サウンドカード管理
 apt install llm-whisper  # Whisper ASR 機能モジュール
 apt install llm-llm      # LLM テキスト生成機能モジュール
 apt install llm-melotts  # MeloTTS TTS 機能モジュール
+apt install llm-vad      # VAD 機能モジュール
+apt install open-jtalk open-jtalk-mecab-naist-jdic alsa-utils  # Open JTalk 日本語TTS
 ```
 
 #### モデルファイル (容量大・要時間)
@@ -141,14 +155,18 @@ apt install llm-melotts  # MeloTTS TTS 機能モジュール
 apt install llm-model-whisper-tiny          # Whisper Tiny (~数十MB)
 apt install llm-model-qwen3-0.6b-ax630c     # Qwen3-0.6B (~数百MB)
 apt install llm-model-melotts-ja-jp         # MeloTTS 日本語モデル
+apt install llm-model-silero-vad            # VAD モデル
 ```
+
+日本語TTSはOpen JTalk + tohoku-f01 neutral voiceを優先します。
+Open JTalk helperが見つからない場合はMeloTTSへフォールバックします。
 
 > **注意:** モデルはストレージを大量に消費します。  
 > `df -h` で空き容量を確認してからインストールしてください。
 
 ---
 
-### 2-4. インストール確認
+### 2-5. インストール確認
 
 ```bash
 # インストール済みパッケージを確認
@@ -167,14 +185,25 @@ llm-audio
 llm-whisper
 llm-llm
 llm-melotts
+llm-vad
 llm-model-whisper-tiny
 llm-model-qwen3-0.6b-ax630c
 llm-model-melotts-ja-jp
+llm-model-silero-vad
+open-jtalk
+open-jtalk-mecab-naist-jdic
+alsa-utils
+```
+
+Open JTalk helperの確認:
+
+```bash
+/opt/stackchan/openjtalk_tts.sh --check
 ```
 
 ---
 
-### 2-5. Module LLM を再起動
+### 2-6. Module LLM を再起動
 
 インストール完了後、Module LLM を再起動してサービスを有効化します。
 
