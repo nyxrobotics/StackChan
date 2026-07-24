@@ -69,9 +69,17 @@ echo ""
 info "=== Verification ==="
 
 missing=()
+outdated=()
 for pkg in "${packages[@]}"; do
     if is_installed "$pkg"; then
-        ok "$pkg"
+        if is_package_current "$pkg"; then
+            ok "$pkg $(installed_version "$pkg")"
+        else
+            installed="$(installed_version "$pkg")"
+            candidate="$(candidate_version "$pkg")"
+            error "$pkg is outdated (${installed:-unknown} -> ${candidate:-unknown})"
+            outdated+=("$pkg")
+        fi
     else
         error "$pkg"
         missing+=("$pkg")
@@ -85,10 +93,24 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 1
 fi
 
+if [ "${#outdated[@]}" -gt 0 ]; then
+    echo ""
+    error "Outdated packages:"
+    printf '  - %s\n' "${outdated[@]}"
+    echo ""
+    error "Run setup_llm_module.sh or the relevant feature setup script to upgrade them."
+    exit 1
+fi
+
 "$OPENJTALK_HELPER_TARGET" --check || die "OpenJTalk helper check failed."
 
-if ps aux | grep stackflow | grep -v grep >/dev/null 2>&1; then
-    ok "StackFlow process is running"
+ensure_qwen3_tokenizer_compat
+
+if command -v systemctl >/dev/null 2>&1 &&
+    systemctl is-active --quiet llm-sys.service &&
+    systemctl is-active --quiet llm-audio.service &&
+    systemctl is-active --quiet llm-llm.service; then
+    ok "StackFlow services are running"
 else
-    warn "StackFlow process was not found. It should start after reboot."
+    warn "StackFlow core services are not all running. They should start after reboot."
 fi

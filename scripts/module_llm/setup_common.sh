@@ -15,6 +15,9 @@ TOHOKU_COPYRIGHT_URL="${TOHOKU_COPYRIGHT_URL:-https://raw.githubusercontent.com/
 
 OPENJTALK_HELPER_SOURCE="${STACKCHAN_OPENJTALK_HELPER:-${SCRIPT_DIR}/openjtalk_tts.sh}"
 OPENJTALK_HELPER_TARGET="/opt/stackchan/openjtalk_tts.sh"
+QWEN3_MODEL_ID="qwen3-0.6B-ax630c"
+QWEN3_TOKENIZER_SCRIPT="/opt/m5stack/scripts/tokenizer_${QWEN3_MODEL_ID}.py"
+QWEN3_TOKENIZER_COMPAT="/opt/m5stack/scripts/${QWEN3_MODEL_ID}_tokenizer.py"
 
 PACKAGES_RUNTIME=(
     lib-llm
@@ -57,6 +60,27 @@ PACKAGES_EN_TTS=(
     llm-model-melotts-en-us
 )
 
+SERVICES_RUNTIME=(
+    llm-sys.service
+    llm-audio.service
+)
+
+SERVICES_WHISPER=(
+    llm-whisper.service
+)
+
+SERVICES_QWEN3=(
+    llm-llm.service
+)
+
+SERVICES_MELOTTS=(
+    llm-melotts.service
+)
+
+SERVICES_VAD=(
+    llm-vad.service
+)
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -78,6 +102,26 @@ require_root() {
 
 is_installed() {
     dpkg -s "$1" >/dev/null 2>&1
+}
+
+installed_version() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true
+}
+
+candidate_version() {
+    apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}'
+}
+
+is_package_current() {
+    local pkg="$1"
+    local installed candidate
+    installed="$(installed_version "$pkg")"
+    candidate="$(candidate_version "$pkg")"
+
+    [ -n "$installed" ] &&
+        [ -n "$candidate" ] &&
+        [ "$candidate" != "(none)" ] &&
+        [ "$installed" = "$candidate" ]
 }
 
 check_disk_space() {
@@ -124,12 +168,25 @@ require_stackflow_repo() {
 
 install_package() {
     local pkg="$1"
+    local installed candidate
+
     if is_installed "$pkg"; then
-        ok "$pkg (already installed)"
-        return 0
+        installed="$(installed_version "$pkg")"
+        candidate="$(candidate_version "$pkg")"
+        if is_package_current "$pkg"; then
+            ok "$pkg ${installed} (already current)"
+            return 0
+        fi
+
+        if [ -n "$candidate" ] && [ "$candidate" != "(none)" ]; then
+            info "Upgrading $pkg: ${installed} -> ${candidate}"
+        else
+            info "Refreshing installed package $pkg (${installed})"
+        fi
+    else
+        info "Installing $pkg..."
     fi
 
-    info "Installing $pkg..."
     if apt-get install -y -qq "$pkg"; then
         ok "$pkg"
     else
@@ -157,4 +214,49 @@ install_package_group() {
         printf '  - %s\n' "${failed[@]}"
         return 1
     fi
+}
+
+ensure_services_active() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl is not available; skipping service activation."
+        return 0
+    fi
+
+    local services=("$@")
+    if [ "${#services[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    info "Enabling and starting services: ${services[*]}"
+    systemctl daemon-reload || true
+    systemctl enable --now "${services[@]}"
+
+    local service
+    local failed=()
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            ok "$service active"
+        else
+            error "$service is not active"
+            failed+=("$service")
+        fi
+    done
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        return 1
+    fi
+}
+
+ensure_qwen3_tokenizer_compat() {
+    if [ ! -f "$QWEN3_TOKENIZER_SCRIPT" ]; then
+        die "Qwen3 tokenizer script was not found: $QWEN3_TOKENIZER_SCRIPT"
+    fi
+
+    if [ -e "$QWEN3_TOKENIZER_COMPAT" ] && [ ! -L "$QWEN3_TOKENIZER_COMPAT" ]; then
+        warn "Qwen3 tokenizer compatibility path exists and is not a symlink: $QWEN3_TOKENIZER_COMPAT"
+        return 0
+    fi
+
+    ln -sfn "$(basename "$QWEN3_TOKENIZER_SCRIPT")" "$QWEN3_TOKENIZER_COMPAT"
+    ok "Qwen3 tokenizer compatibility link: $QWEN3_TOKENIZER_COMPAT"
 }

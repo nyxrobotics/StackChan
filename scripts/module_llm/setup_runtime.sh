@@ -31,3 +31,4 @@ done
 require_root
 require_stackflow_repo
 install_package_group "Module LLM runtime" "${PACKAGES_RUNTIME[@]}"
+ensure_services_active "${SERVICES_RUNTIME[@]}"

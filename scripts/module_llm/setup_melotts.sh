@@ -49,6 +49,7 @@ done
 require_root
 require_stackflow_repo
 install_package_group "MeloTTS fallback TTS" "${PACKAGES_MELOTTS[@]}"
+ensure_services_active "${SERVICES_MELOTTS[@]}"
 
 if [ "$INSTALL_ZH_TTS" -eq 1 ]; then
     install_package_group "Optional Chinese MeloTTS model" "${PACKAGES_ZH_TTS[@]}"

@@ -31,3 +31,5 @@ done
 require_root
 require_stackflow_repo
 install_package_group "Qwen3 local LLM" "${PACKAGES_QWEN3[@]}"
+ensure_qwen3_tokenizer_compat
+ensure_services_active "${SERVICES_QWEN3[@]}"

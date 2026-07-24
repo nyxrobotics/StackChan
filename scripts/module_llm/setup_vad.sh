@@ -31,3 +31,4 @@ done
 require_root
 require_stackflow_repo
 install_package_group "Voice activity detection" "${PACKAGES_VAD[@]}"
+ensure_services_active "${SERVICES_VAD[@]}"

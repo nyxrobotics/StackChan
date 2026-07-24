@@ -118,7 +118,20 @@ while [ "$#" -gt 0 ]; do
 done
 
 adb_shell() {
-    "$ADB" shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; $*" 2>&1
+    local marker="__STACKCHAN_ADB_EXIT__"
+    local output clean rc
+
+    output="$("$ADB" shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; $*; rc=\$?; printf '\n${marker}%s\n' \"\$rc\"" 2>&1)" \
+        || {
+            printf '%s\n' "$output"
+            return 1
+        }
+
+    clean="$(printf '%s\n' "$output" | tr -d '\r')"
+    rc="$(printf '%s\n' "$clean" | sed -n "s/^${marker}//p" | tail -n 1)"
+    printf '%s\n' "$clean" | grep -v "^${marker}" || true
+
+    [ "$rc" = "0" ]
 }
 
 remote_quote_args() {
@@ -216,6 +229,19 @@ check_adb() {
 
     info "Checking ADB device..."
     "$ADB" start-server >/dev/null 2>&1 || true
+
+    if [ -n "${ANDROID_SERIAL:-}" ]; then
+        local state
+        state="$("$ADB" get-state 2>&1 || true)"
+        if [ "$state" = "device" ]; then
+            ok "Module LLM detected: $ANDROID_SERIAL"
+            return
+        fi
+
+        error "ADB target $ANDROID_SERIAL is not ready."
+        printf '%s\n' "$state"
+        exit 1
+    fi
 
     local devices=""
     local denied=""
