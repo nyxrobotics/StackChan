@@ -57,5 +57,6 @@ private:
     int                              lastVadSpeech_    = -1;  // -1=未初期化, 0=silence, 1=speech
     std::string                      pendingTts_;
     std::string                      currentLlmRequestId_;
+    std::string                      currentTtsRequestId_;
     TaskHandle_t                     pollTask_    = nullptr;
 };

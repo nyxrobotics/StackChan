@@ -102,6 +102,7 @@ void ModuleLLMBackend::finishLocalTurn(const char* reason) {
     pendingTts_.clear();
     inThinkBlock_ = false;
     currentLlmRequestId_.clear();
+    currentTtsRequestId_.clear();
     if (client_) client_->resumeWhisper();
     micMuted_      = false;
     ttsDispatched_ = false;
@@ -112,8 +113,12 @@ void ModuleLLMBackend::handleAbortRequest() {
 
     if (client_) {
         if (ttsDispatched_) {
-            client_->pauseTts();
-            ttsPausedForAbort_ = true;
+            if (!currentTtsRequestId_.empty()) {
+                client_->stopOpenJTalkTts();
+            } else {
+                client_->pauseTts();
+                ttsPausedForAbort_ = true;
+            }
         } else if (!currentLlmRequestId_.empty()) {
             client_->pauseLlm();
             llmPausedForAbort_ = true;
@@ -446,6 +451,9 @@ void ModuleLLMBackend::pollLoop() {
             if (ttsDispatchedMs == 0) {
                 ttsDispatchedMs = now;  // 初回: 送信時刻を記録
             } else if (now - ttsDispatchedMs >= ttsTimeoutMs) {
+                if (!currentTtsRequestId_.empty() && client_) {
+                    client_->stopOpenJTalkTts();
+                }
                 finishLocalTurn("tts timeout");
                 ttsDispatchedMs = 0;
             }
@@ -474,6 +482,18 @@ void ModuleLLMBackend::pollLoop() {
                 cJSON_Delete(root);
                 continue;
             }
+        }
+
+        if (cJSON_IsString(rid) && !currentTtsRequestId_.empty() &&
+            currentTtsRequestId_ == rid->valuestring) {
+            cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+            if (cJSON_IsString(data)) {
+                ESP_LOGI(TAG, "OpenJTalk TTS result: %.200s", data->valuestring);
+            }
+            finishLocalTurn("openjtalk done");
+            ttsDispatchedMs = 0;
+            cJSON_Delete(root);
+            continue;
         }
 
         // VAD 応答: 音声検出状態をログ出力
@@ -623,11 +643,23 @@ void ModuleLLMBackend::pollLoop() {
                             client_->resumeTts();
                             ttsPausedForAbort_ = false;
                         }
-                        ttsDispatched_ = true;
-                        if (!client_->sendToTts(pendingTts_, true)) {
-                            ESP_LOGE(TAG, "LLM→TTS send failed");
-                            finishLocalTurn("tts send failed");
-                            goto skip_tts_dispatch;
+                        if (client_->isOpenJTalkTtsReady() && lang == 0) {
+                            currentTtsRequestId_ = nextRequestId("ojt_");
+                            ttsTimeoutMs += 5000;  // open_jtalk + aplay startup margin
+                            ttsDispatched_ = true;
+                            if (!client_->sendToOpenJTalkTts(currentTtsRequestId_, pendingTts_)) {
+                                ESP_LOGE(TAG, "LLM→OpenJTalk send failed");
+                                finishLocalTurn("openjtalk send failed");
+                                goto skip_tts_dispatch;
+                            }
+                        } else {
+                            currentTtsRequestId_.clear();
+                            ttsDispatched_ = true;
+                            if (!client_->sendToTts(pendingTts_, true)) {
+                                ESP_LOGE(TAG, "LLM→TTS send failed");
+                                finishLocalTurn("tts send failed");
+                                goto skip_tts_dispatch;
+                            }
                         }
                         pendingTts_.clear();
                     } else {
@@ -768,6 +800,7 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
 
     inThinkBlock_ = false;
     pendingTts_.clear();
+    currentTtsRequestId_.clear();
     micMuted_         = true;
     ttsDispatched_    = false;
     client_->pauseWhisper();   // LLM推論〜TTS完了まで Whisper を停止

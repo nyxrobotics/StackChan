@@ -108,12 +108,15 @@ public:
 
     // Send filtered text to MeloTTS manually
     bool sendToTts(const std::string& text, bool finish = false);
+    bool sendToOpenJTalkTts(const std::string& requestId, const std::string& text);
     void pauseWhisper();         // TTS再生中はASRを停止
     void resumeWhisper();        // TTS完了後にASR再開
     bool pauseLlm();             // 顔タッチ中断: 生成中のLLM unitを停止
     bool resumeLlm();            // 次ターン開始前にLLM unitを再開
     bool pauseTts();             // 顔タッチ中断: 再生中のMeloTTS unitを停止
     bool resumeTts();            // 次のTTS送信前にMeloTTS unitを再開
+    bool stopOpenJTalkTts();      // 顔タッチ中断: Open JTalk/aplay を停止
+    bool isOpenJTalkTtsReady() const { return openJTalkTtsReady_; }
 
     // Work ID accessors for backend use
     const std::string& llmWorkId()     const { return llmWorkId_; }
@@ -137,6 +140,7 @@ private:
     std::string whisperWorkId_;
     std::string llmWorkId_;
     std::string melottsWorkId_;
+    bool openJTalkTtsReady_ = false;
     bool thinkingEnabled_ = false;
     bool vadEnabled_      = true;
     uint8_t ttsLang_      = 0;   // 0=ja 1=zh 2=en、NVS から復元
@@ -150,6 +154,11 @@ private:
     bool sendAction(const std::string& reqId,
                     const std::string& workId,
                     const char* action);
+    bool sysBashExec(const std::string& reqId,
+                     const std::string& command,
+                     int timeoutMs = 0,
+                     std::string* output = nullptr);
+    bool checkOpenJTalkTts();
 
     // UART configuration (Section 9.1)
     static constexpr int  kRxPin   = 18;

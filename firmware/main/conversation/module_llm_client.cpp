@@ -2,6 +2,7 @@
 
 #include <driver/uart.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cJSON.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -50,6 +51,22 @@ static constexpr const char* kLlmNvsNamespace = "modllm_cfg";
 static constexpr const char* kThinkingKey     = "thinking";
 static constexpr const char* kVadEnabledKey   = "vad_enabled";
 static constexpr const char* kTtsLangKey      = "tts_lang";  // 0=ja 1=zh 2=en
+
+static std::string shellQuote(const std::string& value)
+{
+    std::string quoted;
+    quoted.reserve(value.size() + 2);
+    quoted += '\'';
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+}
 
 ModuleLLMClient::ModuleLLMClient()
 {
@@ -125,6 +142,83 @@ bool ModuleLLMClient::sendAction(const std::string& reqId,
     if (s) free(s);
     cJSON_Delete(msg);
     return ok;
+}
+
+bool ModuleLLMClient::sysBashExec(const std::string& reqId,
+                                  const std::string& command,
+                                  int timeoutMs,
+                                  std::string* output)
+{
+    if (command.empty()) return false;
+
+    cJSON* msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "request_id", reqId.c_str());
+    cJSON_AddStringToObject(msg, "work_id",    "sys");
+    cJSON_AddStringToObject(msg, "action",     "bashexec");
+    cJSON_AddStringToObject(msg, "object",     "sys.bashexec");
+    cJSON_AddStringToObject(msg, "data",       command.c_str());
+
+    char* s = cJSON_PrintUnformatted(msg);
+    bool sent = s && stackflowSend(s);
+    if (s) free(s);
+    cJSON_Delete(msg);
+
+    if (!sent || timeoutMs <= 0) {
+        return sent;
+    }
+
+    int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+    while (esp_timer_get_time() / 1000 < deadline) {
+        int remaining = static_cast<int>(deadline - esp_timer_get_time() / 1000);
+        if (remaining < 1) break;
+
+        std::string resp = stackflowReceive(remaining > 500 ? 500 : remaining);
+        if (resp.empty()) continue;
+
+        cJSON* root = cJSON_Parse(resp.c_str());
+        if (!root) continue;
+
+        cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+        if (!cJSON_IsString(rid) || reqId != rid->valuestring) {
+            cJSON_Delete(root);
+            continue;
+        }
+
+        bool ok = false;
+        cJSON* errObj = cJSON_GetObjectItemCaseSensitive(root, "error");
+        if (cJSON_IsObject(errObj)) {
+            cJSON* code = cJSON_GetObjectItemCaseSensitive(errObj, "code");
+            ok = cJSON_IsNumber(code) && code->valueint == 0;
+        }
+
+        if (output) {
+            cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+            if (cJSON_IsString(data)) {
+                *output = data->valuestring;
+            } else {
+                *output = resp;
+            }
+        }
+
+        cJSON_Delete(root);
+        return ok;
+    }
+
+    ESP_LOGW(TAG, "sys.bashexec timeout: %s", command.c_str());
+    return false;
+}
+
+bool ModuleLLMClient::checkOpenJTalkTts()
+{
+    std::string output;
+    bool ok = sysBashExec("ojt_check", "/opt/stackchan/openjtalk_tts.sh --check", 15000, &output);
+    if (!ok || output.find("STACKCHAN_OPENJTALK_READY") == std::string::npos) {
+        ESP_LOGW(TAG, "OpenJTalk TTS unavailable: %s", output.c_str());
+        return false;
+    }
+
+    ESP_LOGI(TAG, "OpenJTalk TTS ready: %s", output.c_str());
+    return true;
 }
 
 std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
@@ -507,8 +601,15 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         ESP_LOGI(TAG, "LLM setup: work_id=%s", wid.c_str());
     }
 
-    // 5. MeloTTS setup
-    {
+    openJTalkTtsReady_ = false;
+    if (ttsLang_ == 0 && checkOpenJTalkTts()) {
+        openJTalkTtsReady_ = true;
+        melottsWorkId_.clear();
+        ESP_LOGI(TAG, "Using OpenJTalk/tohoku voice for Japanese TTS");
+    }
+
+    // 5. MeloTTS setup (fallback and non-Japanese languages)
+    if (!openJTalkTtsReady_) {
         // ttsLang_: 0=ja-jp  1=zh-cn  2=en-us  3=en-default
         const char* ttsModel =
             (ttsLang_ == 1) ? "melotts-zh-cn" :
@@ -537,8 +638,9 @@ bool ModuleLLMClient::loadModelsAndPipeline()
     }
 
     state_ = ModuleLLMState::PipelineReady;
-    ESP_LOGI(TAG, "Pipeline ready (vad=%s whisper=%s llm=%s melotts=%s)",
-             vadWorkId_.c_str(), whisperWorkId_.c_str(), llmWorkId_.c_str(), melottsWorkId_.c_str());
+    ESP_LOGI(TAG, "Pipeline ready (vad=%s whisper=%s llm=%s tts=%s)",
+             vadWorkId_.c_str(), whisperWorkId_.c_str(), llmWorkId_.c_str(),
+             openJTalkTtsReady_ ? "openjtalk" : melottsWorkId_.c_str());
     return true;
 }
 
@@ -682,6 +784,18 @@ bool ModuleLLMClient::sendToTts(const std::string& text, bool finish)
     return ok;
 }
 
+bool ModuleLLMClient::sendToOpenJTalkTts(const std::string& requestId, const std::string& text)
+{
+    if (!openJTalkTtsReady_ || requestId.empty() || text.empty()) {
+        return false;
+    }
+
+    std::string command = "/opt/stackchan/openjtalk_tts.sh --text " + shellQuote(text);
+    bool ok = sysBashExec(requestId, command, 0, nullptr);
+    ESP_LOGI(TAG, "openjtalk tts send: %s", ok ? "sent" : "failed");
+    return ok;
+}
+
 // Whisper を一時停止する（TTS 再生中に自分の声を拾わないため）
 void ModuleLLMClient::pauseWhisper()
 {
@@ -759,6 +873,18 @@ bool ModuleLLMClient::resumeTts()
 {
     bool ok = sendAction("44", melottsWorkId_, "work");
     ESP_LOGI(TAG, "melotts work: %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+bool ModuleLLMClient::stopOpenJTalkTts()
+{
+    bool ok = sysBashExec(
+        "ojt_stop",
+        "pkill -f 'aplay.*stackchan-openjtalk' || true; "
+        "pkill -f 'open_jtalk.*stackchan-openjtalk' || true",
+        0,
+        nullptr);
+    ESP_LOGI(TAG, "openjtalk tts stop: %s", ok ? "sent" : "failed");
     return ok;
 }
 
