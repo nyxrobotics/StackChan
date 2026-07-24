@@ -221,6 +221,7 @@ void Hal::updateHeapStatusLog()
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
 #include <assets/assets.h>
+#include <conversation/conversation_runtime.h>
 
 void Hal::xiaozhi_board_init()
 {
@@ -285,6 +286,8 @@ void Hal::startXiaozhi()
 
     // Start stackchan update task
     xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
+
+    conversation_runtime::prepare();
 
     hal_bridge::start_xiaozhi_app();
 }

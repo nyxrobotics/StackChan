@@ -28,7 +28,7 @@ struct ConversationCallbacks {
 void set_conversation_callbacks(ConversationCallbacks cbs);
 
 // Active mode stored as int to avoid pulling in conversation_backend.h.
-// Values mirror ConversationMode: Auto=0, LocalOnly=1, OnlineOnly=2.
+// Values mirror ConversationMode: Auto=0, OnlineOnly=1, LocalOnly=2.
 static constexpr int kModeAuto       = 0;
 static constexpr int kModeOnlineOnly = 1;
 static constexpr int kModeLocalOnly  = 2;

@@ -497,7 +497,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
 
     if (strcmp(status, Lang::Strings::LISTENING) == 0) {
         if (speaking_modifier_id_ >= 0) {
-            // Start speaking
+            ESP_LOGI(TAG, "Stop speaking motion: listening");
             stackchan.removeModifier(speaking_modifier_id_);
             avatar.mouth().setWeight(0);
             speaking_modifier_id_ = -1;
@@ -510,7 +510,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
         _is_xiaozhi_ready = true;
 
         if (speaking_modifier_id_ >= 0) {
-            // Stop speaking
+            ESP_LOGI(TAG, "Stop speaking motion: standby");
             stackchan.removeModifier(speaking_modifier_id_);
             avatar.mouth().setWeight(0);
             speaking_modifier_id_ = -1;
@@ -524,6 +524,9 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
         if (speaking_modifier_id_ < 0) {
             speaking_modifier_id_ = stackchan.addModifier(std::make_unique<SpeakingModifier>(0, 180, false));
+            ESP_LOGI(TAG, "Start speaking motion: modifier=%d", speaking_modifier_id_);
+        } else {
+            ESP_LOGI(TAG, "Speaking motion already active: modifier=%d", speaking_modifier_id_);
         }
 
         GetHAL().setRgbColor(0, 0, 0, 50);
