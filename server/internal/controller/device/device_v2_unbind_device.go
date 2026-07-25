@@ -21,10 +21,6 @@ import (
 
 // UnbindDevice Device unbinding interface
 func (c *ControllerV2) UnbindDevice(ctx context.Context, req *v2.UnbindDeviceReq) (res *v2.UnbindDeviceRes, err error) {
-	_, err = service.CreateMacIfNotExists(ctx, req.Mac)
-	if err != nil {
-		return nil, gerror.WrapCode(gcode.CodeDbOperationError, err, "Failed to initialize device information")
-	}
 	uid := g.RequestFromCtx(ctx).GetCtxVar(model.Uid).Int64()
 	if uid == 0 {
 		return nil, gerror.NewCode(gcode.CodeMissingParameter, "User UID cannot be empty")
@@ -33,6 +29,17 @@ func (c *ControllerV2) UnbindDevice(ctx context.Context, req *v2.UnbindDeviceReq
 	// 3. Validate MAC address parameter
 	if req.Mac == "" {
 		return nil, gerror.NewCode(gcode.CodeMissingParameter, "Device MAC address cannot be empty")
+	}
+
+	owned, err := dao.Device.Ctx(ctx).
+		Where("mac = ?", req.Mac).
+		Where("uid = ?", uid).
+		Count()
+	if err != nil {
+		return nil, gerror.WrapCode(gcode.CodeDbOperationError, err, "Failed to query device ownership")
+	}
+	if owned == 0 {
+		return nil, gerror.NewCode(gcode.CodeNotAuthorized, "device not found or not owned by current user")
 	}
 
 	restoreResponse, err := service.RestoreDefaultAgent(req.Mac)

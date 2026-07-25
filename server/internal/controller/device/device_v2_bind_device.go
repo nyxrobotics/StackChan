@@ -7,6 +7,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"stackChan/internal/dao"
 	"stackChan/internal/model"
 	"stackChan/internal/model/do"
@@ -20,6 +21,8 @@ import (
 
 	"stackChan/api/device/v2"
 )
+
+var errDeviceAlreadyBound = errors.New("device is already bound to another user")
 
 // BindDevice Device binding interface
 func (c *ControllerV2) BindDevice(ctx context.Context, req *v2.BindDeviceReq) (res *v2.BindDeviceRes, err error) {
@@ -36,16 +39,30 @@ func (c *ControllerV2) BindDevice(ctx context.Context, req *v2.BindDeviceReq) (r
 			return err
 		}
 
-		_, err = dao.Device.Ctx(ctx).TX(tx).
+		result, updateErr := dao.Device.Ctx(ctx).TX(tx).
 			Where("mac = ?", req.Mac).
+			Where("(uid IS NULL OR uid = 0 OR uid = ?)", uid).
 			Data(do.Device{
 				Uid:      uid,
 				BindTime: gtime.Now().Format("Y-m-d H:i:s"),
 			}).
 			Update()
-		return err
+		if updateErr != nil {
+			return updateErr
+		}
+		affected, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return updateErr
+		}
+		if affected == 0 {
+			return errDeviceAlreadyBound
+		}
+		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errDeviceAlreadyBound) {
+			return nil, gerror.NewCode(gcode.CodeNotAuthorized, errDeviceAlreadyBound.Error())
+		}
 		return nil, gerror.WrapCode(gcode.CodeDbOperationError, err, "Device binding failed")
 	}
 	return new(v2.BindDeviceRes(true)), nil
