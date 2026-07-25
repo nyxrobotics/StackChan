@@ -2,7 +2,6 @@
 
 #include "conversation_health.h"
 #include "agent_config_store.h"
-#include "module_llm_preferences.h"
 
 #include <cstdint>
 #include <functional>
@@ -80,7 +79,6 @@ public:
 
     // TTS 言語（0=ja 1=zh 2=en-us 3=en-default）
     uint8_t getTtsLang() const { return ttsLang_; }
-    uint8_t getTtsVolumePercent() const { return ttsVolumePercent_; }
 
     // ------------------------------------------------------------------
     // Per-turn inference
@@ -141,12 +139,9 @@ private:
     std::string llmWorkId_;
     std::string melottsWorkId_;
     bool openJTalkTtsReady_ = false;
-    bool openJTalkVolumeSupported_ = false;
     bool thinkingEnabled_ = false;
     bool vadEnabled_      = true;
     uint8_t ttsLang_      = 0;   // 0=ja 1=zh 2=en、NVS から復元
-    uint8_t ttsVolumePercent_ =
-        module_llm_preferences::kDefaultTtsVolumePercent;
 
     // Send a StackFlow command and return response work_id (empty on error)
     std::string sfCommand(const std::string& reqId,

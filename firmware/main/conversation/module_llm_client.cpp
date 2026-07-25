@@ -9,7 +9,6 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -49,7 +48,10 @@ static bool uartInit(int uartNum, int txPin, int rxPin, int baud)
 // Construction / Destruction
 // ---------------------------------------------------------------------------
 
-namespace prefs = module_llm_preferences;
+static constexpr const char* kLlmNvsNamespace = "modllm_cfg";
+static constexpr const char* kThinkingKey     = "thinking";
+static constexpr const char* kVadEnabledKey   = "vad_enabled";
+static constexpr const char* kTtsLangKey      = "tts_lang";  // 0=ja 1=zh 2=en
 
 static std::string shellQuote(const std::string& value)
 {
@@ -70,32 +72,25 @@ static std::string shellQuote(const std::string& value)
 ModuleLLMClient::ModuleLLMClient()
 {
     nvs_handle_t h;
-    if (nvs_open(prefs::kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
+    if (nvs_open(kLlmNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = 0;
-        if (nvs_get_u8(h, prefs::kThinkingKey, &v) == ESP_OK) thinkingEnabled_ = (v != 0);
+        if (nvs_get_u8(h, kThinkingKey, &v) == ESP_OK) thinkingEnabled_ = (v != 0);
         uint8_t vad = 1;
-        if (nvs_get_u8(h, prefs::kVadEnabledKey, &vad) == ESP_OK) vadEnabled_ = (vad != 0);
+        if (nvs_get_u8(h, kVadEnabledKey, &vad) == ESP_OK) vadEnabled_ = (vad != 0);
         uint8_t lang = 0;
-        if (nvs_get_u8(h, prefs::kTtsLangKey, &lang) == ESP_OK) ttsLang_ = lang;
-        uint8_t volume = prefs::kDefaultTtsVolumePercent;
-        if (nvs_get_u8(h, prefs::kTtsVolumePercentKey, &volume) == ESP_OK) {
-            ttsVolumePercent_ = prefs::clampTtsVolumePercent(volume);
-        }
+        if (nvs_get_u8(h, kTtsLangKey, &lang) == ESP_OK) ttsLang_ = lang;
         nvs_close(h);
     }
-    ESP_LOGI(
-        TAG,
-        "thinkingEnabled=%d vadEnabled=%d ttsLang=%d ttsVolume=%u%% (from NVS)",
-        thinkingEnabled_, vadEnabled_, (int)ttsLang_,
-        static_cast<unsigned>(ttsVolumePercent_));
+    ESP_LOGI(TAG, "thinkingEnabled=%d vadEnabled=%d ttsLang=%d (from NVS)",
+             thinkingEnabled_, vadEnabled_, (int)ttsLang_);
 }
 
 void ModuleLLMClient::setThinkingEnabled(bool enabled)
 {
     thinkingEnabled_ = enabled;
     nvs_handle_t h;
-    if (nvs_open(prefs::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, prefs::kThinkingKey, enabled ? 1 : 0);
+    if (nvs_open(kLlmNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, kThinkingKey, enabled ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -106,8 +101,8 @@ void ModuleLLMClient::setVadEnabled(bool enabled)
 {
     vadEnabled_ = enabled;
     nvs_handle_t h;
-    if (nvs_open(prefs::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, prefs::kVadEnabledKey, enabled ? 1 : 0);
+    if (nvs_open(kLlmNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, kVadEnabledKey, enabled ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -217,20 +212,12 @@ bool ModuleLLMClient::sysBashExec(const std::string& reqId,
 bool ModuleLLMClient::checkOpenJTalkTts()
 {
     std::string output;
-    openJTalkVolumeSupported_ = false;
     bool ok = sysBashExec("ojt_check", "/opt/stackchan/openjtalk_tts.sh --check", 15000, &output);
     if (!ok || output.find("STACKCHAN_OPENJTALK_READY") == std::string::npos) {
         ESP_LOGW(TAG, "OpenJTalk TTS unavailable: %s", output.c_str());
         return false;
     }
 
-    openJTalkVolumeSupported_ =
-        output.find("features=gain_db,mute") != std::string::npos;
-    if (!openJTalkVolumeSupported_) {
-        ESP_LOGW(
-            TAG,
-            "OpenJTalk helper is legacy; volume control requires helper reprovision");
-    }
     ESP_LOGI(TAG, "OpenJTalk TTS ready: %s", output.c_str());
     return true;
 }
@@ -571,13 +558,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON_AddNumberToObject(data, "capVolume", 0.5);
         cJSON_AddNumberToObject(data, "playcard",  0);
         cJSON_AddNumberToObject(data, "playdevice", 1);
-        const float playVolume =
-            prefs::toMeloPlayVolume(ttsVolumePercent_);
-        cJSON_AddNumberToObject(data, "playVolume", playVolume);
-        ESP_LOGI(
-            TAG, "audio playback volume: %u%% (playVolume=%.3f)",
-            static_cast<unsigned>(ttsVolumePercent_),
-            static_cast<double>(playVolume));
+        cJSON_AddNumberToObject(data, "playVolume", 0.15);
         std::string wid = sfCommand("3", "audio", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "audio.setup failed");
@@ -863,27 +844,9 @@ bool ModuleLLMClient::sendToOpenJTalkTts(const std::string& requestId, const std
         return false;
     }
 
-    const bool muted = ttsVolumePercent_ == 0;
-    float gainDb = 0.0f;
-    if (!muted) {
-        gainDb = 20.0f * std::log10(
-            static_cast<float>(ttsVolumePercent_) / 100.0f);
-    }
-
-    char gainDbText[16];
-    std::snprintf(
-        gainDbText, sizeof(gainDbText), "%.2f", static_cast<double>(gainDb));
-
-    std::string command =
-        "STACKCHAN_OPENJTALK_GAIN_DB=" + std::string(gainDbText) +
-        " STACKCHAN_OPENJTALK_MUTE=" + (muted ? "1" : "0") +
-        " /opt/stackchan/openjtalk_tts.sh --text " + shellQuote(text);
+    std::string command = "/opt/stackchan/openjtalk_tts.sh --text " + shellQuote(text);
     bool ok = sysBashExec(requestId, command, 0, nullptr);
-    ESP_LOGI(
-        TAG, "openjtalk tts send: %s volume=%u%% gain=%s dB helper=%s",
-        ok ? "sent" : "failed",
-        static_cast<unsigned>(ttsVolumePercent_), gainDbText,
-        openJTalkVolumeSupported_ ? "volume-capable" : "legacy");
+    ESP_LOGI(TAG, "openjtalk tts send: %s", ok ? "sent" : "failed");
     return ok;
 }
 
