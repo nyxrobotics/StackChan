@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "speech_bubble.h"
+#include <string>
 
 using namespace uitk;
 using namespace uitk::lvgl_cpp;
@@ -77,10 +78,11 @@ void CommonSpeechBubble::setSpeech(std::string_view text)
         return;
     }
 
-    _text->setText(text);
+    const std::string owned_text(text);
+    _text->setText(owned_text);
 
     lv_point_t text_size;
-    lv_text_get_size(&text_size, text.data(), _text->getTextFont(), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_text_get_size(&text_size, owned_text.c_str(), _text->getTextFont(), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
 
     int bubble_width = min(text_size.x + _text_mx * 2, _bubble_max_width);
     bubble_width     = max(bubble_width, _bubble_min_width);
