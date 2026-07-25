@@ -81,27 +81,31 @@ ConversationManager::~ConversationManager() {
 void ConversationManager::initModuleLLM() {
     if (llmInitialized_) return;
 
+    health_.localLLMConnected  = false;
+    health_.localLLMReady      = false;
+    health_.localPipelineReady = false;
+
     bool llmConnected = llmClient_->connect();
-    health_.localLLMConnected = llmConnected;
-
-    if (llmConnected) {
-        ESP_LOGI(TAG, "Module LLM connected, loading models...");
-        bool pipelineOk = llmClient_->loadModelsAndPipeline();
-        health_.localLLMReady      = pipelineOk;
-        health_.localPipelineReady = pipelineOk;
-
-        if (pipelineOk) {
-            ESP_LOGI(TAG, "Module LLM pipeline ready");
-            // NVS から config を読んで適用（オンライン時に保存済みのものを使う）
-            runAgentConfigSequence();
-        } else {
-            ESP_LOGW(TAG, "Module LLM pipeline NOT ready");
-        }
-    } else {
+    if (!llmConnected) {
         ESP_LOGI(TAG, "Module LLM not connected — local backend disabled");
+        return;
     }
 
+    ESP_LOGI(TAG, "Module LLM connected, loading models...");
+    bool pipelineOk = llmClient_->loadModelsAndPipeline();
+    if (!pipelineOk) {
+        ESP_LOGW(TAG, "Module LLM pipeline NOT ready");
+        return;
+    }
+
+    health_.localLLMConnected  = true;
+    health_.localLLMReady      = true;
+    health_.localPipelineReady = true;
     llmInitialized_ = true;
+
+    ESP_LOGI(TAG, "Module LLM pipeline ready");
+    // NVS から config を読んで適用（オンライン時に保存済みのものを使う）
+    runAgentConfigSequence();
 }
 
 // ---------------------------------------------------------------------------

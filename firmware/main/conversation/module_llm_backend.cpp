@@ -464,7 +464,7 @@ void ModuleLLMBackend::pollLoop() {
         // Block up to 200ms waiting for a UART message
         std::string msg = client_->stackflowReceive(200);
         if (msg.empty()) continue;
-        ESP_LOGI(TAG, "UART rx: %.500s", msg.c_str());
+        ESP_LOGD(TAG, "UART rx: %.500s", msg.c_str());
 
         // Parse JSON
         cJSON* root = cJSON_Parse(msg.c_str());
