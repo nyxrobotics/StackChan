@@ -6,11 +6,247 @@ SPDX-License-Identifier: MIT
 package model
 
 import (
+	"context"
 	"sync"
 	"testing"
 
 	"github.com/gorilla/websocket"
 )
+
+func TestTrySendReplacesStaleMediaAndRejectsStoppedClients(t *testing.T) {
+	t.Parallel()
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	app := &AppClient{
+		sendChan: make(chan *WsSendMsg, 1),
+		ctx:      appCtx,
+		cancel:   appCancel,
+	}
+	message := &WsSendMsg{MsgType: websocket.BinaryMessage, Data: []byte("test")}
+	if !app.TrySend(message) {
+		t.Fatal("AppClient.TrySend rejected an available queue")
+	}
+	replacement := &WsSendMsg{MsgType: websocket.BinaryMessage, Data: []byte("latest")}
+	if !app.TrySend(replacement) {
+		t.Fatal("AppClient.TrySend rejected replacement media")
+	}
+	app.CloseWriterCoroutine()
+	if app.TrySend(message) {
+		t.Fatal("AppClient.TrySend accepted a message after shutdown")
+	}
+	if got := <-app.sendChan; got != replacement {
+		t.Fatal("AppClient did not replace stale queued media")
+	}
+
+	stackCtx, stackCancel := context.WithCancel(context.Background())
+	stack := &StackChanClient{
+		sendChan: make(chan *WsSendMsg, 1),
+		ctx:      stackCtx,
+		cancel:   stackCancel,
+	}
+	if !stack.TrySend(message) {
+		t.Fatal("StackChanClient.TrySend rejected an available queue")
+	}
+	stack.CloseWriterCoroutine()
+	if stack.TrySend(message) {
+		t.Fatal("StackChanClient.TrySend accepted a message after shutdown")
+	}
+	if got := <-stack.sendChan; got != message {
+		t.Fatal("StackChanClient queue was closed or changed during shutdown")
+	}
+}
+
+func TestTrySendKeepsControlTrafficSeparateFromFullMediaQueue(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &AppClient{
+		sendChan:    make(chan *WsSendMsg, 1),
+		controlChan: make(chan *WsSendMsg, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	media := &WsSendMsg{MsgType: websocket.BinaryMessage, Data: []byte("media")}
+	control := &WsSendMsg{
+		MsgType:      websocket.BinaryMessage,
+		Data:         []byte("control"),
+		HighPriority: true,
+	}
+
+	if !client.TrySend(media) {
+		t.Fatal("media queue rejected an available slot")
+	}
+	if !client.TrySend(control) {
+		t.Fatal("full media queue blocked control traffic")
+	}
+	if client.TrySend(control) {
+		t.Fatal("control queue did not enforce its independent capacity")
+	}
+	if got := <-client.controlChan; got != control {
+		t.Fatal("control message was queued on the wrong channel")
+	}
+	client.CloseWriterCoroutine()
+}
+
+func TestControlQueueFailureCanDetachForResync(t *testing.T) {
+	t.Parallel()
+
+	appCtx, appCancel := context.WithCancel(context.Background())
+	appConn := &websocket.Conn{}
+	app := &AppClient{
+		conn:        appConn,
+		sendChan:    make(chan *WsSendMsg, 1),
+		controlChan: make(chan *WsSendMsg, 1),
+		ctx:         appCtx,
+		cancel:      appCancel,
+	}
+	control := &WsSendMsg{HighPriority: true}
+	if !app.TrySend(control) || app.TrySend(control) {
+		t.Fatal("AppClient control queue did not report its full state")
+	}
+	if detached := app.DetachConnForResync(appConn); detached != appConn {
+		t.Fatal("AppClient did not return the connection detached for resync")
+	}
+	if app.GetConn() != nil || app.IsStopped() {
+		t.Fatal("AppClient writer state changed while detaching for resync")
+	}
+	select {
+	case <-appCtx.Done():
+		t.Fatal("AppClient writer context was canceled while detaching for resync")
+	default:
+	}
+	<-app.controlChan
+	if !app.TrySend(control) {
+		t.Fatal("AppClient writer could not be reused after detaching for resync")
+	}
+	app.CloseWriterCoroutine()
+
+	stackCtx, stackCancel := context.WithCancel(context.Background())
+	stackConn := &websocket.Conn{}
+	stack := &StackChanClient{
+		conn:        stackConn,
+		sendChan:    make(chan *WsSendMsg, 1),
+		controlChan: make(chan *WsSendMsg, 1),
+		ctx:         stackCtx,
+		cancel:      stackCancel,
+	}
+	if !stack.TrySend(control) || stack.TrySend(control) {
+		t.Fatal("StackChanClient control queue did not report its full state")
+	}
+	if detached := stack.DetachConnForResync(stackConn); detached != stackConn {
+		t.Fatal("StackChanClient did not return the connection detached for resync")
+	}
+	if stack.GetConn() != nil || stack.IsStopped() {
+		t.Fatal("StackChanClient writer state changed while detaching for resync")
+	}
+	select {
+	case <-stackCtx.Done():
+		t.Fatal("StackChanClient writer context was canceled while detaching for resync")
+	default:
+	}
+	<-stack.controlChan
+	if !stack.TrySend(control) {
+		t.Fatal("StackChanClient writer could not be reused after detaching for resync")
+	}
+	stack.CloseWriterCoroutine()
+}
+
+func TestAppClientDetachConnForResyncPreservesReplacement(t *testing.T) {
+	t.Parallel()
+
+	oldConn := &websocket.Conn{}
+	newConn := &websocket.Conn{}
+	client := &AppClient{conn: oldConn}
+
+	expectedConn := client.GetConn()
+	if replaced := client.ReplaceConn(newConn); replaced != oldConn {
+		t.Fatal("AppClient did not return the replaced connection")
+	}
+	if detached := client.DetachConnForResync(expectedConn); detached != nil {
+		t.Fatal("AppClient detached a replacement connection")
+	}
+	if got := client.GetConn(); got != newConn {
+		t.Fatal("AppClient lost its replacement connection")
+	}
+
+	nilExpectedClient := &AppClient{}
+	nilExpected := nilExpectedClient.GetConn()
+	nilExpectedClient.ReplaceConn(newConn)
+	if detached := nilExpectedClient.DetachConnForResync(nilExpected); detached != nil {
+		t.Fatal("AppClient detached a connection after observing nil")
+	}
+	if got := nilExpectedClient.GetConn(); got != newConn {
+		t.Fatal("AppClient lost a connection installed after observing nil")
+	}
+}
+
+func TestStackChanClientDetachConnForResyncPreservesReplacement(t *testing.T) {
+	t.Parallel()
+
+	oldConn := &websocket.Conn{}
+	newConn := &websocket.Conn{}
+	client := &StackChanClient{conn: oldConn}
+
+	expectedConn := client.GetConn()
+	if replaced := client.ReplaceConn(newConn); replaced != oldConn {
+		t.Fatal("StackChanClient did not return the replaced connection")
+	}
+	if detached := client.DetachConnForResync(expectedConn); detached != nil {
+		t.Fatal("StackChanClient detached a replacement connection")
+	}
+	if got := client.GetConn(); got != newConn {
+		t.Fatal("StackChanClient lost its replacement connection")
+	}
+
+	nilExpectedClient := &StackChanClient{}
+	nilExpected := nilExpectedClient.GetConn()
+	nilExpectedClient.ReplaceConn(newConn)
+	if detached := nilExpectedClient.DetachConnForResync(nilExpected); detached != nil {
+		t.Fatal("StackChanClient detached a connection after observing nil")
+	}
+	if got := nilExpectedClient.GetConn(); got != newConn {
+		t.Fatal("StackChanClient lost a connection installed after observing nil")
+	}
+}
+
+func TestNextQueuedMessageBoundsControlBurst(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	control := make(chan *WsSendMsg, controlBurstLimit+1)
+	media := make(chan *WsSendMsg, 1)
+	controlMessage := &WsSendMsg{HighPriority: true}
+	mediaMessage := &WsSendMsg{}
+	for range controlBurstLimit + 1 {
+		control <- controlMessage
+	}
+	media <- mediaMessage
+
+	controlBurst := 0
+	for range controlBurstLimit {
+		got, fromControl, ok := nextQueuedMessage(
+			ctx,
+			control,
+			media,
+			controlBurst >= controlBurstLimit,
+		)
+		if !ok || !fromControl || got != controlMessage {
+			t.Fatal("control traffic was not prioritized within the burst limit")
+		}
+		controlBurst++
+	}
+
+	got, fromControl, ok := nextQueuedMessage(
+		ctx,
+		control,
+		media,
+		controlBurst >= controlBurstLimit,
+	)
+	if !ok || fromControl || got != mediaMessage {
+		t.Fatal("continuous control traffic starved queued media")
+	}
+}
 
 func TestAppClientClearConnIfDoesNotClearReplacement(t *testing.T) {
 	t.Parallel()

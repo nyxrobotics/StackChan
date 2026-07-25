@@ -74,6 +74,7 @@ var (
 	}
 	logger              = g.Log()
 	stackChanClientPool = sync.Map{}
+	stackChanClientMu   sync.Mutex
 	appClientPool       = sync.Map{}
 	appClientMu         sync.RWMutex
 	validMacPattern     = regexp.MustCompile(
@@ -152,41 +153,30 @@ func Handler(r *ghttp.Request) {
 	ws.SetReadLimit(websocketReadLimit)
 
 	if deviceType == "StackChan" {
-		isHave := false
-		var client *model.StackChanClient
-
-		stackChanClientPool.Range(func(key, value any) bool {
-			macAddr := key.(string)
-			stackChanClient := value.(*model.StackChanClient)
-
-			if macAddr == mac {
-				isHave = true
-				client = stackChanClient
-				previousConn := client.ReplaceConn(ws)
-				if previousConn != nil && previousConn != ws {
-					_ = previousConn.Close()
-				}
-				if client.GetCallAppClient() != nil {
-					reconnectMsg := createStringMessage(TextMessage, "The equipment has been reconnected.")
-					stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), reconnectMsg)
-				}
-				if len(client.GetCameraSubscriptionList()) > 0 {
-					onMsg := createMessage(OnCamera, nil)
-					stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), onMsg)
-				}
-				if len(client.GetAudioSubscriptionList()) > 0 {
-					onMsg := createMessage(OnAudio, nil)
-					stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), onMsg)
-				}
-				client.SetLastTime(time.Now())
-				return false
+		client, previousConn, created := registerStackChanClient(mac, ws)
+		if previousConn != nil && previousConn != ws {
+			_ = previousConn.Close()
+		}
+		if created {
+			if _, createErr := service.CreateMacIfNotExists(ctx, mac); createErr != nil {
+				// WebSocket forwarding does not depend on this metadata write.
+				// Keep the device online; a later registration flow can retry.
+				logger.Errorf(ctx, "Failed to persist newly connected StackChan %s: %v", mac, createErr)
 			}
-			return true
-		})
-
-		if !isHave {
-			client = model.NewStackChanClient(mac, ws, make([]*model.AppClient, 0), nil, false)
-			addStackChenClient(ctx, client)
+		}
+		if !created {
+			if client.GetCallAppClient() != nil {
+				reconnectMsg := createStringMessage(TextMessage, "The equipment has been reconnected.")
+				stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), reconnectMsg)
+			}
+			if len(client.GetCameraSubscriptionList()) > 0 {
+				onMsg := createMessage(OnCamera, nil)
+				stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), onMsg)
+			}
+			if len(client.GetAudioSubscriptionList()) > 0 {
+				onMsg := createMessage(OnAudio, nil)
+				stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), onMsg)
+			}
 		}
 
 		// send Online
@@ -195,6 +185,9 @@ func Handler(r *ghttp.Request) {
 		// Notify App
 		appClients := getAppClients(client.GetMac())
 		for _, appClient := range appClients {
+			if appClient == nil {
+				continue
+			}
 			appSendMessage(ctx, appClient, &msgType, onlineMsg)
 		}
 
@@ -212,37 +205,25 @@ func Handler(r *ghttp.Request) {
 					break
 				}
 
-				if ne, ok := errors.AsType[net.Error](err); ok && ne.Temporary() {
-					logger.Infof(ctx, "StackChan Temporary network error. Continue reading.: mac=%s,deviceType=%s,Error=%v", mac, deviceType, err)
-					continue
+				if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+					logger.Infof(ctx, "StackChan Timeout disconnection: mac=%s, deviceType=%s", mac, deviceType)
+					break
 				}
 
 				logger.Errorf(ctx, "StackChan Abnormal disconnection: mac=%s, deviceType=%s, Error=%v", mac, deviceType, err)
+				break
+			}
+			if client.GetConn() != ws {
+				logger.Debugf(ctx, "Ignore message from replaced StackChan connection: mac=%s", mac)
 				break
 			}
 			client.SetLastTime(time.Now())
 			readStackChanMessage(ctx, client, &messageType, &msg)
 		}
 	} else if deviceType == "App" {
-		var client *model.AppClient
-		found := false
-		clients := getAppClients(mac)
-		for _, appClient := range clients {
-			if appClient.GetDeviceId() == deviceId && appClient.GetMac() == mac {
-				// Already available. Update the connection.
-				client = appClient
-				previousConn := client.ReplaceConn(ws)
-				if previousConn != nil && previousConn != ws {
-					_ = previousConn.Close()
-				}
-				client.SetLastTime(time.Now())
-				found = true
-				break
-			}
-		}
-		if !found {
-			client = model.NewAppClient(mac, ws, deviceId)
-			addAppClient(client)
+		client, previousConn, _ := registerAppClient(mac, deviceId, ws)
+		if previousConn != nil && previousConn != ws {
+			_ = previousConn.Close()
 		}
 		logger.Info(ctx, "There is an App connected to the service.", client.GetMac())
 
@@ -269,15 +250,15 @@ func Handler(r *ghttp.Request) {
 					logger.Infof(ctx, "App Normal disconnection: mac=%s, deviceType=%s, Error=%v", mac, deviceType, err)
 					break
 				}
-				if errors.As(err, &ne) && ne.Temporary() {
-					logger.Infof(ctx, "App Temporary network error. Continue reading.: mac=%s,deviceType=%s,Error=%v", mac, deviceType, err)
-					continue
-				}
 				if errors.As(err, &ne) && ne.Timeout() {
 					logger.Infof(ctx, "App Timeout disconnection: mac=%s, deviceType=%s", mac, deviceType)
 					break
 				}
 				logger.Errorf(ctx, "App Abnormal disconnection: mac=%s, deviceType=%s, Error=%v", mac, deviceType, err)
+				break
+			}
+			if client.GetConn() != ws {
+				logger.Debugf(ctx, "Ignore message from replaced App connection: mac=%s, deviceId=%s", mac, deviceId)
 				break
 			}
 			client.SetLastTime(time.Now())
@@ -286,10 +267,80 @@ func Handler(r *ghttp.Request) {
 	}
 }
 
-// Handle WebSocket connection requests from StackChan devices
-func addStackChenClient(ctx context.Context, c *model.StackChanClient) {
-	stackChanClientPool.Store(c.GetMac(), c)
-	_, _ = service.CreateMacIfNotExists(ctx, c.GetMac())
+func registerStackChanClient(mac string, conn *websocket.Conn) (
+	client *model.StackChanClient,
+	previousConn *websocket.Conn,
+	created bool,
+) {
+	stackChanClientMu.Lock()
+	defer stackChanClientMu.Unlock()
+
+	if value, ok := stackChanClientPool.Load(mac); ok {
+		if existing, valid := value.(*model.StackChanClient); valid && existing != nil {
+			if !existing.IsStopped() {
+				previousConn = existing.ReplaceConn(conn)
+				existing.SetLastTime(time.Now())
+				return existing, previousConn, false
+			}
+			previousConn = existing.GetConn()
+		}
+		stackChanClientPool.Delete(mac)
+	}
+
+	client = model.NewStackChanClient(mac, conn, make([]*model.AppClient, 0), nil, false)
+	stackChanClientPool.Store(mac, client)
+	return client, nil, true
+}
+
+func registerAppClient(mac string, deviceID string, conn *websocket.Conn) (
+	client *model.AppClient,
+	previousConn *websocket.Conn,
+	created bool,
+) {
+	appClientMu.Lock()
+	defer appClientMu.Unlock()
+
+	var clients []*model.AppClient
+	var matchingClient *model.AppClient
+	var stoppedMatchingClient *model.AppClient
+	if value, ok := appClientPool.Load(mac); ok {
+		if existingClients, valid := value.([]*model.AppClient); valid {
+			clients = make([]*model.AppClient, 0, len(existingClients)+1)
+			for _, existing := range existingClients {
+				if existing == nil {
+					continue
+				}
+				if existing.GetDeviceId() == deviceID &&
+					existing.GetMac() == mac &&
+					existing.IsStopped() {
+					if stoppedMatchingClient == nil {
+						stoppedMatchingClient = existing
+					}
+					continue
+				}
+				clients = append(clients, existing)
+				if matchingClient == nil &&
+					existing.GetDeviceId() == deviceID &&
+					existing.GetMac() == mac {
+					matchingClient = existing
+				}
+			}
+		}
+	}
+	if matchingClient != nil {
+		previousConn = matchingClient.ReplaceConn(conn)
+		matchingClient.SetLastTime(time.Now())
+		appClientPool.Store(mac, clients)
+		return matchingClient, previousConn, false
+	}
+
+	client = model.NewAppClient(mac, conn, deviceID)
+	if stoppedMatchingClient != nil {
+		previousConn = stoppedMatchingClient.GetConn()
+	}
+	clients = append(clients, client)
+	appClientPool.Store(mac, clients)
+	return client, previousConn, true
 }
 
 // Handle WebSocket connection requests from App devices
@@ -769,25 +820,64 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 
 // Send WebSocket messages to App clients
 func appSendMessage(ctx context.Context, client *model.AppClient, messageType *int, msg *[]byte) {
-	select {
-	case client.SendChan() <- &model.WsSendMsg{
-		MsgType: *messageType,
-		Data:    *msg,
-	}:
-	default:
-		logger.Infof(ctx, "App client send message is full")
+	if client == nil || messageType == nil || msg == nil {
+		logger.Warningf(ctx, "Cannot queue App message with nil client or payload")
+		return
+	}
+	expectedConn := client.GetConn()
+	highPriority := isControlQueueMessage(*messageType, *msg)
+	if !client.TrySend(&model.WsSendMsg{
+		MsgType:      *messageType,
+		Data:         *msg,
+		HighPriority: highPriority,
+	}) && highPriority {
+		logger.Warningf(ctx, "App client control queue is unavailable or full; closing connection for resync")
+		// Preserve the client identity and writer so reconnect registration can
+		// reuse its server-side subscriptions and current state.
+		if conn := client.DetachConnForResync(expectedConn); conn != nil {
+			if err := conn.Close(); err != nil {
+				logger.Debugf(ctx, "Close overloaded App client connection: %v", err)
+			}
+		}
 	}
 }
 
 // Send WebSocket messages to StackChan devices
 func stackChanSendMessage(ctx context.Context, client *model.StackChanClient, messageType *int, msg *[]byte) {
-	select {
-	case client.SendChan() <- &model.WsSendMsg{
-		MsgType: *messageType,
-		Data:    *msg,
-	}:
+	if client == nil || messageType == nil || msg == nil {
+		logger.Warningf(ctx, "Cannot queue StackChan message with nil client or payload")
+		return
+	}
+	expectedConn := client.GetConn()
+	highPriority := isControlQueueMessage(*messageType, *msg)
+	if !client.TrySend(&model.WsSendMsg{
+		MsgType:      *messageType,
+		Data:         *msg,
+		HighPriority: highPriority,
+	}) && highPriority {
+		logger.Warningf(ctx, "StackChan client control queue is unavailable or full; closing connection for resync")
+		// Preserve the client identity and writer so reconnect registration can
+		// reuse its server-side subscriptions and current state.
+		if conn := client.DetachConnForResync(expectedConn); conn != nil {
+			if err := conn.Close(); err != nil {
+				logger.Debugf(ctx, "Close overloaded StackChan client connection: %v", err)
+			}
+		}
+	}
+}
+
+// High-rate media and motion traffic is intentionally lossy when a client
+// cannot keep up. Lower-frequency control traffic uses a separate queue so a
+// media backlog cannot suppress stop, state, or connection messages.
+func isControlQueueMessage(messageType int, msg []byte) bool {
+	if messageType != websocket.BinaryMessage || len(msg) == 0 {
+		return true
+	}
+	switch msg[0] {
+	case Opus, Jpeg, ControlAvatar, ControlMotion:
+		return false
 	default:
-		logger.Infof(ctx, "StackChan client send message is full")
+		return true
 	}
 }
 

@@ -24,6 +24,17 @@ const (
 	ClientExpireTimeout = 15 * time.Second
 )
 
+type expiredAppClient struct {
+	client *model.AppClient
+	conn   *websocket.Conn
+}
+
+type expiredStackChanClient struct {
+	mac    string
+	client *model.StackChanClient
+	conn   *websocket.Conn
+}
+
 // StartPingTime sends Ping messages to all connected clients for heartbeat detection
 func StartPingTime(ctx context.Context) {
 	// Global panic recovery, prevent entire heartbeat detection logic from crashing
@@ -96,7 +107,7 @@ func StartPingTime(ctx context.Context) {
 	}
 }
 
-// CheckExpiredLinks checks and cleans up App client connections that have been inactive for over 60 seconds
+// CheckExpiredLinks cleans up clients that have exceeded ClientExpireTimeout.
 func CheckExpiredLinks(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -107,7 +118,8 @@ func CheckExpiredLinks(ctx context.Context) {
 	now := time.Now()
 	expiredClients := removeExpiredAppClients(ctx, now)
 
-	for _, client := range expiredClients {
+	for _, expiredClient := range expiredClients {
+		client := expiredClient.client
 		if client == nil {
 			continue
 		}
@@ -149,90 +161,92 @@ func CheckExpiredLinks(ctx context.Context) {
 					logger.Errorf(ctx, "Close AppClient conn panic: %v", r)
 				}
 			}()
-			client.CloseWriterCoroutine()
-			conn := client.GetConn()
-			if conn != nil && client.ClearConnIf(conn) {
-				_ = conn.Close()
+			if expiredClient.conn != nil {
+				_ = expiredClient.conn.Close()
 			}
 		}()
 	}
 
-	var expiredStackChanKeys []string
-	stackChanClientPool.Range(func(mac, value any) bool {
-		if mac == nil || value == nil {
-			return true
-		}
-		macStr, ok := mac.(string)
-		if !ok {
-			return true
-		}
-		stackChanClient, ok := value.(*model.StackChanClient)
-		if !ok || stackChanClient == nil {
-			logger.Warningf(ctx, "StackChanClientPool invalid type for mac: %v, delete invalid entry", macStr)
-			stackChanClientPool.Delete(mac)
-			return true
-		}
-		if now.Sub(stackChanClient.GetLastTime()) > ClientExpireTimeout {
-			expiredStackChanKeys = append(expiredStackChanKeys, macStr)
-		}
-		return true
-	})
+	var expiredStackChanClients []expiredStackChanClient
+	func() {
+		stackChanClientMu.Lock()
+		defer stackChanClientMu.Unlock()
 
-	for _, mac := range expiredStackChanKeys {
-		val, ok := stackChanClientPool.Load(mac)
-		if !ok {
-			continue
-		}
-		stackChanClient, ok := val.(*model.StackChanClient)
-		if !ok || stackChanClient == nil {
-			stackChanClientPool.Delete(mac)
-			continue
-		}
-
-		stackChanClientPool.Delete(mac)
-
-		offlineMsg := createStringMessage(DeviceOffline, "Your StackChan is offline.")
-		msgType := websocket.BinaryMessage
-		appClients := getAppClients(stackChanClient.GetMac())
-		if appClients != nil {
-			for _, appClient := range appClients {
-				if appClient == nil {
-					continue
-				}
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Errorf(ctx, "Notify AppClient offline panic: %v", r)
-						}
-					}()
-					appSendMessage(ctx, appClient, &msgType, offlineMsg)
-				}()
+		stackChanClientPool.Range(func(mac, value any) bool {
+			macStr, validMac := mac.(string)
+			stackChanClient, validClient := value.(*model.StackChanClient)
+			if !validMac || !validClient || stackChanClient == nil {
+				logger.Warningf(ctx, "StackChanClientPool invalid entry for mac: %v, delete invalid entry", mac)
+				stackChanClientPool.Delete(mac)
+				return true
 			}
-		}
+			conn, expired := stackChanClient.ExpireIfInactive(now, ClientExpireTimeout)
+			if !expired {
+				return true
+			}
+			stackChanClientPool.Delete(mac)
+			expiredStackChanClients = append(expiredStackChanClients, expiredStackChanClient{
+				mac:    macStr,
+				client: stackChanClient,
+				conn:   conn,
+			})
+			return true
+		})
+	}()
+
+	for _, expiredClient := range expiredStackChanClients {
+		mac := expiredClient.mac
+		stackChanClient := expiredClient.client
+
+		// Keep registration blocked until the offline messages are queued. This
+		// guarantees that a reconnect's online message is not overtaken by stale
+		// cleanup from the previous connection.
+		func() {
+			stackChanClientMu.Lock()
+			defer stackChanClientMu.Unlock()
+
+			current, reconnected := stackChanClientPool.Load(mac)
+			reconnected = reconnected && current != stackChanClient
+			if !reconnected {
+				offlineMsg := createStringMessage(DeviceOffline, "Your StackChan is offline.")
+				msgType := websocket.BinaryMessage
+				appClients := getAppClients(stackChanClient.GetMac())
+				for _, appClient := range appClients {
+					if appClient == nil {
+						continue
+					}
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								logger.Errorf(ctx, "Notify AppClient offline panic: %v", r)
+							}
+						}()
+						appSendMessage(ctx, appClient, &msgType, offlineMsg)
+					}()
+				}
+			}
+		}()
 
 		logger.Infof(ctx, "Kicked out expired StackChan client: %s", mac)
 
-		stackChanClient.CloseWriterCoroutine()
-		conn := stackChanClient.GetConn()
-
-		if conn != nil && stackChanClient.ClearConnIf(conn) {
+		if expiredClient.conn != nil {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						logger.Errorf(ctx, "Close StackChan conn panic: %v", r)
 					}
 				}()
-				_ = conn.Close()
+				_ = expiredClient.conn.Close()
 			}()
 		}
 	}
 }
 
-func removeExpiredAppClients(ctx context.Context, now time.Time) []*model.AppClient {
+func removeExpiredAppClients(ctx context.Context, now time.Time) []expiredAppClient {
 	appClientMu.Lock()
 	defer appClientMu.Unlock()
 
-	var expiredClients []*model.AppClient
+	var expiredClients []expiredAppClient
 	appClientPool.Range(func(mac, value any) bool {
 		if mac == nil || value == nil {
 			return true
@@ -249,8 +263,12 @@ func removeExpiredAppClients(ctx context.Context, now time.Time) []*model.AppCli
 			if client == nil {
 				continue
 			}
-			if now.Sub(client.GetLastTime()) > ClientExpireTimeout {
-				expiredClients = append(expiredClients, client)
+			conn, expired := client.ExpireIfInactive(now, ClientExpireTimeout)
+			if expired {
+				expiredClients = append(expiredClients, expiredAppClient{
+					client: client,
+					conn:   conn,
+				})
 				continue
 			}
 			newClients = append(newClients, client)
@@ -274,8 +292,12 @@ func GetRandomStackChanDevice(userMac string, maxLength int) (list []string) {
 	var macs []string
 
 	stackChanClientPool.Range(func(key, value interface{}) bool {
-		mac := key.(string)
-		client := value.(*model.StackChanClient)
+		mac, validMac := key.(string)
+		client, validClient := value.(*model.StackChanClient)
+		if !validMac || !validClient || client == nil {
+			logger.Warningf(context.Background(), "GetRandomStackChanDevice: invalid pool entry for key %v", key)
+			return true
+		}
 
 		if mac == userMac {
 			return true

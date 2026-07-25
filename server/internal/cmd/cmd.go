@@ -43,7 +43,8 @@ var (
 			s.BindHandler("/stackChan/ws", web_socket.Handler)
 
 			// heartBeat
-			boot.InitCron()
+			boot.InitCronContext(ctx)
+			defer boot.StopCron()
 
 			///Configuration file access
 			s.Group("/file", func(group *ghttp.RouterGroup) {

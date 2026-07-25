@@ -8,6 +8,7 @@ package model
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogf/gf/v2/frame/g"
@@ -15,8 +16,9 @@ import (
 )
 
 type WsSendMsg struct {
-	MsgType int
-	Data    []byte
+	MsgType      int
+	Data         []byte
+	HighPriority bool
 }
 
 type AppClient struct {
@@ -26,9 +28,12 @@ type AppClient struct {
 	deviceId string
 	lastTime time.Time
 
-	sendChan chan *WsSendMsg
-	ctx      context.Context
-	cancel   context.CancelFunc
+	sendChan    chan *WsSendMsg
+	controlChan chan *WsSendMsg
+	queueMu     sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopped     atomic.Bool
 }
 
 type StackChanClient struct {
@@ -42,22 +47,33 @@ type StackChanClient struct {
 	phoneScreen             bool
 	lastTime                time.Time
 
-	sendChan chan *WsSendMsg
-	ctx      context.Context
-	cancel   context.CancelFunc
+	sendChan    chan *WsSendMsg
+	controlChan chan *WsSendMsg
+	queueMu     sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stopped     atomic.Bool
 }
+
+const (
+	websocketWriteTimeout = 5 * time.Second
+	controlQueueCapacity  = 32
+	mediaQueueCapacity    = 100
+	controlBurstLimit     = 8
+)
 
 // NewAppClient creates and initializes an AppClient
 func NewAppClient(mac string, conn *websocket.Conn, deviceId string) *AppClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &AppClient{
-		mac:      mac,
-		conn:     conn,
-		deviceId: deviceId,
-		lastTime: time.Now(),
-		sendChan: make(chan *WsSendMsg, 100),
-		ctx:      ctx,
-		cancel:   cancel,
+		mac:         mac,
+		conn:        conn,
+		deviceId:    deviceId,
+		lastTime:    time.Now(),
+		sendChan:    make(chan *WsSendMsg, mediaQueueCapacity),
+		controlChan: make(chan *WsSendMsg, controlQueueCapacity),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	client.StartWriterCoroutine()
 	return client
@@ -73,7 +89,8 @@ func NewStackChanClient(mac string, conn *websocket.Conn, cameraSubscriptionList
 		callAppClient:          callAppClient,
 		phoneScreen:            phoneScreen,
 		lastTime:               time.Now(),
-		sendChan:               make(chan *WsSendMsg, 100),
+		sendChan:               make(chan *WsSendMsg, mediaQueueCapacity),
+		controlChan:            make(chan *WsSendMsg, controlQueueCapacity),
 		ctx:                    ctx,
 		cancel:                 cancel,
 	}
@@ -88,29 +105,25 @@ func (a *AppClient) StartWriterCoroutine() {
 			if r := recover(); r != nil {
 				g.Log().Errorf(context.Background(), "AppClient writer coroutine panic: %v", r)
 			}
-			close(a.sendChan)
+			a.CloseWriterCoroutine()
 		}()
 
+		controlBurst := 0
 		for {
-			select {
-			case <-a.ctx.Done():
+			msg, fromControl, ok := nextQueuedMessage(
+				a.ctx,
+				a.controlChan,
+				a.sendChan,
+				controlBurst >= controlBurstLimit,
+			)
+			if !ok {
 				return
-			case msg, ok := <-a.sendChan:
-				if !ok { // Channel closed
-					return
-				}
-				if msg == nil {
-					continue
-				}
-				a.mu.RLock()
-				conn := a.conn
-				a.mu.RUnlock()
-				if conn == nil {
-					continue
-				}
-				if err := conn.WriteMessage(msg.MsgType, msg.Data); err != nil {
-					g.Log().Errorf(context.Background(), "AppClient send message error: %v", err)
-				}
+			}
+			a.writeQueuedMessage(msg)
+			if fromControl {
+				controlBurst++
+			} else {
+				controlBurst = 0
 			}
 		}
 	}()
@@ -123,47 +136,247 @@ func (s *StackChanClient) StartWriterCoroutine() {
 			if r := recover(); r != nil {
 				g.Log().Errorf(context.Background(), "StackChan writer coroutine panic: %v", r)
 			}
-			close(s.sendChan)
+			s.CloseWriterCoroutine()
 		}()
+		controlBurst := 0
 		for {
-			select {
-			case <-s.ctx.Done():
+			msg, fromControl, ok := nextQueuedMessage(
+				s.ctx,
+				s.controlChan,
+				s.sendChan,
+				controlBurst >= controlBurstLimit,
+			)
+			if !ok {
 				return
-			case msg, ok := <-s.sendChan:
-				if !ok {
-					return
-				}
-				if msg == nil {
-					continue
-				}
-				s.mu.RLock()
-				conn := s.conn
-				s.mu.RUnlock()
-				if conn == nil {
-					continue
-				}
-				if err := conn.WriteMessage(msg.MsgType, msg.Data); err != nil {
-					g.Log().Errorf(context.Background(), "StackChan writer coroutine send message error: %v", err)
-				}
+			}
+			s.writeQueuedMessage(msg)
+			if fromControl {
+				controlBurst++
+			} else {
+				controlBurst = 0
 			}
 		}
 	}()
 }
 
+func nextQueuedMessage(
+	ctx context.Context,
+	control <-chan *WsSendMsg,
+	media <-chan *WsSendMsg,
+	forceMedia bool,
+) (msg *WsSendMsg, fromControl bool, ok bool) {
+	if forceMedia {
+		select {
+		case <-ctx.Done():
+			return nil, false, false
+		case msg, ok = <-media:
+			return msg, false, ok
+		default:
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, false, false
+	case msg, ok = <-control:
+		return msg, true, ok
+	default:
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, false, false
+	case msg, ok = <-control:
+		return msg, true, ok
+	case msg, ok = <-media:
+		return msg, false, ok
+	}
+}
+
+func (a *AppClient) writeQueuedMessage(msg *WsSendMsg) {
+	if msg == nil {
+		return
+	}
+
+	var conn *websocket.Conn
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			g.Log().Errorf(context.Background(), "AppClient write panic: %v", recovered)
+			if conn != nil {
+				a.ClearConnIf(conn)
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	a.mu.RLock()
+	conn = a.conn
+	a.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		g.Log().Errorf(context.Background(), "AppClient set write deadline error: %v", err)
+		a.ClearConnIf(conn)
+		_ = conn.Close()
+		return
+	}
+	if err := conn.WriteMessage(msg.MsgType, msg.Data); err != nil {
+		g.Log().Errorf(context.Background(), "AppClient send message error: %v", err)
+		a.ClearConnIf(conn)
+		_ = conn.Close()
+	}
+}
+
+func (s *StackChanClient) writeQueuedMessage(msg *WsSendMsg) {
+	if msg == nil {
+		return
+	}
+
+	var conn *websocket.Conn
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			g.Log().Errorf(context.Background(), "StackChan write panic: %v", recovered)
+			if conn != nil {
+				s.ClearConnIf(conn)
+				_ = conn.Close()
+			}
+		}
+	}()
+
+	s.mu.RLock()
+	conn = s.conn
+	s.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		g.Log().Errorf(context.Background(), "StackChan set write deadline error: %v", err)
+		s.ClearConnIf(conn)
+		_ = conn.Close()
+		return
+	}
+	if err := conn.WriteMessage(msg.MsgType, msg.Data); err != nil {
+		g.Log().Errorf(context.Background(), "StackChan writer coroutine send message error: %v", err)
+		s.ClearConnIf(conn)
+		_ = conn.Close()
+	}
+}
+
 func (a *AppClient) CloseWriterCoroutine() {
-	a.cancel()
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	if a.stopped.CompareAndSwap(false, true) && a.cancel != nil {
+		a.cancel()
+	}
 }
 
 func (s *StackChanClient) CloseWriterCoroutine() {
-	s.cancel()
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if s.stopped.CompareAndSwap(false, true) && s.cancel != nil {
+		s.cancel()
+	}
 }
 
-func (a *AppClient) SendChan() chan *WsSendMsg {
-	return a.sendChan
+// DetachConnForResync atomically detaches expectedConn only if it is still the
+// current connection. A nil or replaced connection is never detached. The
+// caller owns the returned connection and must close it.
+func (a *AppClient) DetachConnForResync(expectedConn *websocket.Conn) *websocket.Conn {
+	if expectedConn == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.conn != expectedConn {
+		return nil
+	}
+	a.conn = nil
+	return expectedConn
 }
 
-func (s *StackChanClient) SendChan() chan *WsSendMsg {
-	return s.sendChan
+// DetachConnForResync atomically detaches expectedConn only if it is still the
+// current connection. A nil or replaced connection is never detached. The
+// caller owns the returned connection and must close it.
+func (s *StackChanClient) DetachConnForResync(expectedConn *websocket.Conn) *websocket.Conn {
+	if expectedConn == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != expectedConn {
+		return nil
+	}
+	s.conn = nil
+	return expectedConn
+}
+
+func (a *AppClient) IsStopped() bool {
+	return a.stopped.Load()
+}
+
+func (s *StackChanClient) IsStopped() bool {
+	return s.stopped.Load()
+}
+
+// TrySend queues a message without blocking. It returns false after shutdown
+// or while the bounded queue is full.
+func (a *AppClient) TrySend(msg *WsSendMsg) bool {
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	if msg == nil || a.stopped.Load() || a.sendChan == nil {
+		return false
+	}
+	if msg.HighPriority && a.controlChan != nil {
+		select {
+		case a.controlChan <- msg:
+			return true
+		default:
+			return false
+		}
+	}
+	return enqueueLatest(a.sendChan, msg)
+}
+
+// TrySend queues a message without blocking. It returns false after shutdown
+// or while the bounded queue is full.
+func (s *StackChanClient) TrySend(msg *WsSendMsg) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if msg == nil || s.stopped.Load() || s.sendChan == nil {
+		return false
+	}
+	if msg.HighPriority && s.controlChan != nil {
+		select {
+		case s.controlChan <- msg:
+			return true
+		default:
+			return false
+		}
+	}
+	return enqueueLatest(s.sendChan, msg)
+}
+
+// enqueueLatest keeps bounded real-time traffic close to the present by
+// discarding one queued stale frame when the media queue is full.
+func enqueueLatest(queue chan *WsSendMsg, msg *WsSendMsg) bool {
+	select {
+	case queue <- msg:
+		return true
+	default:
+	}
+
+	select {
+	case <-queue:
+	default:
+	}
+
+	select {
+	case queue <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *AppClient) SetMac(mac string) {
@@ -230,6 +443,28 @@ func (a *AppClient) GetLastTime() time.Time {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.lastTime
+}
+
+// ExpireIfInactive atomically claims an inactive client for cleanup. Once
+// claimed, a reconnect must create a new client instance.
+func (a *AppClient) ExpireIfInactive(now time.Time, timeout time.Duration) (*websocket.Conn, bool) {
+	a.mu.Lock()
+	if now.Sub(a.lastTime) <= timeout {
+		a.mu.Unlock()
+		return nil, false
+	}
+	conn := a.conn
+	a.conn = nil
+	cancel := a.cancel
+	a.queueMu.Lock()
+	a.stopped.Store(true)
+	a.queueMu.Unlock()
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return conn, true
 }
 
 func (s *StackChanClient) SetMac(mac string) {
@@ -439,4 +674,26 @@ func (s *StackChanClient) SetLastTime(lastTime time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastTime = lastTime
+}
+
+// ExpireIfInactive atomically claims an inactive client for cleanup. Once
+// claimed, a reconnect must create a new client instance.
+func (s *StackChanClient) ExpireIfInactive(now time.Time, timeout time.Duration) (*websocket.Conn, bool) {
+	s.mu.Lock()
+	if now.Sub(s.lastTime) <= timeout {
+		s.mu.Unlock()
+		return nil, false
+	}
+	conn := s.conn
+	s.conn = nil
+	cancel := s.cancel
+	s.queueMu.Lock()
+	s.stopped.Store(true)
+	s.queueMu.Unlock()
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return conn, true
 }

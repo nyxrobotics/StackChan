@@ -8,88 +8,122 @@ package boot
 import (
 	"context"
 	"stackChan/internal/web_socket"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/gogf/gf/v2/frame/g"
 )
 
-func InitCron() {
-	startPingTimer()
-	startCleanTimer()
-}
-
 var (
-	pingTimerStarted  atomic.Bool
-	cleanTimerStarted atomic.Bool
+	cronMu     sync.Mutex
+	cronCancel context.CancelFunc
+	cronDone   chan struct{}
 )
 
-// startPingTimer starts the heartbeat timer, with panic recovery and restart logic.
-func startPingTimer() {
-	if !pingTimerStarted.CompareAndSwap(false, true) {
+// InitCron starts the background WebSocket maintenance tasks once.
+func InitCron() {
+	InitCronContext(context.Background())
+}
+
+// InitCronContext ties the maintenance tasks to the server lifecycle. StopCron
+// should be called when the server stops.
+func InitCronContext(parent context.Context) {
+	if parent == nil {
+		parent = context.Background()
+	}
+
+	cronMu.Lock()
+	if cronCancel != nil {
+		cronMu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = cancel // for future use
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	cronCancel = cancel
+	cronDone = done
+	cronMu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go runPeriodicTask(
+		ctx,
+		&wg,
+		5*time.Second,
+		"The heartbeat sending timer has been activated",
+		"Heartbeat sending task crash",
+		web_socket.StartPingTime,
+	)
+	go runPeriodicTask(
+		ctx,
+		&wg,
+		15*time.Second,
+		"The connection cleaning timer has been started",
+		"Connection cleanup task crash",
+		web_socket.CheckExpiredLinks,
+	)
+
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		g.Log().Info(ctx, "The heartbeat sending timer has been activated")
-		for {
-			select {
-			case <-ctx.Done():
-				pingTimerStarted.Store(false)
-				return
-			case <-ticker.C:
-				func() {
-					defer func() {
-						if err := recover(); err != nil {
-							g.Log().Errorf(ctx, "Heartbeat sending task crash: %v, the timer is about to be restarted", err)
-							pingTimerStarted.Store(false)
-							go func() {
-								time.Sleep(time.Second)
-								startPingTimer()
-							}()
-						}
-					}()
-					web_socket.StartPingTime(ctx)
-				}()
-			}
+		wg.Wait()
+
+		cronMu.Lock()
+		if cronDone == done {
+			cronCancel = nil
+			cronDone = nil
 		}
+		cronMu.Unlock()
+
+		// Closing done after clearing the matching generation guarantees that
+		// StopCron does not return while InitCronContext can still observe the
+		// stopped generation as active.
+		close(done)
 	}()
 }
 
-// startCleanTimer starts the connection cleaning timer, with panic recovery and restart logic.
-func startCleanTimer() {
-	if !cleanTimerStarted.CompareAndSwap(false, true) {
+// StopCron cancels and waits for the maintenance tasks. It is safe to call
+// repeatedly.
+func StopCron() {
+	cronMu.Lock()
+	cancel := cronCancel
+	done := cronDone
+	cronMu.Unlock()
+
+	if cancel == nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = cancel // for future use
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		g.Log().Info(ctx, "The connection cleaning timer has been started")
-		for {
-			select {
-			case <-ctx.Done():
-				cleanTimerStarted.Store(false)
-				return
-			case <-ticker.C:
-				func() {
-					defer func() {
-						if err := recover(); err != nil {
-							g.Log().Errorf(ctx, "Connection cleanup task crash: %v, about to restart the timer", err)
-							cleanTimerStarted.Store(false)
-							go func() {
-								time.Sleep(time.Second)
-								startCleanTimer()
-							}()
-						}
-					}()
-					web_socket.CheckExpiredLinks(ctx)
+	cancel()
+	if done != nil {
+		<-done
+	}
+}
+
+func runPeriodicTask(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	interval time.Duration,
+	startMessage string,
+	panicMessage string,
+	task func(context.Context),
+) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	g.Log().Info(ctx, startMessage)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						g.Log().Errorf(ctx, "%s: %v", panicMessage, recovered)
+					}
 				}()
-			}
+				task(ctx)
+			}()
 		}
-	}()
+	}
 }

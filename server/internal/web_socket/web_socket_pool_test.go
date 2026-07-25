@@ -20,6 +20,12 @@ func resetAppClientPoolForTest() {
 	appClientPool = sync.Map{}
 }
 
+func resetStackChanClientPoolForTest() {
+	stackChanClientMu.Lock()
+	defer stackChanClientMu.Unlock()
+	stackChanClientPool = sync.Map{}
+}
+
 func TestAppClientPoolReturnsCopies(t *testing.T) {
 	resetAppClientPoolForTest()
 
@@ -87,7 +93,7 @@ func TestConcurrentAppClientAddAndCleanupDoesNotLoseLiveClients(t *testing.T) {
 		}()
 	}
 
-	var expiredClients []*model.AppClient
+	var expiredClients []expiredAppClient
 	go func() {
 		defer wg.Done()
 		<-start
@@ -97,7 +103,7 @@ func TestConcurrentAppClientAddAndCleanupDoesNotLoseLiveClients(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	if len(expiredClients) != 1 || expiredClients[0] != expired {
+	if len(expiredClients) != 1 || expiredClients[0].client != expired {
 		t.Fatalf("expired clients = %#v, want only the expired client", expiredClients)
 	}
 
@@ -110,4 +116,116 @@ func TestConcurrentAppClientAddAndCleanupDoesNotLoseLiveClients(t *testing.T) {
 			t.Fatal("expired client remained in the pool")
 		}
 	}
+}
+
+func TestConcurrentAppRegistrationReusesOneClient(t *testing.T) {
+	resetAppClientPoolForTest()
+
+	const (
+		registrationCount = 64
+		mac               = "AABBCCDDEEFF"
+		deviceID          = "phone"
+	)
+	clients := make(chan *model.AppClient, registrationCount)
+	var wg sync.WaitGroup
+	wg.Add(registrationCount)
+	for range registrationCount {
+		go func() {
+			defer wg.Done()
+			client, _, _ := registerAppClient(mac, deviceID, nil)
+			clients <- client
+		}()
+	}
+	wg.Wait()
+	close(clients)
+
+	var first *model.AppClient
+	for client := range clients {
+		if first == nil {
+			first = client
+			t.Cleanup(func() {
+				first.CloseWriterCoroutine()
+				resetAppClientPoolForTest()
+			})
+			continue
+		}
+		if client != first {
+			t.Fatal("concurrent registration created duplicate AppClient instances")
+		}
+	}
+
+	if got := getAppClients(mac); len(got) != 1 || got[0] != first {
+		t.Fatalf("registered clients = %#v, want one shared client", got)
+	}
+}
+
+func TestConcurrentStackChanRegistrationReusesOneClient(t *testing.T) {
+	resetStackChanClientPoolForTest()
+
+	const (
+		registrationCount = 64
+		mac               = "AABBCCDDEEFF"
+	)
+	clients := make(chan *model.StackChanClient, registrationCount)
+	var wg sync.WaitGroup
+	wg.Add(registrationCount)
+	for range registrationCount {
+		go func() {
+			defer wg.Done()
+			client, _, _ := registerStackChanClient(mac, nil)
+			clients <- client
+		}()
+	}
+	wg.Wait()
+	close(clients)
+
+	var first *model.StackChanClient
+	for client := range clients {
+		if first == nil {
+			first = client
+			t.Cleanup(func() {
+				first.CloseWriterCoroutine()
+				resetStackChanClientPoolForTest()
+			})
+			continue
+		}
+		if client != first {
+			t.Fatal("concurrent registration created duplicate StackChanClient instances")
+		}
+	}
+
+	value, ok := stackChanClientPool.Load(mac)
+	if !ok || value != first {
+		t.Fatalf("registered StackChan client = %#v, want shared client %#v", value, first)
+	}
+}
+
+func TestRegistrationReplacesStoppedWriters(t *testing.T) {
+	resetAppClientPoolForTest()
+	resetStackChanClientPoolForTest()
+	t.Cleanup(func() {
+		resetAppClientPoolForTest()
+		resetStackChanClientPoolForTest()
+	})
+
+	const (
+		mac      = "AABBCCDDEEFF"
+		deviceID = "phone"
+	)
+
+	oldApp, _, _ := registerAppClient(mac, deviceID, nil)
+	oldApp.CloseWriterCoroutine()
+	newApp, _, created := registerAppClient(mac, deviceID, nil)
+	if !created || newApp == oldApp || newApp.IsStopped() {
+		t.Fatal("stopped AppClient writer was reused")
+	}
+	newApp.CloseWriterCoroutine()
+
+	oldStackChan, _, _ := registerStackChanClient(mac, nil)
+	oldStackChan.CloseWriterCoroutine()
+	newStackChan, _, created := registerStackChanClient(mac, nil)
+	if !created || newStackChan == oldStackChan || newStackChan.IsStopped() {
+		t.Fatal("stopped StackChanClient writer was reused")
+	}
+	newStackChan.CloseWriterCoroutine()
 }
