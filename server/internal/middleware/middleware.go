@@ -24,16 +24,24 @@ type DefaultHandlerResponse struct {
 	Data    any    `json:"data"    dc:"Result data for certain request according API definition"`
 }
 
+func effectiveRequestPath(r *ghttp.Request) string {
+	if overriddenPath := strings.TrimSpace(r.Header.Get("X-Url-Path")); overriddenPath != "" {
+		if queryIndex := strings.IndexByte(overriddenPath, '?'); queryIndex >= 0 {
+			overriddenPath = overriddenPath[:queryIndex]
+		}
+		return strings.TrimSuffix(overriddenPath, "/")
+	}
+	return strings.TrimSuffix(r.URL.Path, "/")
+}
+
 // TokenAuthMiddleware token
 func TokenAuthMiddleware(r *ghttp.Request) {
 	mac, err := web_socket.GetMac(r)
-	if err != nil {
-		r.Middleware.Next()
+	if err != nil || mac == "" {
+		r.Response.WriteJsonExit(gerror.NewCode(gcode.CodeNotAuthorized, "Invalid device authorization token"))
 		return
 	}
-	if mac != "" {
-		r.SetCtxVar(model.Mac, mac)
-	}
+	r.SetCtxVar(model.Mac, mac)
 	r.Middleware.Next()
 }
 
@@ -46,7 +54,8 @@ func V2TokenAuthMiddleware(r *ghttp.Request) {
 		})
 	}
 
-	if strings.HasPrefix(r.URL.Path, "/stackChan/v2/user/login") || strings.HasPrefix(r.URL.Path, "/stackChan/v2/user/registration") {
+	requestPath := effectiveRequestPath(r)
+	if requestPath == "/stackChan/v2/user/login" || requestPath == "/stackChan/v2/user/registration" {
 		r.Middleware.Next()
 		return
 	}
@@ -99,7 +108,7 @@ func CORS(r *ghttp.Request) {
 
 // AdminTokenAuthMiddleware Admin token validation
 func AdminTokenAuthMiddleware(r *ghttp.Request) {
-	if strings.HasPrefix(r.URL.Path, "/admin/stackChan/login") {
+	if effectiveRequestPath(r) == "/admin/stackChan/login" {
 		r.Middleware.Next()
 		return
 	}
@@ -116,6 +125,9 @@ func AdminTokenAuthMiddleware(r *ghttp.Request) {
 		return
 	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, gerror.NewCodef(gcode.CodeNotAuthorized, "token signing algorithm error: %v", token.Header["alg"])
+		}
 		return []byte(jwtSecret), nil
 	})
 	if err != nil || !token.Valid {
