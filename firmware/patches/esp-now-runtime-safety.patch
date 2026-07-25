@@ -1,0 +1,648 @@
+diff --git a/src/espnow/src/espnow.c b/src/espnow/src/espnow.c
+index 167ebfa..afeacf1 100644
+--- a/src/espnow/src/espnow.c
++++ b/src/espnow/src/espnow.c
+@@ -6,6 +6,7 @@
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <stdatomic.h>
+ #include <string.h>
+ #include <sys/param.h>
+ 
+@@ -31,6 +32,9 @@
+ 
+ #define SEND_CB_OK                      BIT0
+ #define SEND_CB_FAIL                    BIT1
++#define MAIN_TASK_STOPPED                BIT2
++
++#define ESPNOW_DEINIT_TIMEOUT            pdMS_TO_TICKS(1000)
+ 
+ #define ESPNOW_MSG_CACHE                32
+ 
+@@ -119,6 +123,7 @@ static espnow_sec_t *g_espnow_sec = NULL, *g_espnow_dec = NULL;
+ static EventGroupHandle_t g_event_group = NULL;
+ static QueueHandle_t g_espnow_queue = NULL;
+ static QueueHandle_t g_ack_queue = NULL;
++static TaskHandle_t g_espnow_task = NULL;
+ static uint32_t g_buffered_num;
+ static uint8_t g_espnow_sec_key[APP_KEY_LEN] = {0}, g_espnow_dec_key[APP_KEY_LEN] = {0};
+ static bool g_read_from_nvs = true, g_read_dec_from_nvs = true;
+@@ -139,6 +144,13 @@ static espnow_frame_head_t g_espnow_frame_head_default = ESPNOW_FRAME_CONFIG_DEF
+ 
+ wifi_country_t g_self_country = {0};
+ static SemaphoreHandle_t g_send_lock = NULL;
++static atomic_bool g_deinitializing = ATOMIC_VAR_INIT(false);
++static atomic_uint g_active_senders = ATOMIC_VAR_INIT(0);
++static atomic_uint g_active_callbacks = ATOMIC_VAR_INIT(0);
++static bool g_wifi_handler_registered = false;
++static bool g_native_espnow_initialized = false;
++static bool g_send_cb_registered = false;
++static bool g_recv_cb_registered = false;
+ 
+ typedef struct espnow_recv_handle {
+     espnow_data_type_t type;
+@@ -151,6 +163,10 @@ static espnow_recv_handle_t g_recv_handle[ESPNOW_DATA_TYPE_MAX];
+ 
+ static bool queue_over_write(espnow_msg_id_t msg_id, const void *const data, size_t data_len, void *arg, TickType_t xTicksToWait)
+ {
++    if (msg_id != ESPNOW_EVENT_STOP && atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        return false;
++    }
++
+     if (msg_id == ESPNOW_EVENT_RECV_ACK) {
+         if (!g_ack_queue) {
+             return false;
+@@ -174,9 +190,37 @@ static bool queue_over_write(espnow_msg_id_t msg_id, const void *const data, siz
+ 
+ /**< callback function of receiving ESPNOW data */
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 1)
++static void espnow_recv_cb_internal(const esp_now_recv_info_t *recv_info, const uint8_t *data, int size);
++
+ void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int size)
++{
++    if (atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        return;
++    }
++    atomic_fetch_add_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++    if (!atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        espnow_recv_cb_internal(recv_info, data, size);
++    }
++    atomic_fetch_sub_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++}
++
++static void espnow_recv_cb_internal(const esp_now_recv_info_t *recv_info, const uint8_t *data, int size)
+ #else
++static void espnow_recv_cb_internal(const uint8_t *addr, const uint8_t *data, int size);
++
+ void espnow_recv_cb(const uint8_t *addr, const uint8_t *data, int size)
++{
++    if (atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        return;
++    }
++    atomic_fetch_add_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++    if (!atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        espnow_recv_cb_internal(addr, data, size);
++    }
++    atomic_fetch_sub_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++}
++
++static void espnow_recv_cb_internal(const uint8_t *addr, const uint8_t *data, int size)
+ #endif
+ {
+     espnow_data_t *espnow_data = (espnow_data_t *)data;
+@@ -407,14 +451,24 @@ void espnow_send_cb(const uint8_t *addr, esp_now_send_status_t status)
+ #else
+ void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+ {
+-    uint8_t *addr = tx_info->src_addr;
++    const uint8_t *addr = tx_info ? tx_info->src_addr : NULL;
+ #endif // idf version
++    if (atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        return;
++    }
++    atomic_fetch_add_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++    if (atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        atomic_fetch_sub_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
++        return;
++    }
++
+     if (g_buffered_num) {
+         g_buffered_num --;
+     }
+ 
+     if (!addr || !g_event_group) {
+         ESP_LOGW(TAG, "Send cb args error, addr is NULL");
++        atomic_fetch_sub_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
+         return ;
+     }
+ 
+@@ -423,6 +477,7 @@ void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t st
+     } else {
+         xEventGroupSetBits(g_event_group, SEND_CB_FAIL);
+     }
++    atomic_fetch_sub_explicit(&g_active_callbacks, 1, memory_order_acq_rel);
+ }
+ 
+ esp_err_t espnow_add_peer(const espnow_addr_t addr, const uint8_t *lmk)
+@@ -534,6 +589,13 @@ esp_err_t espnow_send(espnow_data_type_t type, const espnow_addr_t dest_addr, co
+     ESP_PARAM_CHECK(type < ESPNOW_DATA_TYPE_MAX);
+     ESP_PARAM_CHECK(size <= ESPNOW_DATA_LEN);
+     ESP_ERROR_RETURN(!g_espnow_config, ESP_ERR_ESPNOW_NOT_INIT, "ESPNOW is not initialized");
++    ESP_ERROR_RETURN(atomic_load_explicit(&g_deinitializing, memory_order_acquire),
++                     ESP_ERR_INVALID_STATE, "ESPNOW is shutting down");
++    atomic_fetch_add_explicit(&g_active_senders, 1, memory_order_acq_rel);
++    if (atomic_load_explicit(&g_deinitializing, memory_order_acquire)) {
++        atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
++        return ESP_ERR_INVALID_STATE;
++    }
+ 
+     esp_err_t ret             = ESP_FAIL;
+     TickType_t write_ticks    = 0;
+@@ -547,11 +609,16 @@ esp_err_t espnow_send(espnow_data_type_t type, const espnow_addr_t dest_addr, co
+     if (g_espnow_config->sec_enable && (data_head ? data_head->security : g_espnow_frame_head_default.security)
+         && type != ESPNOW_DATA_TYPE_ACK && type != ESPNOW_DATA_TYPE_FORWARD
+         && type != ESPNOW_DATA_TYPE_SECURITY_STATUS && type != ESPNOW_DATA_TYPE_SECURITY) {
+-        ESP_ERROR_RETURN(!(g_espnow_sec && g_espnow_sec->state == ESPNOW_SEC_OVER), ESP_FAIL, "Security key is not set");
++        if (!(g_espnow_sec && g_espnow_sec->state == ESPNOW_SEC_OVER)) {
++            ESP_LOGW(TAG, "Security key is not set");
++            atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
++            return ESP_FAIL;
++        }
+         size_t enc_len = 0;
+         espnow_data = ESP_MALLOC(sizeof(espnow_data_t) + size + g_espnow_sec->tag_len + IV_LEN);
+         if (!espnow_data) {
+             ESP_LOGE(TAG, "Not enough memory!");
++            atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+             return ret;
+         }
+         uint8_t key_info[APP_KEY_LEN];
+@@ -561,6 +628,7 @@ esp_err_t espnow_send(espnow_data_type_t type, const espnow_addr_t dest_addr, co
+         if (ret) {
+             ESP_FREE(espnow_data);
+             ESP_LOGE(TAG, "Get security key fail for encrypt, err_name: %s", esp_err_to_name(ret));
++            atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+             return ret;
+         }
+ 
+@@ -576,12 +644,14 @@ esp_err_t espnow_send(espnow_data_type_t type, const espnow_addr_t dest_addr, co
+         } else {
+             ESP_FREE(espnow_data);
+             ESP_LOGE(TAG, "Security encrypt return error");
++            atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+             return ret;
+         }
+     } else {
+         espnow_data = ESP_MALLOC(sizeof(espnow_data_t) + size);
+         if (!espnow_data) {
+             ESP_LOGE(TAG, "Not enough memory!");
++            atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+             return ret;
+         }
+         espnow_data->size = size;
+@@ -621,8 +691,9 @@ esp_err_t espnow_send(espnow_data_type_t type, const espnow_addr_t dest_addr, co
+              frame_head->forward_rssi, espnow_data->payload, frame_head->magic);
+ 
+     /**< Wait for other tasks to be sent before send ESP-NOW data */
+-    if (xSemaphoreTake(g_send_lock, pdMS_TO_TICKS(wait_ticks)) != pdPASS) {
++    if (xSemaphoreTake(g_send_lock, wait_ticks) != pdPASS) {
+         ESP_FREE(espnow_data);
++        atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+         return ESP_ERR_TIMEOUT;
+     }
+ 
+@@ -703,6 +774,7 @@ EXIT:
+             if (*ack_magic == frame_head->magic) {
+                 ESP_FREE(espnow_data);
+                 ESP_FREE(ack_magic);
++                atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+                 return ESP_OK;
+             }
+ 
+@@ -713,6 +785,7 @@ EXIT:
+     }
+ 
+     ESP_FREE(espnow_data);
++    atomic_fetch_sub_explicit(&g_active_senders, 1, memory_order_acq_rel);
+ 
+     return ret;
+ }
+@@ -902,7 +975,7 @@ static esp_err_t espnow_send_forward(espnow_data_t *espnow_data)
+             MAC2STR(espnow_data->src_addr),  espnow_data->size, espnow_data->type, frame_head->magic);
+ 
+     uint32_t start_ticks      = xTaskGetTickCount();
+-    uint32_t max_ticks        = pdMS_TO_TICKS(g_espnow_config->send_max_timeout);
++    uint32_t max_ticks        = g_espnow_config->send_max_timeout;
+     for (int count = 0; !count || ((count < frame_head->retransmit_count) && (max_ticks > (xTaskGetTickCount() - start_ticks))); ++count) {
+         for (int i = 0;  i == 0 || (frame_head->channel == ESPNOW_CHANNEL_ALL && i < g_self_country.nchan && g_set_channel_flag && g_espnow_config->forward_switch_channel); ++i) {
+ 
+@@ -941,16 +1014,6 @@ static void espnow_main_task(void *arg)
+ 
+     ESP_LOGI(TAG, "main task entry");
+ 
+-    if (g_espnow_config && g_espnow_config->qsize) {
+-        g_espnow_queue = xQueueCreate(g_espnow_config->qsize, sizeof(espnow_event_ctx_t));
+-        ESP_ERROR_GOTO(!g_espnow_queue, EXIT, "Create espnow event queue fail");
+-
+-        if (g_recv_handle[ESPNOW_DATA_TYPE_ACK].enable) {
+-            g_ack_queue = xQueueCreate(4, sizeof(uint32_t *));
+-            ESP_ERROR_GOTO(!g_ack_queue, EXIT, "Create espnow ack queue fail");
+-        }
+-    }
+-
+     while (g_espnow_config && loop_continue) {
+         if (xQueueReceive(g_espnow_queue, &evt_data, portMAX_DELAY) != pdTRUE) {
+             continue;
+@@ -976,7 +1039,6 @@
+         }
+     }
+ 
+-EXIT:
+     if (g_espnow_queue) {
+         while (xQueueReceive(g_espnow_queue, &evt_data, 0)) {
+             ESP_FREE(evt_data.data);
+@@ -987,11 +1050,16 @@ EXIT:
+     }
+ 
+     if (g_ack_queue) {
++        uint32_t *ack_magic = NULL;
++        while (xQueueReceive(g_ack_queue, &ack_magic, 0) == pdTRUE) {
++            ESP_FREE(ack_magic);
++        }
+         vQueueDelete(g_ack_queue);
+         g_ack_queue = NULL;
+     }
+ 
+     ESP_LOGI(TAG, "main task exit");
++    xEventGroupSetBits(g_event_group, MAIN_TASK_STOPPED);
+     vTaskDelete(NULL);
+ }
+ 
+@@ -1048,24 +1116,93 @@ esp_err_t espnow_init(const espnow_config_t *config)
+ {
+     ESP_LOGI(TAG, "esp-now Version: %d.%d.%d", ESP_NOW_VER_MAJOR, ESP_NOW_VER_MINOR, ESP_NOW_VER_PATCH);
+     wifi_ap_record_t ap_info;
++    esp_err_t ret = ESP_OK;
++    bool wifi_handler_registered = false;
++    bool espnow_initialized = false;
++    bool send_cb_registered = false;
++    bool recv_cb_registered = false;
+ 
+     ESP_PARAM_CHECK(config);
++    ESP_ERROR_RETURN(config->qsize == 0, ESP_ERR_INVALID_ARG, "Queue size must be greater than zero");
+ 
+     if (g_espnow_config) {
+-        return ESP_OK;
++        return atomic_load_explicit(&g_deinitializing, memory_order_acquire) ? ESP_ERR_INVALID_STATE : ESP_OK;
+     }
++    atomic_store_explicit(&g_deinitializing, true, memory_order_release);
++    atomic_store_explicit(&g_active_senders, 0, memory_order_release);
++    atomic_store_explicit(&g_active_callbacks, 0, memory_order_release);
+ 
+     g_espnow_config = ESP_MALLOC(sizeof(espnow_config_t));
++    if (!g_espnow_config) {
++        atomic_store_explicit(&g_deinitializing, false, memory_order_release);
++        return ESP_ERR_NO_MEM;
++    }
+     memcpy(g_espnow_config, config, sizeof(espnow_config_t));
+ 
+     /**< Event group for espnow sent cb */
+     g_event_group = xEventGroupCreate();
+-    ESP_ERROR_RETURN(!g_event_group, ESP_FAIL, "Create event group fail");
++    if (!g_event_group) {
++        ret = ESP_ERR_NO_MEM;
++        ESP_LOGE(TAG, "Create event group fail");
++        goto FAIL;
++    }
+ 
+     g_send_lock = xSemaphoreCreateMutex();
+-    ESP_ERROR_RETURN(!g_send_lock, ESP_FAIL, "Create send semaphore mutex fail");
++    if (!g_send_lock) {
++        ret = ESP_ERR_NO_MEM;
++        ESP_LOGE(TAG, "Create send semaphore mutex fail");
++        goto FAIL;
++    }
++
++    if (config->sec_enable) {
++        g_espnow_sec = ESP_CALLOC(1, sizeof(espnow_sec_t));
++        g_espnow_dec = ESP_CALLOC(1, sizeof(espnow_sec_t));
++        if (!g_espnow_sec || !g_espnow_dec) {
++            ret = ESP_ERR_NO_MEM;
++            ESP_LOGE(TAG, "Allocate security contexts fail");
++            goto FAIL;
++        }
++
++        ret = espnow_sec_init(g_espnow_sec);
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Initialize encryption context fail: %s", esp_err_to_name(ret));
++            goto FAIL;
++        }
++
++        ret = espnow_sec_init(g_espnow_dec);
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Initialize decryption context fail: %s", esp_err_to_name(ret));
++            goto FAIL;
++        }
++    }
+ 
+-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
++    uint32_t *enable = (uint32_t *)&config->receive_enable;
++    for (int i = 0; i < ESPNOW_DATA_TYPE_MAX; ++i) {
++        g_recv_handle[i].enable = (*enable) & BIT(i);
++    }
++
++    g_espnow_queue = xQueueCreate(config->qsize, sizeof(espnow_event_ctx_t));
++    if (!g_espnow_queue) {
++        ret = ESP_ERR_NO_MEM;
++        ESP_LOGE(TAG, "Create espnow event queue fail");
++        goto FAIL;
++    }
++
++    if (g_recv_handle[ESPNOW_DATA_TYPE_ACK].enable) {
++        g_ack_queue = xQueueCreate(4, sizeof(uint32_t *));
++        if (!g_ack_queue) {
++            ret = ESP_ERR_NO_MEM;
++            ESP_LOGE(TAG, "Create espnow ack queue fail");
++            goto FAIL;
++        }
++    }
++
++    ret = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Register Wi-Fi event handler fail: %s", esp_err_to_name(ret));
++        goto FAIL;
++    }
++    wifi_handler_registered = true;
+ 
+     /* There may be chances that another Wi-Fi application has already connected to AP before ESP-NOW
+      * registers wifi_event_handler. Check AP info here to avoid missing WIFI_EVENT_STA_CONNECTED action.
+@@ -1075,47 +1212,222 @@ esp_err_t espnow_init(const espnow_config_t *config)
+         g_set_channel_flag = false;
+     }
+ 
+-    if (config->sec_enable) {
+-        g_espnow_sec = ESP_MALLOC(sizeof(espnow_sec_t));
+-        g_espnow_dec = ESP_MALLOC(sizeof(espnow_sec_t));
+-        espnow_sec_init(g_espnow_sec);
+-        espnow_sec_init(g_espnow_dec);
++    /**< Initialize ESPNOW function */
++    ret = esp_now_init();
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Initialize ESP-NOW fail: %s", esp_err_to_name(ret));
++        goto FAIL;
+     }
++    espnow_initialized = true;
+ 
+-    uint32_t *enable = (uint32_t *)&config->receive_enable;
+-    for (int i = 0; i < ESPNOW_DATA_TYPE_MAX; ++i) {
+-        g_recv_handle[i].enable = (*enable) & BIT(i);
++    ret = esp_now_register_send_cb(espnow_send_cb);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Register ESP-NOW send callback fail: %s", esp_err_to_name(ret));
++        goto FAIL;
+     }
++    send_cb_registered = true;
+ 
+-    /**< Initialize ESPNOW function */
+-    ESP_ERROR_CHECK(esp_now_init());
+-    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+-    ESP_ERROR_CHECK(esp_now_set_pmk(config->pmk));
++    ret = esp_now_register_recv_cb(espnow_recv_cb);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Register ESP-NOW receive callback fail: %s", esp_err_to_name(ret));
++        goto FAIL;
++    }
++    recv_cb_registered = true;
++
++    ret = esp_now_set_pmk(config->pmk);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Set ESP-NOW PMK fail: %s", esp_err_to_name(ret));
++        goto FAIL;
++    }
++
++    ret = espnow_add_peer(ESPNOW_ADDR_BROADCAST, NULL);
++    if (ret != ESP_OK) {
++        goto FAIL;
++    }
+ 
+-    espnow_add_peer(ESPNOW_ADDR_BROADCAST, NULL);
++    ret = esp_wifi_get_country(&g_self_country);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Read Wi-Fi country fail: %s", esp_err_to_name(ret));
++        goto FAIL;
++    }
+ 
+-    esp_wifi_get_country(&g_self_country);
+-    esp_wifi_get_mac(ESP_IF_WIFI_STA, ESPNOW_ADDR_SELF);
++    ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, ESPNOW_ADDR_SELF);
++    if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "Read Wi-Fi MAC fail: %s", esp_err_to_name(ret));
++        goto FAIL;
++    }
+     ESP_LOGI(TAG, "mac: " MACSTR ", version: %d", MAC2STR(ESPNOW_ADDR_SELF), ESPNOW_VERSION);
+ 
+     ESP_LOGI(TAG, "Enable main task");
+-    xTaskCreate(espnow_main_task, "espnow_main", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
++    if (xTaskCreate(espnow_main_task, "espnow_main", 4096, NULL, tskIDLE_PRIORITY + 1, &g_espnow_task) != pdPASS) {
++        ret = ESP_ERR_NO_MEM;
++        ESP_LOGE(TAG, "Create ESP-NOW main task fail");
++        goto FAIL;
++    }
+ 
++    g_wifi_handler_registered = wifi_handler_registered;
++    g_native_espnow_initialized = espnow_initialized;
++    g_send_cb_registered = send_cb_registered;
++    g_recv_cb_registered = recv_cb_registered;
++    atomic_store_explicit(&g_deinitializing, false, memory_order_release);
+     return ESP_OK;
++
++FAIL:
++    if (recv_cb_registered) {
++        esp_now_unregister_recv_cb();
++    }
++    if (send_cb_registered) {
++        esp_now_unregister_send_cb();
++    }
++    if (espnow_initialized) {
++        esp_now_deinit();
++    }
++    if (wifi_handler_registered) {
++        esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
++    }
++
++    espnow_event_ctx_t evt_data = { 0 };
++    if (g_espnow_queue) {
++        while (xQueueReceive(g_espnow_queue, &evt_data, 0) == pdTRUE) {
++            ESP_FREE(evt_data.data);
++        }
++        vQueueDelete(g_espnow_queue);
++        g_espnow_queue = NULL;
++    }
++
++    if (g_ack_queue) {
++        uint32_t *ack_magic = NULL;
++        while (xQueueReceive(g_ack_queue, &ack_magic, 0) == pdTRUE) {
++            ESP_FREE(ack_magic);
++        }
++        vQueueDelete(g_ack_queue);
++        g_ack_queue = NULL;
++    }
++
++    for (int i = 0; i < ESPNOW_DATA_TYPE_MAX; ++i) {
++        g_recv_handle[i].enable = 0;
++        g_recv_handle[i].handle = NULL;
++    }
++
++    if (g_espnow_sec) {
++        espnow_sec_deinit(g_espnow_sec);
++        ESP_FREE(g_espnow_sec);
++    }
++    if (g_espnow_dec) {
++        espnow_sec_deinit(g_espnow_dec);
++        ESP_FREE(g_espnow_dec);
++    }
++
++    if (g_send_lock) {
++        vSemaphoreDelete(g_send_lock);
++        g_send_lock = NULL;
++    }
++    if (g_event_group) {
++        vEventGroupDelete(g_event_group);
++        g_event_group = NULL;
++    }
++
++    ESP_FREE(g_espnow_config);
++    g_espnow_config = NULL;
++    g_espnow_task = NULL;
++    g_set_channel_flag = true;
++    g_buffered_num = 0;
++    atomic_store_explicit(&g_deinitializing, false, memory_order_release);
++    atomic_store_explicit(&g_active_senders, 0, memory_order_release);
++    atomic_store_explicit(&g_active_callbacks, 0, memory_order_release);
++
++    return ret;
+ }
+ 
+ esp_err_t espnow_deinit(void)
+ {
+     ESP_ERROR_RETURN(!g_espnow_config, ESP_ERR_ESPNOW_NOT_INIT, "ESPNOW is not initialized");
+ 
+-    /**< De-initialize ESPNOW function */
+-    ESP_ERROR_CHECK(esp_now_unregister_recv_cb());
+-    ESP_ERROR_CHECK(esp_now_unregister_send_cb());
+-    ESP_ERROR_CHECK(esp_now_deinit());
++    atomic_store_explicit(&g_deinitializing, true, memory_order_release);
++    if (g_event_group) {
++        xEventGroupSetBits(g_event_group, SEND_CB_FAIL);
++    }
++
++    TickType_t sender_wait_start = xTaskGetTickCount();
++    while (atomic_load_explicit(&g_active_senders, memory_order_acquire) != 0 &&
++           xTaskGetTickCount() - sender_wait_start < ESPNOW_DEINIT_TIMEOUT) {
++        vTaskDelay(1);
++    }
++    if (atomic_load_explicit(&g_active_senders, memory_order_acquire) != 0) {
++        ESP_LOGW(TAG, "Timed out while waiting for active ESP-NOW senders");
++        return ESP_ERR_TIMEOUT;
++    }
++
++    TickType_t callback_wait_start = xTaskGetTickCount();
++    while (atomic_load_explicit(&g_active_callbacks, memory_order_acquire) != 0 &&
++           xTaskGetTickCount() - callback_wait_start < ESPNOW_DEINIT_TIMEOUT) {
++        vTaskDelay(1);
++    }
++    if (atomic_load_explicit(&g_active_callbacks, memory_order_acquire) != 0) {
++        ESP_LOGW(TAG, "Timed out while waiting for active ESP-NOW callbacks");
++        return ESP_ERR_TIMEOUT;
++    }
++
++    if (g_espnow_task) {
++        EventBits_t bits = xEventGroupGetBits(g_event_group);
++        if (!(bits & MAIN_TASK_STOPPED)) {
++            if (!g_espnow_queue) {
++                ESP_LOGE(TAG, "ESP-NOW main task queue is unavailable");
++                return ESP_ERR_INVALID_STATE;
++            }
+ 
+-    if (queue_over_write(ESPNOW_EVENT_STOP, NULL, 0, NULL, 0) != pdPASS) {
+-        ESP_LOGW(TAG, "[%s, %d] Send queue failed", __func__, __LINE__);
++            espnow_event_ctx_t stop_event = {
++                .msg_id = ESPNOW_EVENT_STOP,
++                .data_len = 0,
++                .data = NULL,
++                .handle = NULL,
++            };
++            if (xQueueSendToFront(g_espnow_queue, &stop_event, ESPNOW_DEINIT_TIMEOUT) != pdPASS) {
++                ESP_LOGW(TAG, "Timed out while requesting ESP-NOW main task stop");
++                return ESP_ERR_TIMEOUT;
++            }
++
++            bits = xEventGroupWaitBits(g_event_group, MAIN_TASK_STOPPED, pdFALSE, pdFALSE,
++                                       ESPNOW_DEINIT_TIMEOUT);
++            if (!(bits & MAIN_TASK_STOPPED)) {
++                ESP_LOGW(TAG, "Timed out while waiting for ESP-NOW main task");
++                return ESP_ERR_TIMEOUT;
++            }
++        }
++    }
++
++    esp_err_t ret = ESP_OK;
++    if (g_recv_cb_registered) {
++        ret = esp_now_unregister_recv_cb();
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Unregister ESP-NOW receive callback fail: %s", esp_err_to_name(ret));
++            return ret;
++        }
++        g_recv_cb_registered = false;
++    }
++    if (g_send_cb_registered) {
++        ret = esp_now_unregister_send_cb();
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Unregister ESP-NOW send callback fail: %s", esp_err_to_name(ret));
++            return ret;
++        }
++        g_send_cb_registered = false;
++    }
++    if (g_wifi_handler_registered) {
++        ret = esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Unregister Wi-Fi event handler fail: %s", esp_err_to_name(ret));
++            return ret;
++        }
++        g_wifi_handler_registered = false;
++    }
++    if (g_native_espnow_initialized) {
++        ret = esp_now_deinit();
++        if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "Deinitialize native ESP-NOW fail: %s", esp_err_to_name(ret));
++            return ret;
++        }
++        g_native_espnow_initialized = false;
+     }
+ 
+     for (int i = 0; i < ESPNOW_DATA_TYPE_MAX; ++i) {
+@@ -1135,16 +1447,23 @@ esp_err_t espnow_deinit(void)
+         }
+     }
+ 
+-    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler));
+-
+-    vSemaphoreDelete(g_send_lock);
+-    g_send_lock = NULL;
++    if (g_send_lock) {
++        vSemaphoreDelete(g_send_lock);
++        g_send_lock = NULL;
++    }
+ 
+-    vEventGroupDelete(g_event_group);
+-    g_event_group = NULL;
++    if (g_event_group) {
++        vEventGroupDelete(g_event_group);
++        g_event_group = NULL;
++    }
+ 
+     ESP_FREE(g_espnow_config);
+     g_espnow_config = NULL;
++    g_espnow_task = NULL;
++    g_set_channel_flag = true;
++    g_buffered_num = 0;
++    atomic_store_explicit(&g_active_senders, 0, memory_order_release);
++    atomic_store_explicit(&g_active_callbacks, 0, memory_order_release);
+ 
+     return ESP_OK;
+ }
+diff --git a/src/security/src/espnow_security.c b/src/security/src/espnow_security.c
+index 2483c6d..8534fdf 100644
+--- a/src/security/src/espnow_security.c
++++ b/src/security/src/espnow_security.c
+@@ -33,6 +33,9 @@ esp_err_t espnow_sec_init(espnow_sec_t *sec)
+ 
+     memset(sec, 0, sizeof(espnow_sec_t));
+     sec->cipher_ctx = (mbedtls_ccm_context *)ESP_CALLOC(1, sizeof(mbedtls_ccm_context));
++    if (!sec->cipher_ctx) {
++        return ESP_ERR_NO_MEM;
++    }
+     sec->key_len = KEY_LEN;
+     sec->iv_len = IV_LEN;
+     sec->tag_len = TAG_LEN;
