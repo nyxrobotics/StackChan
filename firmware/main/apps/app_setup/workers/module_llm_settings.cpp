@@ -1,5 +1,6 @@
 #include "workers.h"
 #include "common.h"
+#include "module_llm_preferences.h"
 #include <mooncake_log.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -7,10 +8,7 @@
 using namespace setup_workers;
 using namespace uitk::lvgl_cpp;
 
-static constexpr const char* kNvsNs         = "modllm_cfg";
-static constexpr const char* kThinkingKey   = "thinking";
-static constexpr const char* kVadEnabledKey = "vad_enabled";
-static constexpr const char* kTtsLangKey    = "tts_lang";  // 0=ja 1=zh 2=en
+namespace prefs = module_llm_preferences;
 
 static std::unique_ptr<Container> make_row(Container* parent, int y, int h = 38) {
     auto row = std::make_unique<Container>(parent->get());
@@ -29,13 +27,23 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
 {
     // Read from NVS
     nvs_handle_t h;
-    if (nvs_open(kNvsNs, NVS_READONLY, &h) == ESP_OK) {
+    if (nvs_open(prefs::kNvsNamespace, NVS_READONLY, &h) == ESP_OK) {
         uint8_t v = 0;
-        if (nvs_get_u8(h, kThinkingKey,   &v)  == ESP_OK) _thinking  = (v != 0);
+        if (nvs_get_u8(h, prefs::kThinkingKey,   &v)  == ESP_OK) _thinking  = (v != 0);
         uint8_t vad = 1;
-        if (nvs_get_u8(h, kVadEnabledKey, &vad) == ESP_OK) _vad      = (vad != 0);
+        if (nvs_get_u8(h, prefs::kVadEnabledKey, &vad) == ESP_OK) _vad      = (vad != 0);
         uint8_t lang = 0;
-        if (nvs_get_u8(h, kTtsLangKey,   &lang) == ESP_OK) _tts_lang = lang;
+        if (nvs_get_u8(h, prefs::kTtsLangKey,   &lang) == ESP_OK) _tts_lang = lang;
+        uint8_t volume = prefs::kDefaultTtsVolumePercent;
+        if (nvs_get_u8(h, prefs::kTtsVolumePercentKey, &volume) == ESP_OK) {
+            volume = prefs::clampTtsVolumePercent(volume);
+            _tts_volume_percent = static_cast<uint8_t>(
+                ((volume + prefs::kTtsVolumePercentStep / 2) /
+                 prefs::kTtsVolumePercentStep) *
+                prefs::kTtsVolumePercentStep);
+            _tts_volume_percent =
+                prefs::clampTtsVolumePercent(_tts_volume_percent);
+        }
         nvs_close(h);
     }
 
@@ -81,8 +89,47 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
     if (_vad) lv_obj_add_state(_switch_vad->get(), LV_STATE_CHECKED);
     _switch_vad->onValueChanged().connect([this](bool v) { _vad = v; });
 
+    // ---------- Local TTS volume ----------
+    _panel_tts_volume = make_row(_panel.get(), 124, 76);
+
+    _label_tts_volume = std::make_unique<Label>(_panel_tts_volume->get());
+    _label_tts_volume->setText("Local TTS Volume");
+    _label_tts_volume->setTextFont(&lv_font_montserrat_14);
+    _label_tts_volume->setTextColor(lv_color_hex(0x26206A));
+    _label_tts_volume->align(LV_ALIGN_TOP_LEFT, 12, 8);
+
+    _label_tts_volume_value =
+        std::make_unique<Label>(_panel_tts_volume->get());
+    _label_tts_volume_value->setText(
+        std::to_string(_tts_volume_percent) + "%");
+    _label_tts_volume_value->setTextFont(&lv_font_montserrat_14);
+    _label_tts_volume_value->setTextColor(lv_color_hex(0x26206A));
+    _label_tts_volume_value->align(LV_ALIGN_TOP_RIGHT, -12, 8);
+
+    _slider_tts_volume =
+        std::make_unique<Slider>(_panel_tts_volume->get());
+    _slider_tts_volume->align(LV_ALIGN_BOTTOM_MID, 0, -10);
+    _slider_tts_volume->setRange(
+        0, prefs::kMaxTtsVolumePercent / prefs::kTtsVolumePercentStep);
+    _slider_tts_volume->setSize(254, 14);
+    _slider_tts_volume->setBgColor(
+        lv_color_hex(0x615B9E), LV_PART_KNOB);
+    _slider_tts_volume->setBgColor(
+        lv_color_hex(0x615B9E), LV_PART_INDICATOR);
+    _slider_tts_volume->setBgColor(
+        lv_color_hex(0xB8D3FD), LV_PART_MAIN);
+    _slider_tts_volume->setBgOpa(255);
+    _slider_tts_volume->setValue(
+        _tts_volume_percent / prefs::kTtsVolumePercentStep);
+    _slider_tts_volume->onValueChanged().connect([this](int32_t value) {
+        _tts_volume_percent = static_cast<uint8_t>(
+            value * prefs::kTtsVolumePercentStep);
+        _label_tts_volume_value->setText(
+            std::to_string(_tts_volume_percent) + "%");
+    });
+
     // ---------- TTS Language ----------
-    _panel_lang = make_row(_panel.get(), 124, 52);
+    _panel_lang = make_row(_panel.get(), 208, 52);
 
     auto make_lang_btn = [&](const char* label, int xOffset) {
         auto btn = std::make_unique<Button>(_panel_lang->get());
@@ -109,7 +156,7 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
     // ---------- Confirm button ----------
     _btn_confirm = std::make_unique<Button>(_panel->get());
     apply_button_common_style(*_btn_confirm);
-    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 185);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 269);
     _btn_confirm->setSize(290, 44);
     _btn_confirm->label().setText("Confirm");
     _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
@@ -123,16 +170,19 @@ void ModuleLLMSettingsWorker::update()
     _confirm_flag = false;
 
     nvs_handle_t h;
-    if (nvs_open(kNvsNs, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, kThinkingKey,   _thinking  ? 1 : 0);
-        nvs_set_u8(h, kVadEnabledKey, _vad       ? 1 : 0);
-        nvs_set_u8(h, kTtsLangKey,    _tts_lang);
+    if (nvs_open(prefs::kNvsNamespace, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, prefs::kThinkingKey,   _thinking  ? 1 : 0);
+        nvs_set_u8(h, prefs::kVadEnabledKey, _vad       ? 1 : 0);
+        nvs_set_u8(h, prefs::kTtsLangKey,    _tts_lang);
+        nvs_set_u8(
+            h, prefs::kTtsVolumePercentKey, _tts_volume_percent);
         nvs_commit(h);
         nvs_close(h);
     }
 
-    mclog::info("ModLLMSettings: thinking={} vad={} tts_lang={}",
-                _thinking, _vad, (int)_tts_lang);
+    mclog::info(
+        "ModLLMSettings: thinking={} vad={} tts_lang={} tts_volume={}%",
+        _thinking, _vad, (int)_tts_lang, (int)_tts_volume_percent);
     _is_done = true;
 }
 

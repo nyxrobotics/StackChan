@@ -9,6 +9,8 @@ DICT_PATH="${STACKCHAN_OPENJTALK_DIC:-}"
 SPEED="${STACKCHAN_OPENJTALK_SPEED:-1.05}"
 PITCH_SHIFT="${STACKCHAN_OPENJTALK_PITCH_SHIFT:-0}"
 ALPHA="${STACKCHAN_OPENJTALK_ALPHA:-0.55}"
+GAIN_DB="${STACKCHAN_OPENJTALK_GAIN_DB:-0}"
+MUTE="${STACKCHAN_OPENJTALK_MUTE:-0}"
 
 usage() {
     echo "Usage: $0 --check | --text TEXT"
@@ -88,6 +90,13 @@ speak_text() {
 
     resolve_paths
     stop_previous
+
+    if [ "$MUTE" = "1" ]; then
+        echo "STACKCHAN_OPENJTALK_BEGIN muted=1"
+        echo "STACKCHAN_OPENJTALK_DONE"
+        return 0
+    fi
+
     mkdir -p "$TMP_ROOT"
 
     local stamp txt wav
@@ -105,6 +114,7 @@ speak_text() {
         -r "$SPEED" \
         -fm "$PITCH_SHIFT" \
         -a "$ALPHA" \
+        -g "$GAIN_DB" \
         "$txt"
 
     if ! aplay -q -D "$AUDIO_DEVICE" "$wav"; then
@@ -119,7 +129,7 @@ main() {
     case "${1:-}" in
         --check)
             resolve_paths
-            echo "STACKCHAN_OPENJTALK_READY dict=${DICT_PATH} voice=${VOICE_PATH} audio=${AUDIO_DEVICE}"
+            echo "STACKCHAN_OPENJTALK_READY dict=${DICT_PATH} voice=${VOICE_PATH} audio=${AUDIO_DEVICE} features=gain_db,mute"
             ;;
         --text)
             shift

@@ -497,6 +497,12 @@ private:
     std::unique_ptr<uitk::lvgl_cpp::Label>     _label_vad;
     std::unique_ptr<uitk::lvgl_cpp::Switch>    _switch_vad;
 
+    // Local TTS volume
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_tts_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_tts_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_tts_volume_value;
+    std::unique_ptr<uitk::lvgl_cpp::Slider>    _slider_tts_volume;
+
     // TTS Language selection
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel_lang;
     std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_ja;
@@ -508,6 +514,7 @@ private:
     bool    _thinking     = false;
     bool    _vad          = true;
     uint8_t _tts_lang     = 0;  // 0=ja 1=zh 2=en
+    uint8_t _tts_volume_percent = 100;
     bool    _confirm_flag = false;
 };
 
