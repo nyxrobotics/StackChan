@@ -279,7 +279,9 @@ func GetDevices(
 
 	g.Log().Info(ctx, "Get device list success, list length:", len(resp.Data.List), " total count:", resp.Pagination.Total)
 
-	g.Log().Info(ctx, "Get device list success, first device:", resp.Data.List[0])
+	if len(resp.Data.List) > 0 {
+		g.Log().Info(ctx, "Get device list success, first device:", resp.Data.List[0])
+	}
 
 	return &resp.Data.List, nil
 }
