@@ -62,7 +62,7 @@ void DefaultMouth::setRotation(int rotation)
     Element::setRotation(rotation);
 
     _mouth->setTransformPivot(_mouth->getWidth() / 2, _mouth->getHeight() / 2);
-    _mouth->setRotation(rotation);
+    _mouth->setRotation(_rotation);
 }
 
 void DefaultMouth::setVisible(bool visible)

@@ -34,13 +34,16 @@ public:
     }
 
     /**
-     * @brief 0~3600
+     * @brief [0, 3600)
      *
      * @param rotation
      */
     virtual void setRotation(int rotation)
     {
-        _rotation = uitk::clamp(rotation, 0, 3600);
+        _rotation = rotation % 3600;
+        if (_rotation < 0) {
+            _rotation += 3600;
+        }
     }
     virtual int getRotation()
     {

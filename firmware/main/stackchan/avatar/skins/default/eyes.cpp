@@ -81,7 +81,7 @@ void DefaultEyes::setRotation(int rotation)
 {
     Element::setRotation(rotation);
 
-    _container->setRotation(rotation);
+    _container->setRotation(_rotation);
 }
 
 void DefaultEyes::setEmotion(const Emotion& emotion)
