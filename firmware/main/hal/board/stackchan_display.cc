@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "stackchan_display.h"
+#include <atomic>
 #include <esp_log.h>
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
@@ -177,7 +178,11 @@ StackChanAvatarDisplay::StackChanAvatarDisplay(esp_lcd_panel_io_handle_t panel_i
         .name                  = "preview_timer",
         .skip_unhandled_events = false,
     };
-    esp_timer_create(&preview_timer_args, &preview_timer_);
+    esp_err_t preview_timer_result = esp_timer_create(&preview_timer_args, &preview_timer_);
+    if (preview_timer_result != ESP_OK) {
+        preview_timer_ = nullptr;
+        ESP_LOGE(TAG, "Failed to create preview timer: %s", esp_err_to_name(preview_timer_result));
+    }
 
     // Create boot logo label if not warm boot
     if (GetHAL().getWarmRebootTarget() < 0) {
@@ -433,7 +438,9 @@ void StackChanAvatarDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image)
     }
 
     if (image == nullptr) {
-        esp_timer_stop(preview_timer_);
+        if (preview_timer_ != nullptr) {
+            esp_timer_stop(preview_timer_);
+        }
         lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
         preview_image_cached_.reset();
         return;
@@ -450,8 +457,13 @@ void StackChanAvatarDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image)
 
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(preview_image_);
-    esp_timer_stop(preview_timer_);
-    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, 6000 * 1000));
+    if (preview_timer_ != nullptr) {
+        esp_timer_stop(preview_timer_);
+        esp_err_t preview_timer_result = esp_timer_start_once(preview_timer_, 6000 * 1000);
+        if (preview_timer_result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start preview timer: %s", esp_err_to_name(preview_timer_result));
+        }
+    }
 }
 
 void StackChanAvatarDisplay::UpdateStatusBar(bool update_all)
@@ -477,15 +489,15 @@ void StackChanAvatarDisplay::SetTheme(Theme* theme)
 }
 
 #include <hal/board/hal_bridge.h>
-static bool _is_xiaozhi_ready = false;
-static bool _is_xiaozhi_idle  = false;
+static std::atomic_bool _is_xiaozhi_ready{false};
+static std::atomic_bool _is_xiaozhi_idle{false};
 bool hal_bridge::is_xiaozhi_ready()
 {
-    return _is_xiaozhi_ready;
+    return _is_xiaozhi_ready.load(std::memory_order_relaxed);
 }
 bool hal_bridge::is_xiaozhi_idle()
 {
-    return _is_xiaozhi_idle;
+    return _is_xiaozhi_idle.load(std::memory_order_relaxed);
 }
 
 void StackChanAvatarDisplay::SetStatus(const char* status)
@@ -518,7 +530,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
         GetHAL().refreshRgb();
 
     } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
-        _is_xiaozhi_ready = true;
+        _is_xiaozhi_ready.store(true, std::memory_order_relaxed);
 
         if (speaking_modifier_id_ >= 0) {
             ESP_LOGI(TAG, "Stop speaking motion: standby");
@@ -556,7 +568,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
             idle_expression_modifier_id_ = stackchan.addModifier(std::make_unique<IdleExpressionModifier>());
         }
 
-        _is_xiaozhi_idle = true;
+        _is_xiaozhi_idle.store(true, std::memory_order_relaxed);
     } else {
         // Stop idle motion
         ESP_LOGW(TAG, "Stop idle motion");
@@ -575,7 +587,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
         //     motion.moveYawWithSpeed(0, 350);
         // }
 
-        _is_xiaozhi_idle = false;
+        _is_xiaozhi_idle.store(false, std::memory_order_relaxed);
     }
 
     // Clear sleep state

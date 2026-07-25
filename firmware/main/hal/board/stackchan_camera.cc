@@ -357,19 +357,19 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
             }
             ESP_LOGI(TAG, "Camera init success, captured %d frames in %dms", capture_count,
                      (xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
-            self->streaming_on_ = true;
+            self->streaming_on_.store(true, std::memory_order_release);
             vTaskDelete(NULL);
         },
         "CameraInitTask", 4096, this, 5, nullptr);
 #else
     ESP_LOGI(TAG, "Camera init success");
-    streaming_on_ = true;
+    streaming_on_.store(true, std::memory_order_release);
 #endif  // CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
 }
 
 StackChanCamera::~StackChanCamera()
 {
-    if (streaming_on_ && video_fd_ >= 0) {
+    if (streaming_on_.load(std::memory_order_acquire) && video_fd_ >= 0) {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(video_fd_, VIDIOC_STREAMOFF, &type);
     }
@@ -398,7 +398,7 @@ bool StackChanCamera::Capture()
         encoder_thread_.join();
     }
 
-    if (!streaming_on_ || video_fd_ < 0) {
+    if (!streaming_on_.load(std::memory_order_acquire) || video_fd_ < 0) {
         return false;
     }
 
@@ -857,7 +857,7 @@ bool StackChanCamera::StreamCaptures()
         encoder_thread_.join();
     }
 
-    if (!streaming_on_ || video_fd_ < 0) {
+    if (!streaming_on_.load(std::memory_order_acquire) || video_fd_ < 0) {
         return false;
     }
 

@@ -3,6 +3,7 @@
 
 #ifndef CONFIG_IDF_TARGET_ESP32
 #include <lvgl.h>
+#include <atomic>
 #include <thread>
 #include <memory>
 #include <vector>
@@ -33,8 +34,8 @@ private:
     uint16_t sensor_width_  = 0;
     uint16_t sensor_height_ = 0;
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
-    int video_fd_      = -1;
-    bool streaming_on_ = false;
+    int video_fd_ = -1;
+    std::atomic_bool streaming_on_{false};
     struct MmapBuffer {
         void* start   = nullptr;
         size_t length = 0;

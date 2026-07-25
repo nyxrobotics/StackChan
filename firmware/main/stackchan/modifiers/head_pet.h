@@ -9,6 +9,7 @@
 #include "../utils/random.h"
 #include <smooth_ui_toolkit.hpp>
 #include <hal/hal.h>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -25,9 +26,9 @@ public:
         // 绑定信号
         _signal_connection = GetHAL().onHeadPetGesture.connect([this](HeadPetGesture gesture) {
             if (gesture == HeadPetGesture::SwipeForward || gesture == HeadPetGesture::SwipeBackward) {
-                _event_swipe = true;
+                _event_swipe.store(true, std::memory_order_relaxed);
             } else if (gesture == HeadPetGesture::Release) {
-                _event_release = true;
+                _event_release.store(true, std::memory_order_relaxed);
             }
         });
     }
@@ -42,16 +43,14 @@ public:
         uint32_t now = GetHAL().millis();
 
         // 处理“被抚摸中”事件
-        if (_event_swipe) {
-            _event_swipe = false;
+        if (_event_swipe.exchange(false, std::memory_order_relaxed)) {
             handle_swipe(stackchan);
             // 只要在摸，就推迟恢复时间
             _is_waiting_restore = false;
         }
 
         // 处理“手松开”事件
-        if (_event_release) {
-            _event_release = false;
+        if (_event_release.exchange(false, std::memory_order_relaxed)) {
             if (_in_happy_state) {
                 _is_waiting_restore = true;
                 _restore_tick       = now + _restore_delay_ms;
@@ -142,8 +141,8 @@ private:
 
     // 信号相关
     int _signal_connection;
-    volatile bool _event_swipe   = false;
-    volatile bool _event_release = false;
+    std::atomic_bool _event_swipe{false};
+    std::atomic_bool _event_release{false};
 
     // 状态机相关
     bool _in_happy_state     = false;

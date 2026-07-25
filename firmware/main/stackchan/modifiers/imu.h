@@ -6,6 +6,7 @@
 #pragma once
 #include "../modifiable.h"
 #include <hal/hal.h>
+#include <atomic>
 #include <cstdint>
 
 namespace stackchan {
@@ -20,7 +21,7 @@ public:
     {
         _signal_connection = GetHAL().onImuMotionEvent.connect([this](ImuMotionEvent event) {
             if (event == ImuMotionEvent::Shake) {
-                _event_shake = true;
+                _event_shake.store(true, std::memory_order_relaxed);
             }
         });
     }
@@ -35,8 +36,7 @@ public:
         uint32_t now = GetHAL().millis();
 
         // 收到晃动事件
-        if (_event_shake) {
-            _event_shake = false;
+        if (_event_shake.exchange(false, std::memory_order_relaxed)) {
             handle_shake_start(stackchan, now);
         }
 
@@ -121,7 +121,7 @@ private:
 
     // 信号相关
     int _signal_connection;
-    volatile bool _event_shake = false;
+    std::atomic_bool _event_shake{false};
 
     // 状态控制
     bool _is_reacting          = false;
