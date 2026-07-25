@@ -43,12 +43,6 @@ android {
             keyAlias = "key0"
             keyPassword = "123456"
         }
-        getByName("debug") {
-            storeFile = file("debug.jks")
-            storePassword = "123456"
-            keyAlias = "key0"
-            keyPassword = "123456"
-        }
     }
 
     defaultConfig {
@@ -72,7 +66,6 @@ android {
         debug {
             isMinifyEnabled = false
             isShrinkResources = false
-            signingConfig = signingConfigs.getByName("debug")
         }
     }
 }

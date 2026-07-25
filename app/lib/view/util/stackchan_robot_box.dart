@@ -4,6 +4,7 @@ SPDX-License-Identifier: MIT
 */
 
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/cupertino.dart';
@@ -418,7 +419,7 @@ class _StackchanRobotThreeState extends State<StackchanRobotJs> {
     if (byteData != null) {
       //convertas three_js Uint8Array
       final uint8List = byteData.buffer.asUint8List();
-      final nativeArray = three.Uint8Array.fromList(uint8List);
+      final nativeArray = Uint8List.fromList(uint8List);
 
       //updatetexture
       expressionTexture!.image = three.ImageElement(
@@ -451,7 +452,6 @@ class _StackchanRobotThreeState extends State<StackchanRobotJs> {
       return three.Color(1, 1, 1);
     }
     final intValue = int.parse(hex, radix: 16);
-    final int a = (intValue >> 24) & 0xFF;
     final int r = (intValue >> 16) & 0xFF;
     final int g = (intValue >> 8) & 0xFF;
     final int b = intValue & 0xFF;

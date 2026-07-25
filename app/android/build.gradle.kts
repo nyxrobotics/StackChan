@@ -4,6 +4,8 @@ SPDX-License-Identifier: MIT
 */
 
 import com.android.build.gradle.BaseExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
 allprojects {
     repositories {
@@ -21,6 +23,20 @@ rootProject.layout.buildDirectory.value(newBuildDir)
 subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
+
+    afterEvaluate {
+        extensions.findByType(BaseExtension::class.java)?.apply {
+            compileSdkVersion(36)
+            compileOptions.apply {
+                sourceCompatibility = JavaVersion.VERSION_21
+                targetCompatibility = JavaVersion.VERSION_21
+            }
+        }
+
+        tasks.withType(KotlinJvmCompile::class.java).configureEach {
+            compilerOptions.jvmTarget.set(JvmTarget.JVM_21)
+        }
+    }
 }
 
 subprojects {

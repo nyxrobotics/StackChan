@@ -4,6 +4,7 @@ SPDX-License-Identifier: MIT
 */
 
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/cupertino.dart';
@@ -272,7 +273,7 @@ class _StackChanRotaryRobotJsState extends State<StackChanRotaryRobotJs> {
     if (byteData != null) {
       //convertas three_js Uint8Array
       final uint8List = byteData.buffer.asUint8List();
-      final nativeArray = three.Uint8Array.fromList(uint8List);
+      final nativeArray = Uint8List.fromList(uint8List);
 
       //updatetexture
       expressionTexture.image = three.ImageElement(
