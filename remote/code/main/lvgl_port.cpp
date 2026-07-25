@@ -10,7 +10,7 @@
 extern "C" {
 
 #define LV_BUFFER_LINE 40
-static SemaphoreHandle_t xGuiSemaphore;
+static SemaphoreHandle_t xGuiSemaphore = NULL;
 static void lvgl_tick_timer(void *arg)
 {
     (void)arg;
@@ -21,7 +21,7 @@ static void lvgl_rtos_task(void *pvParameter)
 {
     (void)pvParameter;
     while (1) {
-        if (pdTRUE == xSemaphoreTake(xGuiSemaphore, portMAX_DELAY)) {
+        if (xGuiSemaphore != NULL && pdTRUE == xSemaphoreTake(xGuiSemaphore, portMAX_DELAY)) {
             lv_timer_handler();
             xSemaphoreGive(xGuiSemaphore);
         }
@@ -32,7 +32,6 @@ static void lvgl_rtos_task(void *pvParameter)
 static lv_disp_draw_buf_t draw_buf;
 static void lvgl_flush_cb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p)
 {
-    M5GFX &gfx      = *(M5GFX *)disp->user_data;
     int w           = (area->x2 - area->x1 + 1);
     int h           = (area->y2 - area->y1 + 1);
     uint32_t pixels = w * h;
@@ -69,10 +68,19 @@ static void lvgl_flush_cb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t
 // BtnA / BtnB
 static void lvgl_read_cb(lv_indev_drv_t *indev_driver, lv_indev_data_t *data)
 {
+    (void)indev_driver;
+    data->state  = LV_INDEV_STATE_REL;
+    data->btn_id = 0;
 }
 
-void lvgl_port_init(void)
+bool lvgl_port_init(void)
 {
+    xGuiSemaphore = xSemaphoreCreateMutex();
+    if (xGuiSemaphore == NULL) {
+        ESP_LOGE("LVGL", "Failed to create GUI mutex!");
+        return false;
+    }
+
     lv_init();
 
     size_t buffer_size      = M5.Display.width() * LV_BUFFER_LINE * sizeof(lv_color_t);
@@ -80,7 +88,9 @@ void lvgl_port_init(void)
 
     if (buf1 == NULL) {
         ESP_LOGE("LVGL", "Failed to allocate display buffer!");
-        return;
+        vSemaphoreDelete(xGuiSemaphore);
+        xGuiSemaphore = NULL;
+        return false;
     }
 
     lv_disp_draw_buf_init(&draw_buf, buf1, NULL, M5.Display.width() * LV_BUFFER_LINE);
@@ -96,27 +106,33 @@ void lvgl_port_init(void)
 
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
-    indev_drv.type    = LV_INDEV_TYPE_BUTTON;
-    indev_drv.read_cb = lvgl_read_cb;
-    // indev_drv.user_data = &gfx;
+    indev_drv.type      = LV_INDEV_TYPE_BUTTON;
+    indev_drv.read_cb   = lvgl_read_cb;
     indev_drv.user_data = &M5.Display;
-    lv_indev_t *indev   = lv_indev_drv_register(&indev_drv);
+    lv_indev_drv_register(&indev_drv);
 
-    xGuiSemaphore                                     = xSemaphoreCreateMutex();
-    const esp_timer_create_args_t periodic_timer_args = {.callback = &lvgl_tick_timer, .name = "lvgl_tick_timer"};
+    esp_timer_create_args_t periodic_timer_args = {};
+    periodic_timer_args.callback                = &lvgl_tick_timer;
+    periodic_timer_args.name                    = "lvgl_tick_timer";
     esp_timer_handle_t periodic_timer;
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 10 * 1000));
     xTaskCreate(lvgl_rtos_task, "lvgl_rtos_task", 4096, NULL, 1, NULL);
+    return true;
 }
 
 bool lvgl_port_lock(void)
 {
+    if (xGuiSemaphore == NULL) {
+        return false;
+    }
     return xSemaphoreTake(xGuiSemaphore, portMAX_DELAY) == pdTRUE ? true : false;
 }
 
 void lvgl_port_unlock(void)
 {
-    xSemaphoreGive(xGuiSemaphore);
+    if (xGuiSemaphore != NULL) {
+        xSemaphoreGive(xGuiSemaphore);
+    }
 }
 }

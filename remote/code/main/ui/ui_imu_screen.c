@@ -45,6 +45,28 @@ static int edges[12][2] = {
 
 IMU_Angle_t g_imu_angle = {0.0f, 0.0f};
 
+static bool imu_screen_is_ready_locked(void)
+{
+    if (imu_screen == NULL || cube_container == NULL || imu_battery_label == NULL || imu_channel_info_label == NULL ||
+        imu_id_info_label == NULL || !lv_obj_is_valid(imu_screen) || !lv_obj_is_valid(cube_container) ||
+        !lv_obj_is_valid(imu_battery_label) || !lv_obj_is_valid(imu_channel_info_label) ||
+        !lv_obj_is_valid(imu_id_info_label)) {
+        return false;
+    }
+
+    for (int i = 0; i < 12; i++) {
+        if (edge_lines[i] == NULL || !lv_obj_is_valid(edge_lines[i])) {
+            return false;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (cross_lines[i] == NULL || !lv_obj_is_valid(cross_lines[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * @brief Creates the IMU screen with all UI elements including a 3D cube visualization
  *
@@ -61,12 +83,18 @@ IMU_Angle_t g_imu_angle = {0.0f, 0.0f};
  */
 void create_imu_screen()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
     if (imu_screen == NULL) {
         imu_screen = lv_obj_create(NULL);
     }
+    if (imu_screen == NULL) {
+        ESP_LOGE("UI", "Failed to create IMU screen!");
+        lvgl_port_unlock();
+        return;
+    }
+
     lv_obj_clear_flag(imu_screen, LV_OBJ_FLAG_SCROLLABLE);
 
     // Create title
@@ -91,9 +119,8 @@ void create_imu_screen()
         lv_obj_set_style_line_color(edge_lines[i], lv_color_black(), 0);
         lv_obj_add_flag(edge_lines[i], LV_OBJ_FLAG_FLOATING);
 
-        // Add default coordinate points to avoid empty line segments
-        lv_point_t default_points[2] = {{0, 0}, {0, 0}};
-        lv_line_set_points(edge_lines[i], default_points, 2);
+        // edge_points has static storage and remains valid for the lifetime of the line.
+        lv_line_set_points(edge_lines[i], edge_points[i], 2);
     }
 
     // Create 2 lines identifying the diagonals
@@ -103,9 +130,8 @@ void create_imu_screen()
         lv_obj_set_style_line_color(cross_lines[i], lv_color_make(0, 255, 255), 0);
         lv_obj_add_flag(cross_lines[i], LV_OBJ_FLAG_FLOATING);
 
-        // Add default coordinate
-        lv_point_t default_cross_points[2] = {{0, 0}, {0, 0}};
-        lv_line_set_points(cross_lines[i], default_cross_points, 2);
+        // cross_points has static storage and remains valid for the lifetime of the line.
+        lv_line_set_points(cross_lines[i], cross_points[i], 2);
     }
 
     // Create other UI elements
@@ -177,7 +203,6 @@ void update_imu_cube(float ax, float ay, float az)
 
         // Roll
         float x2 = x1 * cos(roll) + z1 * sin(roll);
-        float z2 = -x1 * sin(roll) + z1 * cos(roll);
         float y2 = y1;
 
         // Orthographic projection
@@ -229,8 +254,13 @@ IMU_Angle_t update_imu_screen(float ax, float ay, float az, uint8_t bat, uint8_t
     static uint8_t last_id      = 0xFF;
     static uint8_t last_channel = 0xFF;
 
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return g_imu_angle;
+    }
+
+    if (!imu_screen_is_ready_locked()) {
+        lvgl_port_unlock();
+        return g_imu_angle;
     }
 
     update_imu_cube(ax, ay, az);
@@ -269,17 +299,23 @@ IMU_Angle_t update_imu_screen(float ax, float ay, float az, uint8_t bat, uint8_t
  */
 void ui_imu_screen_destory()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
-    if (imu_screen != NULL) {
+    if (imu_screen != NULL && lv_obj_is_valid(imu_screen)) {
         lv_obj_del(imu_screen);
-        imu_screen = NULL;
     }
-    lvgl_port_unlock();
-
+    imu_screen             = NULL;
+    cube_container         = NULL;
     imu_battery_label      = NULL;
     imu_channel_info_label = NULL;
     imu_id_info_label      = NULL;
     imu_data_label         = NULL;
+    for (int i = 0; i < 12; i++) {
+        edge_lines[i] = NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        cross_lines[i] = NULL;
+    }
+    lvgl_port_unlock();
 }

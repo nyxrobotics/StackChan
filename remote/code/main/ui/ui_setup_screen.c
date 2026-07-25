@@ -29,8 +29,8 @@ lv_obj_t *id_dropdown      = NULL;
  */
 void create_setup_screen()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
 
     lv_disp_t *disp = lv_disp_get_default();
@@ -42,6 +42,11 @@ void create_setup_screen()
 
     if (setup_screen == NULL) {
         setup_screen = lv_obj_create(NULL);
+    }
+    if (setup_screen == NULL) {
+        ESP_LOGE("UI", "Failed to create setup screen!");
+        lvgl_port_unlock();
+        return;
     }
 
     lv_obj_clear_flag(setup_screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -112,9 +117,18 @@ void create_setup_screen()
  */
 void update_setup_screen(joystick_data_t *data)
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (data == NULL || !lvgl_port_lock()) {
+        return;
     }
+
+    if (setup_screen == NULL || channel_dropdown == NULL || id_dropdown == NULL || !lv_obj_is_valid(setup_screen) ||
+        !lv_obj_is_valid(channel_dropdown) || !lv_obj_is_valid(id_dropdown)) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    bool should_debounce = false;
+
     // Update setup screen
     if (data->select_mode == CHANNEL_SELECT) {
         lv_obj_set_style_bg_color(channel_dropdown, lv_color_make(255, 255, 0), LV_PART_MAIN);  // Yellow
@@ -139,7 +153,7 @@ void update_setup_screen(joystick_data_t *data)
                 data->id = selected + 1;
             }
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);  // Add delay to prevent rapid changes
+        should_debounce = true;
     } else if (data->joyY < Y_CENTER - DEAD_ZONE) {
         // Move down - Decrease Channel
         if (data->select_mode == CHANNEL_SELECT) {
@@ -155,9 +169,13 @@ void update_setup_screen(joystick_data_t *data)
                 data->id = selected - 1;
             }
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);  // Add delay to prevent rapid changes
+        should_debounce = true;
     }
     lvgl_port_unlock();
+
+    if (should_debounce) {
+        vTaskDelay(50 / portTICK_PERIOD_MS);  // Add delay to prevent rapid changes
+    }
 }
 
 /**
@@ -169,17 +187,16 @@ void update_setup_screen(joystick_data_t *data)
  */
 void ui_setup_screen_destory()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
-    if (setup_screen != NULL) {
+    if (setup_screen != NULL && lv_obj_is_valid(setup_screen)) {
         lv_obj_del(setup_screen);
-        setup_screen = NULL;
     }
-    lvgl_port_unlock();
-
+    setup_screen     = NULL;
     channel_label    = NULL;
     id_label         = NULL;
     channel_dropdown = NULL;
     id_dropdown      = NULL;
+    lvgl_port_unlock();
 }

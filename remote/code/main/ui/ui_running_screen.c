@@ -30,8 +30,8 @@ lv_obj_t* id_info_label      = NULL;
  */
 void create_running_screen()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
     lv_disp_t* disp = lv_disp_get_default();
     if (disp == NULL) {
@@ -46,6 +46,7 @@ void create_running_screen()
 
     if (running_screen == NULL) {
         ESP_LOGE("UI", "Failed to create running screen!");
+        lvgl_port_unlock();
         return;
     }
 
@@ -150,9 +151,18 @@ void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t 
     x_pos = fmax(5, fmin(x_pos, 110));
     y_pos = fmax(5, fmin(y_pos, 110));
 
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
+
+    if (running_screen == NULL || joystick_area == NULL || joystick_dot == NULL || battery_label == NULL ||
+        channel_info_label == NULL || id_info_label == NULL || !lv_obj_is_valid(running_screen) ||
+        !lv_obj_is_valid(joystick_area) || !lv_obj_is_valid(joystick_dot) || !lv_obj_is_valid(battery_label) ||
+        !lv_obj_is_valid(channel_info_label) || !lv_obj_is_valid(id_info_label)) {
+        lvgl_port_unlock();
+        return;
+    }
+
     // Update joystick dot position (relative to joystick_area center)
     lv_obj_align(joystick_dot, LV_ALIGN_TOP_LEFT, x_pos - 5, y_pos - 5);
 
@@ -177,17 +187,17 @@ void update_running_screen(int16_t joyX, int16_t joyY, uint8_t channel, uint8_t 
  */
 void ui_running_screen_destory()
 {
-    while (!lvgl_port_lock()) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (!lvgl_port_lock()) {
+        return;
     }
-    if (running_screen != NULL) {
+    if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
         lv_obj_del(running_screen);
-        running_screen = NULL;
     }
-    lvgl_port_unlock();
+    running_screen     = NULL;
     joystick_dot       = NULL;
     joystick_area      = NULL;
     battery_label      = NULL;
     channel_info_label = NULL;
     id_info_label      = NULL;
+    lvgl_port_unlock();
 }

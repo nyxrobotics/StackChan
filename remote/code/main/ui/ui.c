@@ -4,6 +4,26 @@
  * SPDX-License-Identifier: MIT
  */
 #include "ui.h"
+#include "../lvgl_port.h"
+
+static bool load_screen_safely(lv_obj_t *screen, bool animated)
+{
+    if (!lvgl_port_lock()) {
+        return false;
+    }
+
+    bool is_valid = screen != NULL && lv_obj_is_valid(screen);
+    if (is_valid) {
+        if (animated) {
+            lv_scr_load_anim(screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+        } else {
+            lv_disp_load_scr(screen);
+        }
+    }
+
+    lvgl_port_unlock();
+    return is_valid;
+}
 
 /**
  * @brief Switches between different UI screens based on the provided screen ID
@@ -12,9 +32,8 @@
  * by checking if the requested screen exists, creating it if necessary, validating
  * the screen object, and then loading it with a slide-left animation effect.
  *
- * The function implements error handling by destroying and recreating invalid screens
- * using goto statements for retry logic. Each screen type has its own creation
- * and validation flow.
+ * The function implements bounded error recovery by destroying an invalid screen
+ * and retrying its creation once.
  *
  * @param screen_id An integer representing the target screen mode:
  *                  - MODE_SETUP: Configuration/setup screen
@@ -23,63 +42,60 @@
  *                  - Any other value: Logs an error message
  *
  * @note The function uses LVGL's animation API to provide smooth screen transitions
- *       with a 200ms left slide animation. Thread safety should be considered when
- *       calling this function from different tasks.
- *
- * @warning This function relies on external screen objects and creation/destruction
- *          functions that must be implemented in other UI modules. The use of goto
- *          statements may affect code maintainability.
+ *       with a 200ms left slide animation. All LVGL validation and loading is
+ *       serialized by the LVGL port mutex.
  */
-void switch_screen(int screen_id)
+bool switch_screen(int screen_id)
 {
     if (screen_id == MODE_SETUP) {
-    setup_create:
-        if (setup_screen == NULL) {
-            create_setup_screen();
-            ESP_LOGI("UI", "Setup screen created");
-        }
-        // Load only if object is valid
-        if (setup_screen != NULL && lv_obj_is_valid(setup_screen)) {
-            ESP_LOGI("UI", "Setup screen loaded");
-            lv_scr_load_anim(setup_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-        } else {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (setup_screen == NULL) {
+                create_setup_screen();
+                ESP_LOGI("UI", "Setup screen created");
+            }
+            // Validate and load while holding the same mutex used by LVGL updates.
+            if (load_screen_safely(setup_screen, true)) {
+                ESP_LOGI("UI", "Setup screen loaded");
+                return true;
+            }
             ESP_LOGE("UI", "Setup screen is NULL or invalid!");
             ui_setup_screen_destory();
-            goto setup_create;
         }
+        ESP_LOGE("UI", "Failed to recreate setup screen");
     } else if (screen_id == MODE_RUNNING) {
-    running_create:
-        if (running_screen == NULL) {
-            create_running_screen();
-            ESP_LOGI("UI", "Running screen created");
-        }
-        // Load only if object is valid
-        if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
-            ESP_LOGI("UI", "Running screen loaded");
-            lv_scr_load_anim(running_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-        } else {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (running_screen == NULL) {
+                create_running_screen();
+                ESP_LOGI("UI", "Running screen created");
+            }
+            // Validate and load while holding the same mutex used by LVGL updates.
+            if (load_screen_safely(running_screen, true)) {
+                ESP_LOGI("UI", "Running screen loaded");
+                return true;
+            }
             ESP_LOGE("UI", "Running screen is NULL or invalid!");
             ui_running_screen_destory();
-            goto running_create;
         }
+        ESP_LOGE("UI", "Failed to recreate running screen");
     } else if (screen_id == MODE_IMU) {
-    imu_create:
-        if (imu_screen == NULL) {
-            create_imu_screen();
-            ESP_LOGI("UI", "IMU screen created");
-        }
-        // Load only if object is valid
-        if (imu_screen != NULL && lv_obj_is_valid(imu_screen)) {
-            ESP_LOGI("UI", "IMU screen loaded");
-            lv_scr_load_anim(imu_screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-        } else {
-            ESP_LOGE("UI", "Running screen is NULL or invalid!");
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (imu_screen == NULL) {
+                create_imu_screen();
+                ESP_LOGI("UI", "IMU screen created");
+            }
+            // Validate and load while holding the same mutex used by LVGL updates.
+            if (load_screen_safely(imu_screen, true)) {
+                ESP_LOGI("UI", "IMU screen loaded");
+                return true;
+            }
+            ESP_LOGE("UI", "IMU screen is NULL or invalid!");
             ui_imu_screen_destory();
-            goto imu_create;
         }
+        ESP_LOGE("UI", "Failed to recreate IMU screen");
     } else {
         ESP_LOGE("UI", "Invalid screen mode!");
     }
+    return false;
 }
 
 /**
@@ -91,8 +107,12 @@ void switch_screen(int screen_id)
  *      3. Sets up the initial UI state for user interaction
  * @warning This function should only be called once during application startup
  */
-void ui_init()
+bool ui_init()
 {
     create_setup_screen();
-    lv_disp_load_scr(setup_screen);
+    if (!load_screen_safely(setup_screen, false)) {
+        ESP_LOGE("UI", "Failed to load setup screen!");
+        return false;
+    }
+    return true;
 }

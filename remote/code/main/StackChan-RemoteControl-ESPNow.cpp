@@ -38,21 +38,17 @@ void handle_button_press()
     // check if BtnA is pressed
     if (M5.BtnA.wasPressed()) {
         // use BtnA to switch mode
-        screen_mode = (screen_mode + 1) % 3;
-
-        if (screen_mode == MODE_SETUP) {
-            // in setup mode, press A to enter running mode
-            joystick_data.screen_mode = MODE_SETUP;
-            switch_screen(joystick_data.screen_mode);
-        } else if (screen_mode == MODE_RUNNING) {
-            // in running mode, press A to enter IMU mode
+        uint8_t next_screen_mode = (screen_mode + 1) % 3;
+        if (next_screen_mode == MODE_RUNNING) {
             wifi_espnow_reinit(joystick_data.channel);
-            joystick_data.screen_mode = MODE_RUNNING;
-            switch_screen(joystick_data.screen_mode);
-        } else if (screen_mode == MODE_IMU) {
-            // in IMU mode, press A to return to setup mode
-            joystick_data.screen_mode = MODE_IMU;
-            switch_screen(joystick_data.screen_mode);
+        }
+
+        // Publish the mode only after all target-screen objects are ready and loaded.
+        if (switch_screen(next_screen_mode)) {
+            screen_mode               = next_screen_mode;
+            joystick_data.screen_mode = next_screen_mode;
+        } else {
+            ESP_LOGE("APP", "Failed to switch screen mode to %u", next_screen_mode);
         }
     }
     if (M5.BtnB.wasPressed()) {
@@ -84,8 +80,14 @@ void app_main(void)
 
     joystick_data = joystick_init();  // init joystick
 
-    lvgl_port_init();  // init LVGL
-    ui_init();         // init UI
+    if (!lvgl_port_init()) {  // init LVGL
+        ESP_LOGE("APP", "LVGL initialization failed");
+        return;
+    }
+    if (!ui_init()) {  // init UI
+        ESP_LOGE("APP", "UI initialization failed");
+        return;
+    }
 
     // init WiFi and ESP-NOW
     wifi_espnow_init(joystick_data.channel);

@@ -14,7 +14,7 @@
 #include "ui_running_screen.h"
 #include "ui_imu_screen.h"
 
-void ui_init();
-void switch_screen(int screen_id);
+bool ui_init();
+bool switch_screen(int screen_id);
 
 #endif

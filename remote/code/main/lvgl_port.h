@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-void lvgl_port_init(void);
+bool lvgl_port_init(void);
 bool lvgl_port_lock(void);
 void lvgl_port_unlock(void);
 

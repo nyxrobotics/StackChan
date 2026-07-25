@@ -31,7 +31,7 @@ extern lv_obj_t *imu_canvas;
 extern lv_obj_t *imu_data_label;
 
 void create_imu_screen(void);
-IMU_Angle_t update_imu_screen(float ax, float ay, float az, uint8_t channel, uint8_t id, uint8_t bat);
+IMU_Angle_t update_imu_screen(float ax, float ay, float az, uint8_t bat, uint8_t id, uint8_t channel);
 void update_imu_cube(float ax, float ay, float az);
 void ui_imu_screen_destory(void);
 
