@@ -13,6 +13,13 @@ import (
 )
 
 func (c *ControllerV2) Delete(ctx context.Context, req *v2.DeleteReq) (res *v2.DeleteRes, err error) {
-	_, err = dao.DeviceDance.Ctx(ctx).Where("id=", req.Id).Delete()
+	mac, err := requireOwnedDance(ctx, req.Id)
+	if err != nil {
+		return nil, err
+	}
+	_, err = dao.DeviceDance.Ctx(ctx).
+		Where("id = ?", req.Id).
+		Where("mac = ?", mac).
+		Delete()
 	return
 }

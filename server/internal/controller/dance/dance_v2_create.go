@@ -20,6 +20,9 @@ import (
 
 func (c *ControllerV2) Create(ctx context.Context, req *v2.CreateReq) (res *v2.CreateRes, err error) {
 	mac := req.Mac
+	if err = requireOwnedDevice(ctx, mac); err != nil {
+		return nil, err
+	}
 	if req.DanceName == "" {
 		return nil, gerror.NewCode(gcode.CodeInvalidParameter, "Dance name cannot be empty")
 	}
@@ -27,16 +30,6 @@ func (c *ControllerV2) Create(ctx context.Context, req *v2.CreateReq) (res *v2.C
 		return nil, gerror.NewCode(gcode.CodeInvalidParameter, "Dance data cannot be empty or null")
 	}
 	err = g.DB().Transaction(ctx, func(ctx context.Context, tx gdb.TX) error {
-		device, err := dao.Device.Ctx(ctx).TX(tx).Where("mac=?", mac).One()
-		if err != nil && !gerror.HasCode(err, gcode.CodeNotFound) {
-			return gerror.NewCode(gcode.CodeInternalError, "Failed to query device: %v", err.Error())
-		}
-		if device.IsEmpty() {
-			_, err = dao.Device.Ctx(ctx).TX(tx).Data(dao.Device.Columns().Mac, mac).Insert()
-			if err != nil {
-				return gerror.NewCode(gcode.CodeInternalError, "Failed to create device: %v", err.Error())
-			}
-		}
 		exist, err := dao.DeviceDance.Ctx(ctx).TX(tx).
 			Where("mac=?", mac).
 			Where("dance_name=?", req.DanceName).

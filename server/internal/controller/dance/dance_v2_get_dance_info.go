@@ -20,8 +20,15 @@ func (c *ControllerV2) GetDanceInfo(ctx context.Context, req *v2.GetDanceInfoReq
 	if req.Id == 0 {
 		return nil, gerror.NewCode(gcode.CodeInvalidParameter, "The dance ID cannot be left blank.")
 	}
+	mac, err := requireOwnedDance(ctx, req.Id)
+	if err != nil {
+		return nil, err
+	}
 	var dance model.Dance
-	err = dao.DeviceDance.Ctx(ctx).Where("id=?", req.Id).Scan(&dance)
+	err = dao.DeviceDance.Ctx(ctx).
+		Where("id = ?", req.Id).
+		Where("mac = ?", mac).
+		Scan(&dance)
 	if err != nil {
 		return nil, gerror.NewCode(gcode.CodeInternalError)
 	}

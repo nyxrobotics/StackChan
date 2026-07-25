@@ -12,6 +12,9 @@ import (
 )
 
 func (c *ControllerV2) GetList(ctx context.Context, req *v2.GetListReq) (res *v2.GetListRes, err error) {
+	if err = requireOwnedDevice(ctx, req.Mac); err != nil {
+		return nil, err
+	}
 	danceList, err := service.GetOrCreateDanceList(ctx, req.Mac, "http://47.113.125.164:12800/file/music/stackchan_music.mp3")
 	if err != nil {
 		return nil, err

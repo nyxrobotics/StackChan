@@ -22,6 +22,9 @@ func (c *ControllerV1) Delete(ctx context.Context, req *v1.DeleteReq) (res *v1.D
 	if mac == "" {
 		return nil, gerror.NewCode(gcode.CodeInvalidParameter)
 	}
-	_, err = dao.DeviceDance.Ctx(ctx).Where("id=", req.Id).Delete()
+	_, err = dao.DeviceDance.Ctx(ctx).
+		Where("id = ?", req.Id).
+		Where("mac = ?", mac).
+		Delete()
 	return
 }

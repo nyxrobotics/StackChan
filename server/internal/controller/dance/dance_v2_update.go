@@ -21,6 +21,10 @@ func (c *ControllerV2) Update(ctx context.Context, req *v2.UpdateReq) (res *v2.U
 	if req.Id == 0 { // Adjust based on actual type of req.Id (int/string)
 		return nil, gerror.NewCode(gcode.CodeInvalidParameter, "Dance ID cannot be empty")
 	}
+	mac, err := requireOwnedDance(ctx, req.Id)
+	if err != nil {
+		return nil, err
+	}
 	updateData := do.DeviceDance{}
 	if req.MusicUrl != "" {
 		updateData.MusicUrl = req.MusicUrl
@@ -36,7 +40,11 @@ func (c *ControllerV2) Update(ctx context.Context, req *v2.UpdateReq) (res *v2.U
 		}
 		updateData.DanceData = danceJSON
 	}
-	_, err = dao.DeviceDance.Ctx(ctx).Where("id=?", req.Id).Data(updateData).Update()
+	_, err = dao.DeviceDance.Ctx(ctx).
+		Where("id = ?", req.Id).
+		Where("mac = ?", mac).
+		Data(updateData).
+		Update()
 	if err != nil {
 		return nil, err
 	}
