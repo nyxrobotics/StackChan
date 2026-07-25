@@ -22,6 +22,12 @@ extern "C" {
 #include "joystick_basic.h"
 
 joystick_data_t joystick_init();
+bool joystick_task_gate_init(void);
+void joystick_task_gate_open(void);
+void joystick_task_gate_deinit(void);
+void joystick_data_lock(void);
+void joystick_data_unlock(void);
+void joystick_notify_mode_change(uint8_t screen_mode);
 void handle_setup_screen(void *pvParam);
 void handle_running_screen(void *pvParam);
 void handle_imu_screen(void *pvParam);

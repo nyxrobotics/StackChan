@@ -20,7 +20,7 @@ lv_obj_t *id_dropdown      = NULL;
  * @brief Create the setup screen UI with configuration options
  * @note This function creates a standalone screen with multiple UI elements:
  *       - Title label at the top
- *       - Channel selection dropdown with options 1-14
+ *       - Channel selection dropdown with options 1-13
  *       - ID selection dropdown with options 0-50
  *       - Start button at the bottom for transitioning to running mode
  * @details The function sets up dropdown controls with initial selections and
@@ -63,7 +63,7 @@ void create_setup_screen()
 
     // Create Channel dropdown
     channel_dropdown = lv_dropdown_create(setup_screen);
-    lv_dropdown_set_options(channel_dropdown, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14");
+    lv_dropdown_set_options(channel_dropdown, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13");
     lv_dropdown_set_selected(channel_dropdown, 0);
     lv_obj_align(channel_dropdown, LV_ALIGN_TOP_LEFT, 5, 50);
     lv_dropdown_set_symbol(channel_dropdown, &updown_img);
@@ -113,7 +113,6 @@ void create_setup_screen()
  *      1. Changes background color of dropdowns to indicate selection
  *      2. Processes joystick Y-axis input for value modification
  *      3. Updates dropdown selections and corresponding data values
- *      4. Applies debouncing delay to prevent rapid value changes
  */
 void update_setup_screen(joystick_data_t *data)
 {
@@ -126,8 +125,6 @@ void update_setup_screen(joystick_data_t *data)
         lvgl_port_unlock();
         return;
     }
-
-    bool should_debounce = false;
 
     // Update setup screen
     if (data->select_mode == CHANNEL_SELECT) {
@@ -142,7 +139,7 @@ void update_setup_screen(joystick_data_t *data)
         // Move up - Increase Channel
         if (data->select_mode == CHANNEL_SELECT) {
             uint16_t selected = lv_dropdown_get_selected(channel_dropdown);
-            if (selected < 13) {  // Maximum index is 13 (corresponding to Channel 14)
+            if (selected < 12) {  // Maximum index is 12 (corresponding to Channel 13)
                 lv_dropdown_set_selected(channel_dropdown, selected + 1);
                 data->channel = selected + 2;  // Index + 1 + 1 = displayed value
             }
@@ -153,7 +150,6 @@ void update_setup_screen(joystick_data_t *data)
                 data->id = selected + 1;
             }
         }
-        should_debounce = true;
     } else if (data->joyY < Y_CENTER - DEAD_ZONE) {
         // Move down - Decrease Channel
         if (data->select_mode == CHANNEL_SELECT) {
@@ -169,13 +165,8 @@ void update_setup_screen(joystick_data_t *data)
                 data->id = selected - 1;
             }
         }
-        should_debounce = true;
     }
     lvgl_port_unlock();
-
-    if (should_debounce) {
-        vTaskDelay(50 / portTICK_PERIOD_MS);  // Add delay to prevent rapid changes
-    }
 }
 
 /**

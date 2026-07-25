@@ -6,6 +6,10 @@
 #ifndef __ESP_NOW_INIT_H__
 #define __ESP_NOW_INIT_H__
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,9 +21,9 @@ extern "C" {
 #include <espnow_utils.h>
 #include "esp_wifi.h"
 
-void wifi_espnow_init(uint8_t channel);
-int wifi_espnow_reinit(uint8_t new_channel);
-void espnow_send_data(uint8_t *pkt, size_t len);
+esp_err_t wifi_espnow_init(uint8_t channel);
+int wifi_espnow_set_channel(uint8_t new_channel);
+esp_err_t espnow_send_data(uint8_t *pkt, size_t len);
 
 #ifdef __cplusplus
 }

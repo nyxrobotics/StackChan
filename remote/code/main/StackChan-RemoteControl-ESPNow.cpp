@@ -40,23 +40,35 @@ void handle_button_press()
         // use BtnA to switch mode
         uint8_t next_screen_mode = (screen_mode + 1) % 3;
         if (next_screen_mode == MODE_RUNNING) {
-            wifi_espnow_reinit(joystick_data.channel);
+            int channel;
+            joystick_data_lock();
+            channel = joystick_data.channel;
+            joystick_data_unlock();
+            if (wifi_espnow_set_channel((uint8_t)channel) < 0) {
+                ESP_LOGE("APP", "Failed to change ESP-NOW channel");
+                return;
+            }
         }
 
         // Publish the mode only after all target-screen objects are ready and loaded.
         if (switch_screen(next_screen_mode)) {
-            screen_mode               = next_screen_mode;
+            screen_mode = next_screen_mode;
+            joystick_data_lock();
             joystick_data.screen_mode = next_screen_mode;
+            joystick_data_unlock();
+            joystick_notify_mode_change(next_screen_mode);
         } else {
             ESP_LOGE("APP", "Failed to switch screen mode to %u", next_screen_mode);
         }
     }
     if (M5.BtnB.wasPressed()) {
+        joystick_data_lock();
         if (joystick_data.screen_mode == MODE_SETUP) {
             joystick_data.select_mode = !joystick_data.select_mode;
         } else if ((joystick_data.screen_mode == MODE_RUNNING) || (joystick_data.screen_mode == MODE_IMU)) {
             joystick_data.btnB_status = !joystick_data.btnB_status;
         }
+        joystick_data_unlock();
     }
 }
 
@@ -67,8 +79,16 @@ void app_main(void)
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_erase();
+        if (ret != ESP_OK) {
+            ESP_LOGE("APP", "Failed to erase NVS: %s", esp_err_to_name(ret));
+            return;
+        }
         ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE("APP", "Failed to initialize NVS: %s", esp_err_to_name(ret));
+        return;
     }
 
     M5.begin();
@@ -90,33 +110,64 @@ void app_main(void)
     }
 
     // init WiFi and ESP-NOW
-    wifi_espnow_init(joystick_data.channel);
+    ret = wifi_espnow_init(joystick_data.channel);
+    if (ret != ESP_OK) {
+        ESP_LOGE("APP", "Failed to initialize ESP-NOW: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    xTaskCreate(handle_setup_screen, "handle_setup_screen", 8192, &joystick_data, 5, NULL);      // handle setup mode
-    xTaskCreate(handle_running_screen, "handle_running_screen", 8192, &joystick_data, 5, NULL);  // handle running mode
-    xTaskCreate(handle_imu_screen, "handle_imu_screen", 8192, &joystick_data, 5, NULL);
+    TaskHandle_t setup_task = NULL;
+    TaskHandle_t running_task = NULL;
+    TaskHandle_t imu_task = NULL;
+    // Every task blocks on this shared gate before touching LVGL or shared
+    // joystick state. This also makes partial-creation rollback safe on SMP.
+    if (!joystick_task_gate_init()) {
+        ESP_LOGE("APP", "Failed to create joystick task start gate");
+        return;
+    }
+    BaseType_t setup_created =
+        xTaskCreate(handle_setup_screen, "handle_setup_screen", 8192, &joystick_data, 5, &setup_task);
+    BaseType_t running_created =
+        setup_created == pdPASS
+            ? xTaskCreate(handle_running_screen, "handle_running_screen", 8192, &joystick_data, 5, &running_task)
+            : pdFAIL;
+    BaseType_t imu_created =
+        running_created == pdPASS ? xTaskCreate(handle_imu_screen, "handle_imu_screen", 8192, &joystick_data, 5, &imu_task)
+                                  : pdFAIL;
+    const bool tasks_created = setup_created == pdPASS && running_created == pdPASS && imu_created == pdPASS;
+    if (!tasks_created) {
+        ESP_LOGE("APP", "Failed to create joystick task");
+        if (setup_task != NULL) vTaskDelete(setup_task);
+        if (running_task != NULL) vTaskDelete(running_task);
+        if (imu_task != NULL) vTaskDelete(imu_task);
+        joystick_task_gate_deinit();
+        return;
+    }
+    joystick_task_gate_open();
 
     while (1) {
         M5.update();
         // Handle button press
         handle_button_press();
-        joystick_data.bat = (M5.Power.Axp192.getBatteryLevel());  // updata battery level
-
-        joystick_data.bat = (joystick_data.bat > 100) ? 100 : joystick_data.bat;
-        joystick_data.bat = (joystick_data.bat < 0) ? 0 : joystick_data.bat;
+        int battery_level = M5.Power.Axp192.getBatteryLevel();
+        battery_level     = (battery_level > 100) ? 100 : battery_level;
+        battery_level     = (battery_level < 0) ? 0 : battery_level;
 
         M5.Imu.update();                              // update IMU data
         imu_data              = M5.Imu.getImuData();  // get IMU data
+        joystick_data_lock();
+        joystick_data.bat     = (int8_t)battery_level;
         joystick_data.accel_x = imu_data.accel.x;
         joystick_data.accel_y = imu_data.accel.y;
         joystick_data.accel_z = imu_data.accel.z;
+        joystick_data_unlock();
 
 #if 0
         printf("Accel: (%.2f, %.2f, %.2f), Gyro: (%.2f, %.2f, %.2f)\n",
                joystick_data.accel_x, joystick_data.accel_y, joystick_data.accel_z,
                joystick_data.gyro_x, joystick_data.gyro_y, joystick_data.gyro_z);
 #endif
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 }

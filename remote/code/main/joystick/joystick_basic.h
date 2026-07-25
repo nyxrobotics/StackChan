@@ -19,6 +19,7 @@ typedef struct {
     uint8_t screen_mode;
     uint8_t select_mode;
     bool btnB_status;
+    bool joystick_available;
     float accel_x;
     float accel_y;
     float accel_z;
