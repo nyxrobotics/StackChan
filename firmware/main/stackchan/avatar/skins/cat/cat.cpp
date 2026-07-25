@@ -374,26 +374,6 @@ void draw_circular_arc(const DrawContext& context, const CircularArc& arc, int w
              false);
 }
 
-void draw_triangle(const DrawContext& context, Point first, Point second, Point third,
-                   lv_color_t color = lv_color_white())
-{
-    lv_draw_triangle_dsc_t descriptor;
-    lv_draw_triangle_dsc_init(&descriptor);
-    descriptor.color = color;
-    descriptor.opa   = LV_OPA_COVER;
-    descriptor.p[0]  = {context.origin_x + first.x, context.origin_y + first.y};
-    descriptor.p[1]  = {context.origin_x + second.x, context.origin_y + second.y};
-    descriptor.p[2]  = {context.origin_x + third.x, context.origin_y + third.y};
-    lv_draw_triangle(context.layer, &descriptor);
-}
-
-void draw_triangle(const DrawContext& context, Point first, Point second, Point third, const FeaturePose& pose,
-                   Point pivot, lv_color_t color = lv_color_white())
-{
-    draw_triangle(context, transform_point(first, pivot, pose), transform_point(second, pivot, pose),
-                  transform_point(third, pivot, pose), color);
-}
-
 struct ArcBoundary {
     Point center;
     int radius;
@@ -906,18 +886,13 @@ void draw_wink_eyes(const DrawContext& context, const CatFaceState& state)
         if (is_blinking(state.left_eye)) {
             draw_closed_blink(context, left_center, state.left_eye);
         } else {
-            draw_ring(context, left_center, 38, 5, state.left_eye, left_center);
+            draw_default_eye_contents(context, left_center, state.left_eye);
         }
     }
     if (state.right_eye.visible) {
         draw_arc(context, {172, 67}, 11, 213, 303, 9, state.right_eye, right_center);
         draw_line(context, {177, 120}, {224, 89}, 14, state.right_eye, right_center);
         draw_line(context, {177, 120}, {224, 126}, 14, state.right_eye, right_center);
-
-        draw_triangle(context, {242, 96}, {244, 99}, {242, 100}, state.right_eye, right_center);
-        draw_triangle(context, {244, 99}, {246, 100}, {242, 100}, state.right_eye, right_center);
-        draw_triangle(context, {246, 100}, {242, 100}, {242, 103}, state.right_eye, right_center);
-        draw_triangle(context, {242, 100}, {238, 100}, {240, 99}, state.right_eye, right_center);
     }
 }
 
