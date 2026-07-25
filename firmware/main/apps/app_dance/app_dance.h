@@ -7,6 +7,7 @@
 #include <mooncake.h>
 #include <memory>
 #include <mutex>
+#include <string>
 
 /**
  * @brief
@@ -26,7 +27,7 @@ private:
 
     struct BleHandlerData_t {
         bool update_flag = false;
-        char* data_ptr   = nullptr;
+        std::string data;
     };
     BleHandlerData_t _ble_avatar_data;
     BleHandlerData_t _ble_motion_data;

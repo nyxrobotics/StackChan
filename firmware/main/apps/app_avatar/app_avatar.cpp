@@ -94,8 +94,8 @@ void AppAvatar::onOpen()
         if (_ble_avatar_data.update_flag) {
             return;
         }
+        _ble_avatar_data.data        = data;
         _ble_avatar_data.update_flag = true;
-        _ble_avatar_data.data_ptr    = (char*)data;
     });
 
     GetHAL().onBleMotionData.connect([&](const char* data) {
@@ -103,8 +103,8 @@ void AppAvatar::onOpen()
         if (_ble_motion_data.update_flag) {
             return;
         }
+        _ble_motion_data.data        = data;
         _ble_motion_data.update_flag = true;
-        _ble_motion_data.data_ptr    = (char*)data;
     });
 
     /* ---------------------------- Websocket events ---------------------------- */
@@ -228,21 +228,31 @@ void AppAvatar::onOpen()
 
 void AppAvatar::onRunning()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
+    BleHandlerData_t ble_avatar_data;
+    BleHandlerData_t ble_motion_data;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_ble_avatar_data.update_flag) {
+            ble_avatar_data.data         = std::move(_ble_avatar_data.data);
+            ble_avatar_data.update_flag  = true;
+            _ble_avatar_data.update_flag = false;
+        }
+        if (_ble_motion_data.update_flag) {
+            ble_motion_data.data         = std::move(_ble_motion_data.data);
+            ble_motion_data.update_flag  = true;
+            _ble_motion_data.update_flag = false;
+        }
+    }
 
     LvglLockGuard lvgl_lock;
 
-    if (_ble_avatar_data.update_flag) {
-        GetStackChan().updateAvatarFromJson(_ble_avatar_data.data_ptr);
-        _ble_avatar_data.update_flag = false;
-        _ble_avatar_data.data_ptr    = nullptr;
+    if (ble_avatar_data.update_flag) {
+        GetStackChan().updateAvatarFromJson(ble_avatar_data.data.c_str());
     }
 
-    if (_ble_motion_data.update_flag) {
+    if (ble_motion_data.update_flag) {
         check_auto_angle_sync_mode();
-        GetStackChan().updateMotionFromJson(_ble_motion_data.data_ptr);
-        _ble_motion_data.update_flag = false;
-        _ble_motion_data.data_ptr    = nullptr;
+        GetStackChan().updateMotionFromJson(ble_motion_data.data.c_str());
     }
 
     if (_screen_clicked_flag) {

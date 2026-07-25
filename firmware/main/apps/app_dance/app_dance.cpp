@@ -62,8 +62,8 @@ void AppDance::onOpen()
         if (_ble_avatar_data.update_flag) {
             return;
         }
+        _ble_avatar_data.data        = data;
         _ble_avatar_data.update_flag = true;
-        _ble_avatar_data.data_ptr    = (char*)data;
     });
 
     GetHAL().onBleMotionData.connect([&](const char* data) {
@@ -71,8 +71,8 @@ void AppDance::onOpen()
         if (_ble_motion_data.update_flag) {
             return;
         }
+        _ble_motion_data.data        = data;
         _ble_motion_data.update_flag = true;
-        _ble_motion_data.data_ptr    = (char*)data;
     });
 
     GetHAL().onBleRgbData.connect([&](const char* data) {
@@ -80,8 +80,8 @@ void AppDance::onOpen()
         if (_ble_rgb_data.update_flag) {
             return;
         }
+        _ble_rgb_data.data        = data;
         _ble_rgb_data.update_flag = true;
-        _ble_rgb_data.data_ptr    = (char*)data;
     });
 
     /* ----------------------------- Common widgets ----------------------------- */
@@ -91,27 +91,41 @@ void AppDance::onOpen()
 
 void AppDance::onRunning()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
+    BleHandlerData_t ble_avatar_data;
+    BleHandlerData_t ble_motion_data;
+    BleHandlerData_t ble_rgb_data;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_ble_avatar_data.update_flag) {
+            ble_avatar_data.data         = std::move(_ble_avatar_data.data);
+            ble_avatar_data.update_flag  = true;
+            _ble_avatar_data.update_flag = false;
+        }
+        if (_ble_motion_data.update_flag) {
+            ble_motion_data.data         = std::move(_ble_motion_data.data);
+            ble_motion_data.update_flag  = true;
+            _ble_motion_data.update_flag = false;
+        }
+        if (_ble_rgb_data.update_flag) {
+            ble_rgb_data.data         = std::move(_ble_rgb_data.data);
+            ble_rgb_data.update_flag  = true;
+            _ble_rgb_data.update_flag = false;
+        }
+    }
 
     LvglLockGuard lvgl_lock;
 
-    if (_ble_avatar_data.update_flag) {
-        GetStackChan().updateAvatarFromJson(_ble_avatar_data.data_ptr);
-        _ble_avatar_data.update_flag = false;
-        _ble_avatar_data.data_ptr    = nullptr;
+    if (ble_avatar_data.update_flag) {
+        GetStackChan().updateAvatarFromJson(ble_avatar_data.data.c_str());
     }
 
-    if (_ble_motion_data.update_flag) {
+    if (ble_motion_data.update_flag) {
         check_auto_angle_sync_mode();
-        GetStackChan().updateMotionFromJson(_ble_motion_data.data_ptr);
-        _ble_motion_data.update_flag = false;
-        _ble_motion_data.data_ptr    = nullptr;
+        GetStackChan().updateMotionFromJson(ble_motion_data.data.c_str());
     }
 
-    if (_ble_rgb_data.update_flag) {
-        GetStackChan().updateNeonLightFromJson(_ble_rgb_data.data_ptr);
-        _ble_rgb_data.update_flag = false;
-        _ble_rgb_data.data_ptr    = nullptr;
+    if (ble_rgb_data.update_flag) {
+        GetStackChan().updateNeonLightFromJson(ble_rgb_data.data.c_str());
     }
 
     GetStackChan().update();
@@ -131,6 +145,7 @@ void AppDance::onClose()
 
         GetHAL().onBleAvatarData.clear();
         GetHAL().onBleMotionData.clear();
+        GetHAL().onBleRgbData.clear();
 
         view::destroy_home_indicator();
         view::destroy_status_bar();
