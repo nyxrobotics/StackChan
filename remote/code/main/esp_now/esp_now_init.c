@@ -71,6 +71,8 @@ void wifi_espnow_init(uint8_t channel)
 int wifi_espnow_reinit(uint8_t new_channel)
 {
     uint8_t channel = 0;
+    wifi_second_chan_t second;
+    ESP_ERROR_CHECK(esp_wifi_get_channel(&channel, &second));
     if (new_channel == channel) {
         ESP_LOGI("wifi reinit", "New Channel is same as current channel, no need to reinitialize");
         return channel;
@@ -103,8 +105,7 @@ int wifi_espnow_reinit(uint8_t new_channel)
     esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
     ESP_LOGI("reinit", "ESP-NOW reinitialized with MAC: %02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3],
              mac[4], mac[5]);
-    wifi_second_chan_t second;
-    esp_wifi_get_channel(&channel, &second);
+    ESP_ERROR_CHECK(esp_wifi_get_channel(&channel, &second));
     ESP_LOGI("WiFi", "Current channel: %d", channel);
     return channel;
 }
