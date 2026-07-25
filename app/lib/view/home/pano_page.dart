@@ -3,6 +3,7 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/cupertino.dart';
@@ -25,6 +26,10 @@ class _PanoPageState extends State<PanoPage> {
   final String tag = "PanoPage";
 
   bool recordSwitch = false;
+  bool _disposed = false;
+  int _captureGeneration = 0;
+  int _assemblyGeneration = 0;
+  String? _captureDeviceMac;
 
   RxList<Uint8List> imageDataList = RxList([]);
 
@@ -176,6 +181,7 @@ class _PanoPageState extends State<PanoPage> {
   void initState() {
     super.initState();
     WebSocketUtil.shared.addObserver(tag, (message) {
+      if (_disposed) return;
       if (message is Uint8List) {
         final result = AppState.shared.parseMessage(message);
         final msgType = result.$1;
@@ -200,18 +206,33 @@ class _PanoPageState extends State<PanoPage> {
 
   @override
   void dispose() {
+    _disposed = true;
+    ++_captureGeneration;
+    ++_assemblyGeneration;
+    recordSwitch = false;
     WebSocketUtil.shared.removeObserver(tag);
+    final captureDeviceMac = _captureDeviceMac;
+    _captureDeviceMac = null;
+    if (captureDeviceMac != null) {
+      AppState.shared.sendWebSocketMessage(
+        .offCamera,
+        data: captureDeviceMac.toUint8List(),
+      );
+    }
     super.dispose();
   }
 
   Future<void> startTakingPhotos() async {
-    if (AppState.shared.deviceMac.isEmpty) {
+    final deviceMac = AppState.shared.deviceMac;
+    if (deviceMac.isEmpty) {
       AppState.shared.showToast("Please re-attempt after binding the device.");
       return;
     }
 
-    if (isTakingPhotos.value) return;
+    if (_disposed || isTakingPhotos.value) return;
 
+    final generation = ++_captureGeneration;
+    var cameraOpened = false;
     try {
       isTakingPhotos.value = true;
       imageDataList.clear();
@@ -220,83 +241,84 @@ class _PanoPageState extends State<PanoPage> {
 
       AppState.shared.sendWebSocketMessage(
         .onCamera,
-        data: AppState.shared.deviceMac.toUint8List(),
+        data: deviceMac.toUint8List(),
       );
+      cameraOpened = true;
+      _captureDeviceMac = deviceMac;
       await Future.delayed(Duration(milliseconds: 300));
+      if (!_isCaptureCurrent(generation, deviceMac)) return;
 
       for (final motion in motionList) {
-        final jsonString = AppState.shared.deviceMac + motion.toString();
+        final jsonString = deviceMac + motion.toString();
         AppState.shared.sendWebSocketMessage(
           .controlMotion,
           data: jsonString.toUint8List(),
         );
 
         await Future.delayed(motionDelay);
+        if (!_isCaptureCurrent(generation, deviceMac)) return;
 
         recordSwitch = true;
 
         await Future.delayed(captureDelay);
+        if (!_isCaptureCurrent(generation, deviceMac)) return;
       }
 
-      AppState.shared.sendWebSocketMessage(
-        .offCamera,
-        data: AppState.shared.deviceMac.toUint8List(),
-      );
-
       AppState.shared.showToast("The shooting is complete.");
-
-      startAssemble();
+      unawaited(startAssemble());
     } catch (e) {
-      AppState.shared.sendWebSocketMessage(
-        .offCamera,
-        data: AppState.shared.deviceMac.toUint8List(),
-      );
-      AppState.shared.showToast("The shooting was unsuccessful.：${e.toString()}");
-          } finally {
-      isTakingPhotos.value = false;
+      if (_isCaptureCurrent(generation, deviceMac)) {
+        AppState.shared.showToast(
+          "The shooting was unsuccessful.：${e.toString()}",
+        );
+      }
+    } finally {
+      if (cameraOpened && _captureDeviceMac == deviceMac) {
+        _captureDeviceMac = null;
+        AppState.shared.sendWebSocketMessage(
+          .offCamera,
+          data: deviceMac.toUint8List(),
+        );
+      }
+      if (!_disposed && generation == _captureGeneration) {
+        isTakingPhotos.value = false;
+      }
       recordSwitch = false;
     }
+  }
 
-    ///deviceSide / EndCamera
-    AppState.shared.sendWebSocketMessage(
-      .onCamera,
-      data: AppState.shared.deviceMac.toUint8List(),
-    );
-
-    for (final motion in motionList) {
-      String jsonString = AppState.shared.deviceMac + motion.toString();
-      AppState.shared.sendWebSocketMessage(
-        .controlMotion,
-        data: jsonString.toUint8List(),
-      );
-
-      ///Wait500ms,after recordSwitch = true, Again 500ms, executeNext
-    }
-
-    ///closedeviceSide / EndCamera
-    AppState.shared.sendWebSocketMessage(
-      .offCamera,
-      data: AppState.shared.deviceMac.toUint8List(),
-    );
+  bool _isCaptureCurrent(int generation, String deviceMac) {
+    return !_disposed &&
+        generation == _captureGeneration &&
+        AppState.shared.deviceMac == deviceMac;
   }
 
   Future<void> startAssemble() async {
     if (imageDataList.length < 5) {
-      AppState.shared.showToast("At least 5 photos are needed to stitch together a panoramic image!");
+      AppState.shared.showToast(
+        "At least 5 photos are needed to stitch together a panoramic image!",
+      );
       return;
     }
-    if (isLoading.value) return;
+    if (_disposed || isLoading.value) return;
+    final generation = ++_assemblyGeneration;
     isLoading.value = true;
     panoImage.value = null;
 
     List<cv.Mat> mats = [];
     cv.VecMat? vecMat;
     cv.Stitcher? stitcher;
+    cv.Mat? resultMat;
 
     try {
       for (final data in imageDataList) {
         final mat = await cv.imdecodeAsync(data, cv.IMREAD_COLOR);
+        if (_disposed || generation != _assemblyGeneration) {
+          mat.dispose();
+          return;
+        }
         if (mat.isEmpty) {
+          mat.dispose();
           throw Exception("Invalid image data");
         }
         mats.add(mat);
@@ -304,25 +326,32 @@ class _PanoPageState extends State<PanoPage> {
       vecMat = cv.VecMat.fromList(mats);
       stitcher = cv.Stitcher.create(mode: .PANORAMA);
       final (status, result) = await stitcher.stitchAsync(vecMat);
+      resultMat = result;
+      if (_disposed || generation != _assemblyGeneration) return;
       if (status != cv.StitcherStatus.OK) {
         throw Exception("Stitch error code: $status");
       }
       final (resultStatus, jpeg) = await cv.imencodeAsync(".jpg", result);
+      if (_disposed || generation != _assemblyGeneration) return;
       if (!resultStatus) {
         throw Exception("Encode failed");
       }
       panoImage.value = jpeg;
       AppState.shared.showToast("Stitch success!");
-      result.dispose();
     } catch (e) {
-      AppState.shared.showToast("Error: ${e.toString()}");
-          } finally {
+      if (!_disposed && generation == _assemblyGeneration) {
+        AppState.shared.showToast("Error: ${e.toString()}");
+      }
+    } finally {
+      resultMat?.dispose();
       for (var mat in mats) {
         mat.dispose();
       }
       vecMat?.dispose();
       stitcher?.dispose();
-      isLoading.value = false;
+      if (!_disposed && generation == _assemblyGeneration) {
+        isLoading.value = false;
+      }
     }
   }
 

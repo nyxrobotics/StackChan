@@ -3,32 +3,46 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:stack_chan/view/app.dart';
+import 'package:stack_chan/app_state.dart';
+import 'package:stack_chan/model/msg_type.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(App());
+  group('AppState WebSocket frame parsing', () {
+    final appState = AppState();
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    test('decodes a complete frame', () {
+      final result = appState.parseMessage(
+        Uint8List.fromList([
+          MsgType.deviceOnline.value,
+          0,
+          0,
+          0,
+          3,
+          0x41,
+          0x42,
+          0x43,
+        ]),
+      );
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+      expect(result.$1, MsgType.deviceOnline);
+      expect(result.$2, Uint8List.fromList([0x41, 0x42, 0x43]));
+    });
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    test('rejects unknown, incomplete, and truncated frames', () {
+      expect(appState.parseMessage(Uint8List(0)), (null, null));
+      expect(appState.parseMessage(Uint8List.fromList([0xFF, 0, 0, 0, 0])), (
+        null,
+        null,
+      ));
+      expect(
+        appState.parseMessage(
+          Uint8List.fromList([MsgType.opus.value, 0, 0, 0, 2, 0x01]),
+        ),
+        (null, null),
+      );
+    });
   });
 }

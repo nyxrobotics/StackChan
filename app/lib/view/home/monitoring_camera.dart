@@ -3,6 +3,8 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
@@ -64,7 +66,7 @@ class _MonitoringCameraState extends State<MonitoringCamera> {
               break;
             case .opus:
               if (parsedData != null) {
-                AudioEngineManager.shared.playOpus(parsedData);
+                unawaited(AudioEngineManager.shared.playOpus(parsedData));
               }
               break;
             default:

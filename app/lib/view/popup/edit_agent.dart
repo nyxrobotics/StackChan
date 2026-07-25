@@ -3,6 +3,8 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:get/get.dart';
 import 'package:stack_chan/app_state.dart';
@@ -34,10 +36,13 @@ class EditAgentModel extends GetxController {
   final RxBool isEdit = false.obs;
   final RxBool isLoading = false.obs;
 
-  late TextEditingController agentNameController;
-  late TextEditingController assistantNameController;
-  late TextEditingController characterController;
-  late TextEditingController memoryController;
+  final TextEditingController agentNameController = TextEditingController();
+  final TextEditingController assistantNameController = TextEditingController();
+  final TextEditingController characterController = TextEditingController();
+  final TextEditingController memoryController = TextEditingController();
+  Worker? _languageWorker;
+  bool _disposed = false;
+  int _lifecycleGeneration = 0;
 
   final Rxn<ModelData> selectedModel = Rxn();
   final Rxn<TTsVoice> selectedTtsVoice = Rxn();
@@ -60,31 +65,47 @@ class EditAgentModel extends GetxController {
   final List<int> pitchList = [-2, -1, 0, 1, 2];
   final List<String> memoryTypeList = ["OFF", "SHORT_TERM"];
 
-  void initPageData() async {
-    agentNameController = TextEditingController();
-    assistantNameController = TextEditingController();
-    characterController = TextEditingController();
-    memoryController = TextEditingController();
+  bool _isCurrent(int generation) {
+    return !_disposed && generation == _lifecycleGeneration;
+  }
 
-    //listenlanguageswitch → autorefreshvoice tone
-    ever(selectedLanguage, (lang) => _updateTtsVoiceList(lang));
+  Future<void> initPageData() async {
+    if (_disposed) return;
+    final generation = ++_lifecycleGeneration;
+    isLoading.value = false;
+    selectedMcpEndpoints.clear();
+    _languageWorker?.dispose();
+    _languageWorker = ever(selectedLanguage, (lang) {
+      if (_isCurrent(generation)) {
+        _updateTtsVoiceList(lang);
+      }
+    });
 
-    await loadCommonMcpTools();
-    await loadTtsList(); //loadTTS → autogeneratelanguagelist
-    await loadModelList();
+    try {
+      await loadCommonMcpTools(generation);
+      await loadTtsList(generation); //loadTTS → autogeneratelanguagelist
+      await loadModelList(generation);
+      if (!_isCurrent(generation)) return;
 
-    if (agent != null) {
-      isEdit.value = true;
-      fillEditData(agent!);
-    } else {
-      isEdit.value = false;
-      setDefaultCreateData();
+      if (agent != null) {
+        isEdit.value = true;
+        fillEditData(agent!);
+      } else {
+        isEdit.value = false;
+        setDefaultCreateData();
+      }
+    } catch (_) {
+      if (_isCurrent(generation)) {
+        AppState.shared.showToast("Failed to load AI Agent settings.");
+      }
     }
   }
 
   //loadTTSdata + generatedynamiclanguagelist
-  Future<void> loadTtsList() async {
-    ttsData = await XiaoZhiUtil.shared.getTtsList();
+  Future<void> loadTtsList(int generation) async {
+    final loadedTtsData = await XiaoZhiUtil.shared.getTtsList();
+    if (!_isCurrent(generation)) return;
+    ttsData = loadedTtsData;
 
     //✅ key：from ttsVoices  key generatelanguagelist
     if (ttsData?.ttsVoices != null) {
@@ -102,6 +123,7 @@ class EditAgentModel extends GetxController {
 
   //switchlanguage → switchvoice tone
   void _updateTtsVoiceList(String lang) {
+    if (_disposed) return;
     if (ttsData?.ttsVoices == null || lang.isEmpty) {
       ttsList.clear();
       selectedTtsVoice.value = null;
@@ -112,13 +134,16 @@ class EditAgentModel extends GetxController {
     update();
   }
 
-  Future<void> loadModelList() async {
+  Future<void> loadModelList(int generation) async {
     final models = await XiaoZhiUtil.shared.getModelList();
+    if (!_isCurrent(generation)) return;
     modelList.assignAll(models);
   }
 
-  Future<void> loadCommonMcpTools() async {
-    commonMcpTools = await XiaoZhiUtil.shared.getCommonMcpTool();
+  Future<void> loadCommonMcpTools(int generation) async {
+    final tools = await XiaoZhiUtil.shared.getCommonMcpTool();
+    if (!_isCurrent(generation)) return;
+    commonMcpTools = tools;
     update();
   }
 
@@ -147,12 +172,9 @@ class EditAgentModel extends GetxController {
     }
 
     if (agent.tts_voice != null) {
-      Future.delayed(const Duration(milliseconds: 100), () {
-        selectedTtsVoice.value = ttsList.firstWhereOrNull(
-          (t) => t.voiceId == agent.tts_voice,
-        );
-        update();
-      });
+      selectedTtsVoice.value = ttsList.firstWhereOrNull(
+        (t) => t.voiceId == agent.tts_voice,
+      );
     }
 
     if (agent.mcp_endpoints != null) {
@@ -181,6 +203,7 @@ class EditAgentModel extends GetxController {
   }
 
   Future<bool> submitAgent() async {
+    if (_disposed || isLoading.value) return false;
     if (agentNameController.text.isEmpty) {
       AppState.shared.showToast("Please enter the AI Agent name.");
       return false;
@@ -194,43 +217,62 @@ class EditAgentModel extends GetxController {
       return false;
     }
 
+    final generation = _lifecycleGeneration;
     isLoading.value = true;
 
-    final agentParams = AgentCreate(
-      agent_name: agentNameController.text.trim(),
-      assistant_name: assistantNameController.text.trim(),
-      llm_model: selectedModel.value!.name!,
-      tts_voice: selectedTtsVoice.value!.voiceId!,
-      tts_speech_speed: ttsSpeed.value,
-      tts_pitch: ttsPitch.value,
-      asr_speed: asrSpeed.value,
-      language: selectedLanguage.value,
-      character: characterController.text.trim(),
-      memory: memoryController.text.trim(),
-      memory_type: memoryType.value,
-      mcp_endpoints: selectedMcpEndpoints,
-      product_mcp_endpoints: [],
-    );
+    try {
+      final agentParams = AgentCreate(
+        agent_name: agentNameController.text.trim(),
+        assistant_name: assistantNameController.text.trim(),
+        llm_model: selectedModel.value!.name!,
+        tts_voice: selectedTtsVoice.value!.voiceId!,
+        tts_speech_speed: ttsSpeed.value,
+        tts_pitch: ttsPitch.value,
+        asr_speed: asrSpeed.value,
+        language: selectedLanguage.value,
+        character: characterController.text.trim(),
+        memory: memoryController.text.trim(),
+        memory_type: memoryType.value,
+        mcp_endpoints: selectedMcpEndpoints,
+        product_mcp_endpoints: [],
+      );
 
-    bool result = false;
-    if (isEdit.value) {
-      result = await XiaoZhiUtil.shared.updateAgent(agent!.id!, agentParams);
-    } else {
-      final agentId = await XiaoZhiUtil.shared.createAgent(agentParams);
-      result = agentId != null;
-    }
+      bool result;
+      if (isEdit.value) {
+        result = await XiaoZhiUtil.shared.updateAgent(agent!.id!, agentParams);
+      } else {
+        final agentId = await XiaoZhiUtil.shared.createAgent(agentParams);
+        result = agentId != null;
+      }
 
-    isLoading.value = false;
-    if (result) {
-      AppState.shared.showToast(isEdit.value
-          ? "Agent edited successfully"
-          : "Agent created successfully");
+      if (!_isCurrent(generation)) return false;
+      if (result) {
+        AppState.shared.showToast(
+          isEdit.value
+              ? "Agent edited successfully"
+              : "Agent created successfully",
+        );
+      }
+      return result;
+    } catch (_) {
+      if (_isCurrent(generation)) {
+        AppState.shared.showToast("Failed to save AI Agent settings.");
+      }
+      return false;
+    } finally {
+      if (_isCurrent(generation)) {
+        isLoading.value = false;
+      }
     }
-    return result;
   }
 
   @override
   void onClose() {
+    if (_disposed) return;
+    _disposed = true;
+    ++_lifecycleGeneration;
+    _languageWorker?.dispose();
+    _languageWorker = null;
     agentNameController.dispose();
     assistantNameController.dispose();
     characterController.dispose();
@@ -258,15 +300,13 @@ class _EditAgentState extends State<EditAgent> {
   void initState() {
     super.initState();
     model = EditAgentModel(widget.agent);
-    model.initPageData();
+    unawaited(model.initPageData());
   }
 
   @override
   void dispose() {
+    FocusManager.instance.primaryFocus?.unfocus();
     model.onClose();
-    if (mounted) {
-      FocusScope.of(context).unfocus();
-    }
     super.dispose();
   }
 
@@ -426,6 +466,10 @@ class _EditAgentState extends State<EditAgent> {
   }
 
   void showModelPicker() {
+    if (model.modelList.isEmpty) {
+      AppState.shared.showToast("No LLM models are available.");
+      return;
+    }
     final initialIndex = model.modelList.indexOf(model.selectedModel.value);
     showPicker(
       title: "Select LLM Model",
@@ -436,6 +480,10 @@ class _EditAgentState extends State<EditAgent> {
   }
 
   void showLanguagePicker() {
+    if (model.languageList.isEmpty) {
+      AppState.shared.showToast("No languages are available.");
+      return;
+    }
     final initialIndex = model.languageList.indexOf(
       model.selectedLanguage.value,
     );
@@ -453,6 +501,10 @@ class _EditAgentState extends State<EditAgent> {
   }
 
   void showTtsPicker() {
+    if (model.ttsList.isEmpty) {
+      AppState.shared.showToast("No voice tones are available.");
+      return;
+    }
     final initialIndex = model.ttsList.indexOf(model.selectedTtsVoice.value);
     showPicker(
       title: "Select Voice Tone",
@@ -512,6 +564,7 @@ class _EditAgentState extends State<EditAgent> {
     required Function(int) onSelected,
     int initialIndex = 0, //new：selectedindex
   }) {
+    if (items.isEmpty) return;
     //initselectedItemascurrentValue(fixdefaultselectederror)
     selectedItem = initialIndex;
     showCupertinoModalPopup(

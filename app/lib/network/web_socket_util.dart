@@ -6,7 +6,8 @@ SPDX-License-Identifier: MIT
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 
 import '../app_state.dart';
 import '../model/msg_type.dart';
@@ -21,15 +22,24 @@ class WebSocketUtil {
   WebSocket? _socket;
   StreamSubscription<dynamic>? _subscription;
   Timer? _reconnectTimer;
+  Future<void>? _connectFuture;
+  String? _connectFutureUrl;
+  String? _connectFutureMac;
 
   bool _isConnected = false;
   bool _manualDisconnect = false;
   int _generation = 0;
+  int _reconnectAttempt = 0;
+
+  static const Duration _connectTimeout = Duration(seconds: 15);
+  static const Duration _closeTimeout = Duration(seconds: 5);
+  static const int _maxReconnectDelaySeconds = 30;
 
   final Map<String, void Function()> _connectionObservers = {};
   final Map<String, void Function(dynamic)> _observers = {};
 
   String _urlString = '';
+  String _deviceMac = '';
 
   /* =======================
    * Authorization
@@ -51,42 +61,91 @@ class WebSocketUtil {
   /* =======================
    * Connect
    * ======================= */
-  Future<void> connect(String urlString) async {
+  Future<void> connect(String urlString) {
+    return _connectInternalTracked(urlString, AppState.shared.deviceMac);
+  }
+
+  Future<void> _connectInternalTracked(String urlString, String deviceMac) {
+    final inFlight = _connectFuture;
+    if (inFlight != null &&
+        !_manualDisconnect &&
+        _connectFutureUrl == urlString &&
+        _connectFutureMac == deviceMac) {
+      return inFlight;
+    }
+
+    late final Future<void> future;
+    future = (() async {
+      try {
+        await _connectInternal(urlString, deviceMac);
+      } finally {
+        if (identical(_connectFuture, future)) {
+          _connectFuture = null;
+          _connectFutureUrl = null;
+          _connectFutureMac = null;
+        }
+      }
+    })();
+    _connectFuture = future;
+    _connectFutureUrl = urlString;
+    _connectFutureMac = deviceMac;
+    return future;
+  }
+
+  Future<void> _connectInternal(String urlString, String deviceMac) async {
     _manualDisconnect = false;
     _urlString = urlString;
+    _deviceMac = deviceMac;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
     final generation = ++_generation;
     await _closeCurrentConnection();
 
-    if (!_isConnectionRequestCurrent(generation, urlString) ||
-        AppState.shared.deviceMac.isEmpty) {
+    if (!_isConnectionRequestCurrent(generation, urlString, deviceMac) ||
+        deviceMac.isEmpty) {
       return;
     }
 
     late final WebSocket socket;
     try {
-      final encryptedToken = RsaUtil.encrypt(
-        getAuthorization(AppState.shared.deviceMac),
-      );
+      final encryptedToken = RsaUtil.encrypt(getAuthorization(deviceMac));
       final headers = {ValueConstant.authorization: encryptedToken};
-      socket = await WebSocket.connect(urlString, headers: headers);
+      final pendingSocket = WebSocket.connect(urlString, headers: headers);
+      try {
+        socket = await pendingSocket.timeout(_connectTimeout);
+      } on TimeoutException {
+        // Dart cannot cancel WebSocket.connect. Close a socket that arrives
+        // after our timeout so it cannot leak in the background.
+        unawaited(
+          pendingSocket.then<void>(
+            (lateSocket) => _closeSocket(null, lateSocket),
+            onError: (Object error, StackTrace stackTrace) {
+              debugPrint(
+                "Timed-out WebSocket connection failed while closing: "
+                "$error\n$stackTrace",
+              );
+            },
+          ),
+        );
+        rethrow;
+      }
     } catch (_) {
-      if (_isConnectionRequestCurrent(generation, urlString)) {
+      if (_isConnectionRequestCurrent(generation, urlString, deviceMac)) {
         _isConnected = false;
         _scheduleReconnect(generation);
       }
       return;
     }
 
-    if (!_isConnectionRequestCurrent(generation, urlString)) {
+    if (!_isConnectionRequestCurrent(generation, urlString, deviceMac)) {
       await _closeSocket(null, socket);
       return;
     }
 
     _socket = socket;
     _isConnected = true;
+    _reconnectAttempt = 0;
 
     try {
       _subscription = socket.listen(
@@ -202,14 +261,26 @@ class WebSocketUtil {
     }
 
     final urlString = _urlString;
-    _reconnectTimer = Timer(const Duration(seconds: 1), () {
+    final deviceMac = _deviceMac;
+    final exponent = min(_reconnectAttempt, 5);
+    final baseDelayMs = min(
+      _maxReconnectDelaySeconds * 1000,
+      1000 * (1 << exponent),
+    );
+    _reconnectAttempt++;
+    final jitterMs = (baseDelayMs * (Random().nextDouble() * 0.4 - 0.2))
+        .round();
+    _reconnectTimer = Timer(Duration(milliseconds: baseDelayMs + jitterMs), () {
       _reconnectTimer = null;
       if (_manualDisconnect ||
           generation != _generation ||
-          urlString != _urlString) {
+          urlString != _urlString ||
+          deviceMac != _deviceMac ||
+          deviceMac.isEmpty ||
+          deviceMac != AppState.shared.deviceMac) {
         return;
       }
-      unawaited(connect(urlString));
+      unawaited(_connectInternalTracked(urlString, deviceMac));
     });
   }
 
@@ -219,6 +290,8 @@ class WebSocketUtil {
   void disconnect() {
     _manualDisconnect = true;
     _urlString = '';
+    _deviceMac = '';
+    _reconnectAttempt = 0;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     ++_generation;
@@ -246,27 +319,48 @@ class WebSocketUtil {
     StreamSubscription<dynamic>? subscription,
     WebSocket? socket,
   ) async {
-    try {
-      await subscription?.cancel();
-    } catch (_) {
-      // The connection generation prevents stale callbacks from taking effect.
+    Future<void> cancelSubscription() async {
+      if (subscription == null) {
+        return;
+      }
+      try {
+        await subscription.cancel().timeout(_closeTimeout);
+      } catch (_) {
+        // The connection generation prevents stale callbacks from taking effect.
+      }
     }
 
-    try {
-      await socket?.close(WebSocketStatus.goingAway, 'Connection replaced');
-    } catch (_) {
-      // The socket is already unusable, so there is nothing else to clean up.
+    Future<void> closeSocket() async {
+      if (socket == null) {
+        return;
+      }
+      try {
+        await socket
+            .close(WebSocketStatus.goingAway, 'Connection replaced')
+            .timeout(_closeTimeout);
+      } catch (_) {
+        // The socket is already unusable, so there is nothing else to clean up.
+      }
     }
+
+    await Future.wait([cancelSubscription(), closeSocket()]);
   }
 
-  bool _isConnectionRequestCurrent(int generation, String urlString) {
+  bool _isConnectionRequestCurrent(
+    int generation,
+    String urlString,
+    String deviceMac,
+  ) {
     return !_manualDisconnect &&
         generation == _generation &&
-        urlString == _urlString;
+        urlString == _urlString &&
+        deviceMac == _deviceMac &&
+        deviceMac.isNotEmpty &&
+        deviceMac == AppState.shared.deviceMac;
   }
 
   bool _isCurrentSocket(WebSocket socket, int generation) {
-    return _isConnectionRequestCurrent(generation, _urlString) &&
+    return _isConnectionRequestCurrent(generation, _urlString, _deviceMac) &&
         identical(socket, _socket);
   }
 
@@ -305,8 +399,13 @@ class WebSocketUtil {
   }
 
   void _notifyObservers(dynamic message) {
-    for (final observer in _observers.values) {
-      observer(message);
+    final observers = List<void Function(dynamic)>.of(_observers.values);
+    for (final observer in observers) {
+      try {
+        observer(message);
+      } catch (_) {
+        // One observer must not prevent the remaining observers from running.
+      }
     }
   }
 

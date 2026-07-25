@@ -3,6 +3,7 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -43,7 +44,13 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
   }
 
   Future<void> initCamera() async {
-    List<CameraDescription> cameras = await availableCameras();
+    late final List<CameraDescription> cameras;
+    try {
+      cameras = await availableCameras();
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
     if (cameras.isEmpty) return;
 
     CameraDescription? frontCamera;
@@ -57,45 +64,50 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
       return;
     }
 
-    cameraController = CameraController(
+    final controller = CameraController(
       frontCamera,
       .medium,
       imageFormatGroup: .nv21,
     );
 
-    cameraController!
-        .initialize()
-        .then((_) async {
-          if (!mounted) {
-            return;
-          }
-          await cameraController!.startImageStream((image) {
-            processCameraImage(image, frontCamera!.sensorOrientation);
-          });
-          setState(() {});
-        })
-        .catchError((Object e) {
-          if (e is CameraException) {
-            switch (e.code) {
-              case "CameraAccessDenied":
-                // Handle access errors here.
-                break;
-              default:
-                // Handle other errors here.
-                break;
-            }
-          }
-        });
+    try {
+      await controller.initialize();
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      await controller.startImageStream((image) {
+        if (mounted) {
+          processCameraImage(image, frontCamera!.sensorOrientation);
+        }
+      });
+      if (!mounted) {
+        await _disposeCamera(controller);
+        return;
+      }
+      cameraController = controller;
+      setState(() {});
+    } on CameraException {
+      await _disposeCamera(controller);
+    } catch (_) {
+      await _disposeCamera(controller);
+    }
   }
 
   ///faceandSurface / Side
   void processCameraImage(CameraImage image, int sensorOrientation) {
+    if (!mounted) {
+      return;
+    }
+
     ///face
-    MlKitUtil.shared.testing(image, sensorOrientation, (faces) {
-      if (faces.isNotEmpty) {
-        dataConversionTesting(faces.first);
-      }
-    });
+    unawaited(
+      MlKitUtil.shared.testing(image, sensorOrientation, (faces) {
+        if (mounted && faces.isNotEmpty) {
+          dataConversionTesting(faces.first);
+        }
+      }),
+    );
     if (widget.captureScreen) {
       //willimagecompressConcurrencyBack
       final now = DateTime.now();
@@ -110,6 +122,10 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
 
   ///willdataconvert
   void dataConversionTesting(Face face) {
+    if (!mounted) {
+      return;
+    }
+
     double headYaw = face.headEulerAngleY ?? 0;
     double headPitch = face.headEulerAngleX ?? 0;
 
@@ -163,9 +179,7 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
       durationMs: 1000,
     );
 
-    if (widget.onCallback != null) {
-      widget.onCallback!(data);
-    }
+    widget.onCallback?.call(data);
   }
 
   ///compressAndsend
@@ -173,25 +187,37 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
     CameraImage image,
     int sensorOrientation,
   ) async {
-    final nv21Bytes = image.planes.first.bytes;
-    final mat = cv.Mat.fromList(
-      (image.height * 1.5).toInt(),
-      image.width,
-      .CV_8UC1,
-      nv21Bytes,
-    );
-    final bgrMat = cv.cvtColor(mat, cv.COLOR_YUV2BGR_NV21);
-    final rotatedMat = rotateMatIfNeeded(bgrMat, sensorOrientation);
-    final (success, jpegByte) = cv.imencode(".jpg", rotatedMat);
-    if (success) {
-      if (jpegByte.isNotEmpty && widget.onFrameCallback != null) {
+    cv.Mat? mat;
+    cv.Mat? bgrMat;
+    cv.Mat? rotatedMat;
+    try {
+      final nv21Bytes = image.planes.first.bytes;
+      mat = cv.Mat.fromList(
+        (image.height * 1.5).toInt(),
+        image.width,
+        .CV_8UC1,
+        nv21Bytes,
+      );
+      bgrMat = cv.cvtColor(mat, cv.COLOR_YUV2BGR_NV21);
+      rotatedMat = rotateMatIfNeeded(bgrMat, sensorOrientation);
+      final (success, jpegByte) = cv.imencode(".jpg", rotatedMat);
+      if (success &&
+          mounted &&
+          jpegByte.isNotEmpty &&
+          widget.onFrameCallback != null) {
         widget.onFrameCallback!(jpegByte);
       }
+    } catch (error, stackTrace) {
+      debugPrint("Camera frame compression failed: $error\n$stackTrace");
+      // A failed frame must not permanently stop subsequent capture frames.
+    } finally {
+      if (rotatedMat != null && !identical(rotatedMat, bgrMat)) {
+        rotatedMat.dispose();
+      }
+      bgrMat?.dispose();
+      mat?.dispose();
+      isProcessing = false;
     }
-    mat.dispose();
-    bgrMat.dispose();
-    rotatedMat.dispose();
-    isProcessing = false;
   }
 
   cv.Mat rotateMatIfNeeded(cv.Mat src, int orientation) {
@@ -207,17 +233,30 @@ class _StackChanFaceViewState extends State<StackChanFaceView> {
 
   @override
   void dispose() {
-    cameraController?.stopImageStream();
-    cameraController?.dispose();
+    final controller = cameraController;
+    cameraController = null;
+    if (controller != null) {
+      unawaited(_disposeCamera(controller));
+    }
     super.dispose();
+  }
+
+  Future<void> _disposeCamera(CameraController controller) async {
+    try {
+      await controller.stopImageStream();
+    } catch (_) {}
+    try {
+      await controller.dispose();
+    } catch (_) {}
   }
 
   @override
   Widget build(BuildContext context) {
-    if (cameraController == null) {
+    final controller = cameraController;
+    if (controller == null || !controller.value.isInitialized) {
       return Center(child: CupertinoActivityIndicator());
     } else {
-      return SizedBox.expand(child: CameraPreview(cameraController!));
+      return SizedBox.expand(child: CameraPreview(controller));
     }
   }
 }

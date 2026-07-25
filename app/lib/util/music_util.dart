@@ -6,11 +6,10 @@ SPDX-License-Identifier: MIT
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
-import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:music_feature_analyzer/music_feature_analyzer.dart';
 import 'package:path/path.dart' as path;
@@ -103,7 +102,7 @@ class MusicInfo {
         }
       } catch (e) {
         //onlyPrintdeletefaillog,NotinterruptMainStreamProcess / Thread
-              }
+      }
     }
   }
 
@@ -217,34 +216,73 @@ class MusicUtil {
 
   //currentplaymusicinfo
   MusicInfo? _currentMusicInfo;
+  int _operationGeneration = 0;
+  int? _activePlaybackGeneration;
+  int? _completionGeneration;
+  int? _loopOverrideGeneration;
+  LoopMode? _loopOverride;
+  bool _isDisposed = false;
+
+  int _beginPlaybackOperation() {
+    final generation = ++_operationGeneration;
+    _musicDuration = 0.0;
+    _currentPosition = 0.0;
+    _activePlaybackGeneration = null;
+    _completionGeneration = null;
+    _loopOverrideGeneration = null;
+    _loopOverride = null;
+    _playbackCompletion = null;
+    _currentMusicInfo = null;
+    return generation;
+  }
+
+  bool _isOperationCurrent(int generation) {
+    return !_isDisposed && generation == _operationGeneration;
+  }
 
   ///initmusicAnalyzer
   Future<void> _initAnalyzer() async {
     try {
       await MusicFeatureAnalyzer.initialize();
-          } catch (e) {
-          }
+    } catch (error, stackTrace) {
+      debugPrint(
+        "Music feature analyzer initialization failed: "
+        "$error\n$stackTrace",
+      );
+    }
   }
 
   ///configplayerlistener(System1Managerstate)
   void _setupPlayerListener() {
-    _audioPlayer.setVolume(1.0);
+    _audioPlayer.setVolume(1.0).ignore();
 
     //playerstatelisten(Containsplaystateandhandlestate)
     _audioPlayer.playerStateStream.listen((PlayerState state) {
-      
       //Playback completion check (handle completed status)
-      if (state.processingState == ProcessingState.completed) {
-                _currentPosition = 0.0; //resetprogress
+      if (state.processingState == ProcessingState.completed &&
+          _audioPlayer.processingState == ProcessingState.completed) {
+        _currentPosition = 0.0; //resetprogress
 
-        //SingleloopThenreplay,elseexecutecompletecallback
-        if (_audioPlayer.loopMode == LoopMode.one &&
-            _currentMusicInfo != null) {
-          _audioPlayer.seek(Duration.zero);
-          _audioPlayer.play();
-        } else {
-          _playbackCompletion?.call();
+        // just_audio handles LoopMode.one itself. Completion belongs only to
+        // the still-current non-looping source.
+        final completion = _playbackCompletion;
+        if (_audioPlayer.loopMode != LoopMode.one &&
+            _activePlaybackGeneration == _operationGeneration) {
+          final shouldCallCompletion =
+              _completionGeneration == _operationGeneration;
+          _activePlaybackGeneration = null;
           _playbackCompletion = null;
+          _completionGeneration = null;
+          _currentMusicInfo = null;
+          _loopOverrideGeneration = null;
+          _loopOverride = null;
+          if (shouldCallCompletion) {
+            try {
+              completion?.call();
+            } catch (_) {
+              // A UI callback must not break the shared player state stream.
+            }
+          }
         }
       }
 
@@ -258,7 +296,7 @@ class MusicUtil {
     _audioPlayer.durationStream.listen((Duration? duration) {
       if (duration != null) {
         _musicDuration = duration.inMilliseconds / 1000.0;
-              }
+      }
     });
 
     //playprogresslisten
@@ -272,8 +310,7 @@ class MusicUtil {
 
     //errorlisten
     _audioPlayer.errorStream.listen((PlayerException? e) {
-      if (e != null) {
-              }
+      if (e != null) {}
     });
   }
 
@@ -282,133 +319,245 @@ class MusicUtil {
     Uint8List data, {
     String contentType = 'audio/mpeg',
   }) async {
+    if (_isDisposed) return;
+    final generation = _beginPlaybackOperation();
     try {
-      await stopMusic();
-      _musicDuration = 0.0;
-      _currentPosition = 0.0;
-
-      //usecustomByteStreamaudioSourceload
-
-      final audioSource = BytesAudioSource(data, contentType: contentType);
-      await _audioPlayer.setAudioSource(audioSource);
-      await _audioPlayer.play();
-
-          } on PlayerException catch (e) {
-            throw Exception("播放失败: ${e.message}");
+      await _playMusicDataForOperation(
+        generation,
+        data,
+        contentType: contentType,
+      );
+    } on PlayerException catch (e) {
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: ${e.message}");
+      }
     } catch (e) {
-            throw Exception("播放失败: $e");
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: $e");
+      }
     }
   }
 
   ///playSinglemusic(playcompleteafterexecutecallback)
   Future<void> playMusicOnce(MusicInfo musicInfo, Function() completion) async {
-    _playbackCompletion = completion;
-    await playMusic(musicInfo, isLoop: false); //playcloseloop
+    if (_isDisposed) return;
+    final generation = _beginPlaybackOperation();
+    await _playMusicForOperation(
+      generation,
+      musicInfo,
+      isLoop: false,
+      completion: completion,
+    );
   }
 
   ///PlayOnlineMusic1Time(s),RepeatCallThenStopFrontFrom beginningPlay
   Future<void> playUrlMusicOnce(String? url, {Function()? completion}) async {
-    if (url == null) {
-            return;
-    }
+    if (url == null || _isDisposed) return;
+    final generation = _beginPlaybackOperation();
     try {
-      // First / PreviouslyStopFrontPlay
-      await stopMusic();
-
-      // SetComplete / DoneCallback
+      if (!await _resetPlayerForOperation(generation)) return;
       _playbackCompletion = completion;
+      _completionGeneration = completion == null ? null : generation;
 
-      // SetIsNotLoop
-      _audioPlayer.setLoopMode(LoopMode.off);
-
-      // DirectlyUse setUrl Load URL
+      final loopMode = _loopOverrideGeneration == generation
+          ? _loopOverride!
+          : LoopMode.off;
+      await _audioPlayer.setLoopMode(loopMode);
+      if (!_isOperationCurrent(generation)) return;
       await _audioPlayer.setUrl(url);
-      await _audioPlayer.play();
+      if (!_isOperationCurrent(generation)) return;
 
-          } on PlayerException catch (e) {
-            throw Exception("播放失败: ${e.message}");
+      _activePlaybackGeneration = generation;
+      await _audioPlayer.play();
+    } on PlayerException catch (e) {
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: ${e.message}");
+      }
     } catch (e) {
-            throw Exception("播放失败: $e");
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: $e");
+      }
     }
   }
 
   ///coreplaymethod（supportloop）
   Future<void> playMusic(MusicInfo? musicInfo, {bool isLoop = false}) async {
-    if (musicInfo == null) {
-            return;
-    }
+    if (musicInfo == null || _isDisposed) return;
+    final generation = _beginPlaybackOperation();
+    await _playMusicForOperation(generation, musicInfo, isLoop: isLoop);
+  }
 
-    //Recordcurrentplaymusicinfo
-    _currentMusicInfo = musicInfo;
-
-    //Set loop mode (just_audio LoopMode)
-    _audioPlayer.setLoopMode(isLoop ? LoopMode.one : LoopMode.off);
-
+  Future<void> _playMusicForOperation(
+    int generation,
+    MusicInfo musicInfo, {
+    required bool isLoop,
+    Function()? completion,
+  }) async {
     try {
+      if (!await _resetPlayerForOperation(generation)) return;
       final data = await musicInfo.loadData();
+      if (!_isOperationCurrent(generation)) return;
       final contentType = musicInfo.mimeType;
-      await playMusicData(data, contentType: contentType);
-          } on PlayerException catch (e) {
-            throw Exception("播放失败: ${e.message}");
+      await _playMusicDataForOperation(
+        generation,
+        data,
+        contentType: contentType,
+        musicInfo: musicInfo,
+        isLoop: isLoop,
+        completion: completion,
+        resetPlayer: false,
+      );
+    } on PlayerException catch (e) {
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: ${e.message}");
+      }
     } catch (e) {
-            throw Exception("播放失败: $e");
+      if (_isOperationCurrent(generation)) {
+        _clearPlaybackState();
+        throw Exception("播放失败: $e");
+      }
     }
+  }
+
+  Future<void> _playMusicDataForOperation(
+    int generation,
+    Uint8List data, {
+    required String contentType,
+    MusicInfo? musicInfo,
+    bool isLoop = false,
+    Function()? completion,
+    bool resetPlayer = true,
+  }) async {
+    if (resetPlayer) {
+      if (!await _resetPlayerForOperation(generation)) return;
+    } else if (!_isOperationCurrent(generation)) {
+      return;
+    }
+
+    _musicDuration = 0.0;
+    _currentPosition = 0.0;
+    _currentMusicInfo = musicInfo;
+    _playbackCompletion = completion;
+    _completionGeneration = completion == null ? null : generation;
+
+    final loopMode = _loopOverrideGeneration == generation
+        ? _loopOverride!
+        : (isLoop ? LoopMode.one : LoopMode.off);
+    await _audioPlayer.setLoopMode(loopMode);
+    if (!_isOperationCurrent(generation)) return;
+
+    final audioSource = BytesAudioSource(data, contentType: contentType);
+    await _audioPlayer.setAudioSource(audioSource);
+    if (!_isOperationCurrent(generation)) return;
+
+    _activePlaybackGeneration = generation;
+    await _audioPlayer.play();
+  }
+
+  Future<bool> _resetPlayerForOperation(int generation) async {
+    await _audioPlayer.stop();
+    if (!_isOperationCurrent(generation)) return false;
+    await _audioPlayer.seek(Duration.zero);
+    return _isOperationCurrent(generation);
+  }
+
+  void _clearPlaybackState() {
+    _musicDuration = 0.0;
+    _currentPosition = 0.0;
+    _currentMusicInfo = null;
+    _playbackCompletion = null;
+    _completionGeneration = null;
+    _activePlaybackGeneration = null;
+    _loopOverrideGeneration = null;
+    _loopOverride = null;
   }
 
   ///stopplay
   Future<void> stopMusic() async {
-    await _audioPlayer.stop();
-    await _audioPlayer.seek(Duration.zero); //resetprogressto
-
-    _currentPosition = 0.0;
-    _playbackCompletion = null;
-    _currentMusicInfo = null;
-      }
+    if (_isDisposed) return;
+    final generation = ++_operationGeneration;
+    _clearPlaybackState();
+    try {
+      await _audioPlayer.stop();
+    } catch (_) {
+      return;
+    }
+    if (!_isOperationCurrent(generation)) return;
+    try {
+      await _audioPlayer.seek(Duration.zero);
+    } catch (_) {
+      return;
+    }
+    if (_isOperationCurrent(generation)) {
+      _currentPosition = 0.0;
+    }
+  }
 
   ///pauseplay
   Future<void> pauseMusic() async {
-    if (_audioPlayer.playing) {
+    if (!_isDisposed && _audioPlayer.playing) {
       await _audioPlayer.pause();
-          }
+    }
   }
 
   ///resumeplay
   Future<void> resumeMusic() async {
-    if (!_audioPlayer.playing && _currentMusicInfo != null) {
+    if (!_isDisposed &&
+        !_audioPlayer.playing &&
+        _currentMusicInfo != null &&
+        _activePlaybackGeneration == _operationGeneration) {
       await _audioPlayer.play();
-          }
+    }
   }
 
   ///setloopplaystate
   void setMusicLoop(bool isLoop) {
+    if (_isDisposed) return;
+    final generation = _operationGeneration;
     final loopMode = isLoop ? LoopMode.one : LoopMode.off;
-    _audioPlayer.setLoopMode(loopMode);
-      }
+    _loopOverrideGeneration = generation;
+    _loopOverride = loopMode;
+    unawaited(_setLoopModeForOperation(generation, loopMode));
+  }
+
+  Future<void> _setLoopModeForOperation(
+    int generation,
+    LoopMode loopMode,
+  ) async {
+    if (!_isOperationCurrent(generation)) return;
+    try {
+      await _audioPlayer.setLoopMode(loopMode);
+    } catch (_) {
+      // A loop toggle must not fail the active playback operation.
+    }
+  }
 
   ///jumpplayprogress
   Future<void> seekTo(double seconds) async {
-    if (seconds < 0 || seconds > _musicDuration) {
-            return;
-    }
+    if (_isDisposed || seconds < 0 || seconds > _musicDuration) return;
+    final generation = _operationGeneration;
     await _audioPlayer.seek(Duration(seconds: seconds.toInt()));
-    _currentPosition = seconds;
-      }
+    if (_isOperationCurrent(generation)) {
+      _currentPosition = seconds;
+    }
+  }
 
   ///Set volume (0.0 ~ 1.0)
   Future<void> setVolume(double volume) async {
-    if (volume < 0.0 || volume > 1.0) {
-            return;
-    }
+    if (_isDisposed || volume < 0.0 || volume > 1.0) return;
     await _audioPlayer.setVolume(volume);
-      }
+  }
 
   ///setplayspeed
   Future<void> setPlaybackSpeed(double speed) async {
-    if (speed <= 0) {
-            return;
-    }
+    if (_isDisposed || speed <= 0) return;
     await _audioPlayer.setSpeed(speed);
-      }
+  }
 
   ///Getcurrentplayprogress(Second(s))
   double getCurrentPosition() => _currentPosition;
@@ -417,28 +566,40 @@ class MusicUtil {
   double getMusicDuration() => _musicDuration;
 
   ///Getcurrentloopstate
-  bool getIsLoop() => _audioPlayer.loopMode == LoopMode.one;
+  bool getIsLoop() => !_isDisposed && _audioPlayer.loopMode == LoopMode.one;
 
   ///GetcurrentplayerwhetherCurrentlyinplay
-  bool isPlaying() => _audioPlayer.playing;
+  bool isPlaying() => !_isDisposed && _audioPlayer.playing;
 
   ///releaseplayerAsset / ResourceSource(pagedisposewhenCall)
   Future<void> dispose() async {
-    await stopMusic();
-    await _audioPlayer.dispose();
-    _currentMusicInfo = null;
-    _playbackCompletion = null;
-      }
+    if (_isDisposed) return;
+    _isDisposed = true;
+    ++_operationGeneration;
+    _clearPlaybackState();
+    try {
+      await _audioPlayer.stop();
+    } catch (error, stackTrace) {
+      debugPrint(
+        "Failed to stop audio player during dispose: "
+        "$error\n$stackTrace",
+      );
+    }
+    try {
+      await _audioPlayer.dispose();
+    } catch (error, stackTrace) {
+      debugPrint("Failed to dispose audio player: $error\n$stackTrace");
+    }
+  }
 
   ///improveaftermusicinfoparse(With / CarryVerboselog+cacheverify)
   Future<MusicInfo?> getMusicInfoAsync(String urlString) async {
     const tag = "MusicUtil/getMusicInfoAsync";
     try {
-      
       //1. Parse URL
       final uri = Uri.parse(urlString);
       if (!uri.isAbsolute) {
-                return null;
+        return null;
       }
 
       //2. Generate cache file info
@@ -450,7 +611,7 @@ class MusicUtil {
             '.m4a',
             '.flac',
           ].contains(extension.toLowerCase())) {
-                return null;
+        return null;
       }
       final fileName = '${uri.hashCode.toRadixString(16)}$extension';
       //useDocumentDirectoryAnd / WhileNotisWhenwhenDirectory,avoidSystemautocleancachefile
@@ -467,9 +628,9 @@ class MusicUtil {
         final stat = await file.stat();
         final fileSizeKB = stat.size / 1024;
         if (fileSizeKB < 10) {
-                    await file.delete();
+          await file.delete();
         } else {
-                    return await _extractMetadataFromFile(filePath, uri);
+          return await _extractMetadataFromFile(filePath, uri);
         }
       }
 
@@ -478,19 +639,19 @@ class MusicUtil {
       final stat = await file.stat();
       final fileSizeKB = stat.size / 1024;
       if (fileSizeKB < 10) {
-                return null;
+        return null;
       }
 
       //5. Extract metadata
       return await _extractMetadataFromFile(filePath, uri);
     } catch (e, stackTrace) {
-            return null;
+      debugPrint("$tag failed for $urlString: $e\n$stackTrace");
+      return null;
     }
   }
 
   ///DownLoadfiletoLocalcache
   Future<void> _downloadFile(Uri uri, File file) async {
-    const tag = "MusicUtil/_downloadFile";
     final httpClient = HttpClient();
     try {
       final request = await httpClient.getUrl(uri);
@@ -501,8 +662,6 @@ class MusicUtil {
       }
 
       await response.pipe(file.openWrite());
-          } catch (e) {
-            rethrow;
     } finally {
       httpClient.close();
     }
@@ -514,11 +673,11 @@ class MusicUtil {
     try {
       final song = await MusicFeatureAnalyzer.metadata(filePath);
       if (song == null) {
-                return null;
+        return null;
       }
 
       final durationSec = song.duration ~/ 1000; //convertas
-      
+
       return MusicInfo(
         durationSec,
         filePath,
@@ -528,7 +687,8 @@ class MusicUtil {
         artwork: song.albumArt,
       );
     } catch (e, stackTrace) {
-            return null;
+      debugPrint("$tag failed for $filePath: $e\n$stackTrace");
+      return null;
     }
   }
 
@@ -552,11 +712,15 @@ class MusicUtil {
             if (fileAge > maxAge) {
               await file.delete();
               deletedCount++;
-                          }
+            }
           }
         }
       }
-          } catch (e) {
-          }
+      if (deletedCount > 0) {
+        debugPrint("$tag deleted $deletedCount expired music files");
+      }
+    } catch (error, stackTrace) {
+      debugPrint("$tag failed: $error\n$stackTrace");
+    }
   }
 }

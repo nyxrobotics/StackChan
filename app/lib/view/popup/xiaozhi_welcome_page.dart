@@ -3,6 +3,8 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:get/get.dart';
 import 'package:pull_down_button/pull_down_button.dart';
@@ -34,10 +36,13 @@ class XiaoZhiEditAgentModel extends GetxController {
 
   final RxBool isLoading = false.obs;
 
-  late TextEditingController agentNameController;
-  late TextEditingController assistantNameController;
-  late TextEditingController characterController;
-  late TextEditingController memoryController;
+  final TextEditingController agentNameController = TextEditingController();
+  final TextEditingController assistantNameController = TextEditingController();
+  final TextEditingController characterController = TextEditingController();
+  final TextEditingController memoryController = TextEditingController();
+  Worker? _languageWorker;
+  bool _disposed = false;
+  int _lifecycleGeneration = 0;
 
   final Rxn<ModelData> selectedModel = Rxn();
   final Rxn<TTsVoice> selectedTtsVoice = Rxn();
@@ -60,94 +65,144 @@ class XiaoZhiEditAgentModel extends GetxController {
   final List<int> pitchList = [-2, -1, 0, 1, 2];
   final List<String> memoryTypeList = ["OFF", "SHORT_TERM"];
 
+  bool _isCurrent(int generation) {
+    return !_disposed && generation == _lifecycleGeneration;
+  }
+
   Future<void> initPageData(bool isWelCome) async {
-    agentNameController = TextEditingController();
-    assistantNameController = TextEditingController();
-    characterController = TextEditingController();
-    memoryController = TextEditingController();
-    ever(selectedLanguage, (lang) => _updateTtsVoiceList(lang));
-    await loadCommonMcpTools();
-    await loadTtsList();
-    await loadModelList();
-    final devices = await XiaoZhiUtil.shared.getDevice(
-      AppState.shared.deviceMac,
-    );
+    if (_disposed) return;
+    final generation = ++_lifecycleGeneration;
+    isLoading.value = false;
+    agent = null;
+    selectedMcpEndpoints.clear();
+    _languageWorker?.dispose();
+    _languageWorker = ever(selectedLanguage, (lang) {
+      if (_isCurrent(generation)) {
+        _updateTtsVoiceList(lang);
+      }
+    });
 
-    if (devices.isNotEmpty) {
-      if (devices.first.agent_id != null) {
-        if (isWelCome) {
-          final originallyAgent = await XiaoZhiUtil.shared.getAgentDetail(
-            devices.first.agent_id!,
-          );
+    try {
+      await loadCommonMcpTools(generation);
+      await loadTtsList(generation);
+      await loadModelList(generation);
+      if (!_isCurrent(generation)) return;
 
-          //fromtemplateGet
-          final agentTemplatesList = await XiaoZhiUtil.shared
-              .agentTemplatesList(1, 10);
+      final deviceMac = AppState.shared.deviceMac;
+      await _loadAgentForDevice(isWelCome, generation, deviceMac);
+      if (_isCurrent(generation) && AppState.shared.deviceMac == deviceMac) {
+        update();
+      }
+    } catch (_) {
+      if (_isCurrent(generation)) {
+        AppState.shared.showToast("Failed to load AI Agent settings.");
+      }
+    }
+  }
 
-          if (agentTemplatesList.isNotEmpty) {
-            final template = agentTemplatesList.first;
-            agent = Agent(
-              id: originallyAgent?.id,
-              user_name: template.user_name,
-              agent_name: template.agent_name,
-              assistant_name: template.assistant_name,
-              llm_model: template.llm_model,
-              tts_voice: getTtsVoice("en", template.tts_voices ?? []),
-              tts_speech_speed: template.tts_speech_speed,
-              tts_pitch: template.tts_pitch,
-              asr_speed: template.asr_speed,
-              language: "en",
-              character: template.character,
-              memory: "",
-              memory_type: "SHORT_TERM",
-              knowledge_base_ids: template.knowledge_base_ids,
-            );
-            fillEditData(agent!);
-          } else {
-            agent = originallyAgent;
-            fillEditData(agent!);
-          }
-        } else {
-          //update
-          agent = await XiaoZhiUtil.shared.getAgentDetail(
-            devices.first.agent_id!,
-          );
-          fillEditData(agent!);
-        }
+  Future<void> _loadAgentForDevice(
+    bool isWelCome,
+    int generation,
+    String deviceMac,
+  ) async {
+    var devices = await XiaoZhiUtil.shared.getDevice(deviceMac);
+    if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+      return;
+    }
+
+    if (devices.isEmpty) {
+      agent = null;
+      setDefaultCreateData();
+      return;
+    }
+
+    var agentId = devices.first.agent_id;
+    if (agentId == null) {
+      final generateLicense = await XiaoZhiUtil.shared.generateLicense(
+        deviceMac,
+      );
+      if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+        return;
+      }
+      if (generateLicense?.serialNumber == null) {
+        AppState.shared.showToast("Failed to generate device license.");
+        return;
+      }
+
+      final mac = MacAddressValidator.formatMac(deviceMac);
+      if (mac == null) {
+        AppState.shared.showToast("Failed to format device MAC address.");
+        return;
+      }
+
+      final activated = await XiaoZhiUtil.shared.agentsDevicesActivate(
+        generateLicense!.serialNumber!,
+        mac,
+      );
+      if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+        return;
+      }
+      if (!activated) {
+        AppState.shared.showToast("Device cloud activation failed.");
+        return;
+      }
+
+      // Re-query once after activation. Do not recursively recreate
+      // controllers/workers or retry forever when the backend is not ready.
+      devices = await XiaoZhiUtil.shared.getDevice(deviceMac);
+      if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+        return;
+      }
+      agentId = devices.isEmpty ? null : devices.first.agent_id;
+      if (agentId == null) {
+        AppState.shared.showToast(
+          "Device activation is still being prepared. Please try again.",
+        );
+        return;
+      }
+    }
+
+    final originalAgent = await XiaoZhiUtil.shared.getAgentDetail(agentId);
+    if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+      return;
+    }
+    if (originalAgent == null) {
+      AppState.shared.showToast("Failed to load the AI Agent.");
+      return;
+    }
+
+    if (isWelCome) {
+      final templates = await XiaoZhiUtil.shared.agentTemplatesList(1, 10);
+      if (!_isCurrent(generation) || AppState.shared.deviceMac != deviceMac) {
+        return;
+      }
+      if (templates.isNotEmpty) {
+        final template = templates.first;
+        agent = Agent(
+          id: originalAgent.id,
+          user_name: template.user_name,
+          agent_name: template.agent_name,
+          assistant_name: template.assistant_name,
+          llm_model: template.llm_model,
+          tts_voice: getTtsVoice("en", template.tts_voices ?? []),
+          tts_speech_speed: template.tts_speech_speed,
+          tts_pitch: template.tts_pitch,
+          asr_speed: template.asr_speed,
+          language: "en",
+          character: template.character,
+          memory: "",
+          memory_type: "SHORT_TERM",
+          knowledge_base_ids: template.knowledge_base_ids,
+        );
       } else {
-        ///hasactivateagent,Needactivateagent
-        //2. generatelicense
-        final generateLicense = await XiaoZhiUtil.shared.generateLicense(
-          AppState.shared.deviceMac,
-        );
-        if (generateLicense == null || generateLicense.serialNumber == null) {
-                    AppState.shared.showToast("Failed to generate device license.");
-          return;
-        }
-
-        //3. activatedevice
-        final serialNumber = generateLicense.serialNumber!;
-        final mac = MacAddressValidator.formatMac(AppState.shared.deviceMac);
-        if (mac == null) {
-          AppState.shared.showToast("Failed to format device MAC address.");
-          return;
-        }
-        bool activateResult = await XiaoZhiUtil.shared.agentsDevicesActivate(
-          serialNumber,
-          mac,
-        );
-        if (!activateResult) {
-                    AppState.shared.showToast("Device cloud activation failed.");
-          return;
-        }
-
-        //activatedevicesuccess
-        initPageData(isWelCome);
+        agent = originalAgent;
       }
     } else {
-      setDefaultCreateData();
+      agent = originalAgent;
     }
-    update();
+
+    selectedMcpEndpoints.clear();
+    fillEditData(agent!);
   }
 
   String getTtsVoice(String language, List<String> ttsVoices) {
@@ -169,8 +224,10 @@ class XiaoZhiEditAgentModel extends GetxController {
     return '';
   }
 
-  Future<void> loadTtsList() async {
-    ttsData = await XiaoZhiUtil.shared.getTtsList();
+  Future<void> loadTtsList(int generation) async {
+    final loadedTtsData = await XiaoZhiUtil.shared.getTtsList();
+    if (!_isCurrent(generation)) return;
+    ttsData = loadedTtsData;
     if (ttsData?.ttsVoices != null) {
       languageList.value = ttsData!.ttsVoices!.keys.toList();
     }
@@ -181,6 +238,7 @@ class XiaoZhiEditAgentModel extends GetxController {
   }
 
   void _updateTtsVoiceList(String lang) {
+    if (_disposed) return;
     if (ttsData?.ttsVoices == null || lang.isEmpty) {
       ttsList.clear();
       selectedTtsVoice.value = null;
@@ -191,14 +249,17 @@ class XiaoZhiEditAgentModel extends GetxController {
     update();
   }
 
-  Future<void> loadModelList() async {
+  Future<void> loadModelList(int generation) async {
     final models = await XiaoZhiUtil.shared.getModelList();
+    if (!_isCurrent(generation)) return;
     modelList.assignAll(models);
     update();
   }
 
-  Future<void> loadCommonMcpTools() async {
-    commonMcpTools.value = await XiaoZhiUtil.shared.getCommonMcpTool();
+  Future<void> loadCommonMcpTools(int generation) async {
+    final tools = await XiaoZhiUtil.shared.getCommonMcpTool();
+    if (!_isCurrent(generation)) return;
+    commonMcpTools.value = tools;
     update();
   }
 
@@ -255,12 +316,9 @@ class XiaoZhiEditAgentModel extends GetxController {
     }
 
     if (agent.tts_voice != null) {
-      Future.delayed(const Duration(milliseconds: 100), () {
-        selectedTtsVoice.value = ttsList.firstWhereOrNull(
-          (t) => t.voiceId == agent.tts_voice,
-        );
-        update();
-      });
+      selectedTtsVoice.value = ttsList.firstWhereOrNull(
+        (t) => t.voiceId == agent.tts_voice,
+      );
     }
 
     if (agent.mcp_endpoints != null) {
@@ -289,6 +347,7 @@ class XiaoZhiEditAgentModel extends GetxController {
   }
 
   Future<bool> submitAgent() async {
+    if (_disposed || isLoading.value) return false;
     if (assistantNameController.text.trim().isEmpty) {
       AppState.shared.showToast("Please input assistant assistant name.");
       return false;
@@ -301,43 +360,61 @@ class XiaoZhiEditAgentModel extends GetxController {
       AppState.shared.showToast("Please select a voice tone.");
       return false;
     }
+    final generation = _lifecycleGeneration;
     isLoading.value = true;
-    final agentParams = AgentCreate(
-      agent_name: agent?.agent_name ?? "StackChan AI Agent",
-      assistant_name: assistantNameController.text.trim(),
-      llm_model: selectedModel.value!.name!,
-      tts_voice: selectedTtsVoice.value!.voiceId!,
-      tts_speech_speed: ttsSpeed.value,
-      tts_pitch: ttsPitch.value,
-      asr_speed: asrSpeed.value,
-      language: selectedLanguage.value,
-      character: characterController.text.trim(),
-      memory: memoryController.text.trim(),
-      memory_type: memoryType.value,
-      mcp_endpoints: null,
-      product_mcp_endpoints: null,
-    );
-    bool result = false;
-    if (agent != null) {
-      result = await XiaoZhiUtil.shared.updateAgent(agent!.id!, agentParams);
-    } else {
-      final agentId = await XiaoZhiUtil.shared.createAgent(agentParams);
-      result = agentId != null;
-    }
-
-    isLoading.value = false;
-    if (result) {
-      AppState.shared.showToast(
-        agent != null
-            ? "Agent edited successfully"
-            : "Agent created successfully",
+    try {
+      final agentParams = AgentCreate(
+        agent_name: agent?.agent_name ?? "StackChan AI Agent",
+        assistant_name: assistantNameController.text.trim(),
+        llm_model: selectedModel.value!.name!,
+        tts_voice: selectedTtsVoice.value!.voiceId!,
+        tts_speech_speed: ttsSpeed.value,
+        tts_pitch: ttsPitch.value,
+        asr_speed: asrSpeed.value,
+        language: selectedLanguage.value,
+        character: characterController.text.trim(),
+        memory: memoryController.text.trim(),
+        memory_type: memoryType.value,
+        mcp_endpoints: null,
+        product_mcp_endpoints: null,
       );
+
+      bool result;
+      if (agent != null) {
+        result = await XiaoZhiUtil.shared.updateAgent(agent!.id!, agentParams);
+      } else {
+        final agentId = await XiaoZhiUtil.shared.createAgent(agentParams);
+        result = agentId != null;
+      }
+
+      if (!_isCurrent(generation)) return false;
+      if (result) {
+        AppState.shared.showToast(
+          agent != null
+              ? "Agent edited successfully"
+              : "Agent created successfully",
+        );
+      }
+      return result;
+    } catch (_) {
+      if (_isCurrent(generation)) {
+        AppState.shared.showToast("Failed to save AI Agent settings.");
+      }
+      return false;
+    } finally {
+      if (_isCurrent(generation)) {
+        isLoading.value = false;
+      }
     }
-    return result;
   }
 
   @override
   void onClose() {
+    if (_disposed) return;
+    _disposed = true;
+    ++_lifecycleGeneration;
+    _languageWorker?.dispose();
+    _languageWorker = null;
     agentNameController.dispose();
     assistantNameController.dispose();
     characterController.dispose();
@@ -385,24 +462,40 @@ class _XiaoZhiWelcomePageState extends State<XiaoZhiWelcomePage> {
     init();
   }
 
-  Future<void> init() async {
-    model.initPageData(widget.isWelCome ?? false);
-    setState(() {});
-    model.ttsList.listen((list) {
-      setState(() {});
-    });
-    model.selectedTtsVoice.listen((data) {
-      setState(() {});
-    });
+  void init() {
+    unawaited(model.initPageData(widget.isWelCome ?? false));
+  }
+
+  Future<void> _stopVoicePreview() async {
+    try {
+      await MusicUtil.shared.stopMusic();
+    } catch (_) {
+      // Leaving the page must continue even if the preview player has failed.
+    }
+  }
+
+  Future<void> _playVoicePreview(String? url) async {
+    try {
+      await MusicUtil.shared.playUrlMusicOnce(
+        url,
+        completion: () {
+          if (mounted) {
+            setState(() {});
+          }
+        },
+      );
+    } catch (_) {
+      if (mounted) {
+        AppState.shared.showToast("Failed to play the voice preview.");
+      }
+    }
   }
 
   @override
   void dispose() {
-    MusicUtil.shared.stopMusic();
+    unawaited(_stopVoicePreview());
+    FocusManager.instance.primaryFocus?.unfocus();
     model.onClose();
-    if (mounted) {
-      FocusScope.of(context).unfocus();
-    }
     super.dispose();
   }
 
@@ -552,7 +645,7 @@ class _XiaoZhiWelcomePageState extends State<XiaoZhiWelcomePage> {
                         header: Text("Voice Settings"),
                         children: [
                           //voice tone
-                          ttsVoiceWidget(),
+                          Obx(() => ttsVoiceWidget()),
                           //translated comment
                           Obx(
                             () => buildSelectItem(
@@ -835,12 +928,7 @@ class _XiaoZhiWelcomePageState extends State<XiaoZhiWelcomePage> {
                       padding: .zero,
                       child: Icon(CupertinoIcons.speaker_2),
                       onPressed: () {
-                        MusicUtil.shared.playUrlMusicOnce(
-                          e.voiceDemo,
-                          completion: () {
-                            setState(() {});
-                          },
-                        );
+                        unawaited(_playVoicePreview(e.voiceDemo));
                       },
                     )
                   : null,

@@ -5,7 +5,6 @@ SPDX-License-Identifier: MIT
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -46,6 +45,14 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
   //verifytimeouttime:20Second(s)
   static const int _verifyTimeout = 20;
 
+  bool _acceptBleCallbacks = true;
+  BluetoothDevice? _verificationDevice;
+  int? _verificationGeneration;
+  BlueCharacteristicCallback? _characteristicCallback;
+  BlueNotificationCallback? _notificationCallback;
+  BlueReconnectCallback? _reconnectCallback;
+  int _activationGeneration = 0;
+
   String? _getDeviceId(BlueDeviceInfo blueDeviceInfo) {
     final Map<int, List<int>> manufacturerDataMap =
         blueDeviceInfo.advertisementData[ValueConstant.manufacturerData];
@@ -65,13 +72,20 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
 
   @override
   void dispose() {
+    final hadActiveBleSession =
+        _verificationDevice != null || connectDeviceId.value.isNotEmpty;
+    _acceptBleCallbacks = false;
+    ++_activationGeneration;
+    _verificationDevice = null;
+    _verificationGeneration = null;
     _connectTimer?.cancel();
     _verifyTimer?.cancel();
-    BlueUtil.shared.characteristicCallback = null;
-    BlueUtil.shared.wifiSetCharacteristicCall = null;
-    BlueUtil.shared.onReconnectSuccess = null;
+    _unregisterBlueCallbacks();
     connectDeviceId.value = "";
     isSuccess = false;
+    if (hadActiveBleSession) {
+      unawaited(BlueUtil.shared.disconnectCurrentPeripheral());
+    }
     super.dispose();
   }
 
@@ -82,21 +96,19 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
     super.initState();
     //enterbindStreamProcess / Thread,setbindflag
     _registerBlueCallbacks();
-    BlueUtil.shared.onReconnectSuccess = (device) {
-      if (mounted) {
+    _reconnectCallback = (device, generation) {
+      if (_isActiveBleConnection(device, generation)) {
         AppState.shared.showToast("Reconnected to device successfully.");
       }
-      _registerBlueCallbacks();
-      //reconnectafterretriggerdeviceverify（key：originallogiconlyhasfirstconnectwhentrigger）
-      if (BlueUtil.shared.writeWifiSetCharacteristic != null) {
-        startVerificationEquipment(BlueUtil.shared.writeWifiSetCharacteristic!);
-      }
     };
+    BlueUtil.shared.onReconnectSuccess = _reconnectCallback;
   }
 
   //resetconnectstate(System1wrap)
   void _resetConnectState() {
     connectDeviceId.value = "";
+    _verificationDevice = null;
+    _verificationGeneration = null;
     _connectTimer?.cancel();
     _verifyTimer?.cancel();
     if (mounted) {
@@ -104,53 +116,67 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
     }
   }
 
+  bool _isActiveBleConnection(BluetoothDevice device, int generation) {
+    return _acceptBleCallbacks &&
+        mounted &&
+        BlueUtil.shared.isConnectionCurrent(device, generation);
+  }
+
+  void _unregisterBlueCallbacks() {
+    if (identical(
+      BlueUtil.shared.characteristicCallback,
+      _characteristicCallback,
+    )) {
+      BlueUtil.shared.characteristicCallback = null;
+    }
+    if (identical(
+      BlueUtil.shared.wifiSetCharacteristicCall,
+      _notificationCallback,
+    )) {
+      BlueUtil.shared.wifiSetCharacteristicCall = null;
+    }
+    if (identical(BlueUtil.shared.onReconnectSuccess, _reconnectCallback)) {
+      BlueUtil.shared.onReconnectSuccess = null;
+    }
+    _characteristicCallback = null;
+    _notificationCallback = null;
+    _reconnectCallback = null;
+  }
+
   void _registerBlueCallbacks() {
-    BlueUtil.shared.characteristicCallback = (device, characteristic) async {
+    _characteristicCallback = (device, characteristic, generation) async {
+      if (!_isActiveBleConnection(device, generation)) return;
       final properties = characteristic.properties;
       final canWrite = properties.write || properties.writeWithoutResponse;
-      if (canWrite) {
-        final uuid = characteristic.uuid.toString();
-        if (uuid == BlueUtil.wifiSetCharacteristicUUID) {
-          BlueUtil.shared.writeWifiSetCharacteristic = characteristic;
-          if (Platform.isAndroid) {
-            await device
-                .requestMtu(512)
-                .then((mtu) {
-                                  })
-                .catchError((e) {
-                                    if (mounted) {
-                    AppState.shared.showToast(
-                      "Failed to set MTU. Device may not work properly.",
-                    );
-                  }
-                });
-          }
-          //enablefeatureValuenotify
-          try {
-            await characteristic.setNotifyValue(true);
-                        startVerificationEquipment(characteristic);
-          } catch (e) {
-                        _resetConnectState();
-            if (mounted) {
-              AppState.shared.showToast(
-                "Failed to enable device notification.",
-              );
-            }
-          }
-          return;
-        }
+      final uuid = characteristic.uuid.toString().toLowerCase();
+      if (!canWrite ||
+          uuid != BlueUtil.wifiSetCharacteristicUUID.toLowerCase()) {
+        return;
       }
-            if (mounted) {
-        AppState.shared.showToast("Device configuration feature not found.");
-      }
+
+      _verificationDevice = device;
+      _verificationGeneration = generation;
+
+      if (!_isActiveBleConnection(device, generation)) return;
+      await startVerificationEquipment(device, generation);
     };
-    BlueUtil.shared.wifiSetCharacteristicCall = (data) async {
+    BlueUtil.shared.characteristicCallback = _characteristicCallback;
+
+    _notificationCallback = (data) async {
+      final device = _verificationDevice;
+      final generation = _verificationGeneration;
+      if (device == null ||
+          generation == null ||
+          !_isActiveBleConnection(device, generation)) {
+        return;
+      }
+
       try {
-        String json = utf8.decode(data);
-                final model = BlueNotifyStateModel.fromJson(json);
+        final json = utf8.decode(data);
+        final model = BlueNotifyStateModel.fromJson(json);
 
         if (model == null) {
-                    if (mounted) {
+          if (_isActiveBleConnection(device, generation)) {
             AppState.shared.showToast("Failed to parse device data.");
           }
           return;
@@ -162,7 +188,7 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
           //toEncryptinfo
           String? data = model.data?.state;
           if (data == null) {
-                        if (mounted) {
+            if (_isActiveBleConnection(device, generation)) {
               AppState.shared.showToast(
                 "Device did not return encryption data.",
               );
@@ -174,7 +200,7 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
           final result = RsaUtil.decryptStackChanBlue(data);
           //newIncrease / Add:Decryptfail/lengthNot
           if (result.isEmpty || result.length < 12) {
-                        if (mounted) {
+            if (_isActiveBleConnection(device, generation)) {
               AppState.shared.showToast(
                 "Device verification decryption failed.",
               );
@@ -182,6 +208,7 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
             return;
           }
 
+          if (!_isActiveBleConnection(device, generation)) return;
           if (isSuccess) return;
           isSuccess = true;
           _connectTimer?.cancel(); //cancelconnecttimeouttimer
@@ -195,14 +222,16 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
 
           AppState.shared.deviceMac = macAddress;
           AppState.shared.connectWebSocket();
-          activateDevice(macAddress);
+          final activationGeneration = ++_activationGeneration;
+          unawaited(activateDevice(macAddress, activationGeneration));
         }
       } catch (e) {
-                if (mounted) {
+        if (_isActiveBleConnection(device, generation)) {
           AppState.shared.showToast("Failed to process device data.");
         }
       }
     };
+    BlueUtil.shared.wifiSetCharacteristicCall = _notificationCallback;
   }
 
   String formatMacAddress(String mac) {
@@ -219,10 +248,17 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
   }
 
   //activatedevice
-  Future<void> activateDevice(String macAddress) async {
+  bool _isActivationCurrent(int generation) {
+    return _acceptBleCallbacks &&
+        mounted &&
+        generation == _activationGeneration;
+  }
+
+  Future<void> activateDevice(String macAddress, int generation) async {
     try {
       ///startqueryagentconfiginfo
-      bool isConfiguration = await queryConfiguration(macAddress);
+      final isConfiguration = await queryConfiguration(macAddress, generation);
+      if (!_isActivationCurrent(generation)) return;
       if (!isConfiguration) {
         _resetConnectState();
         //activatefail(Alreadyhashint,NoRepeat)
@@ -234,33 +270,31 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
       }
 
       //binddevice
-      bool result = await AppState.shared.bindDevice(macAddress);
+      final result = await AppState.shared.bindDevice(macAddress);
+      if (!_isActivationCurrent(generation)) return;
+      if (!mounted) return;
       if (result) {
         _resetConnectState();
-        if (mounted) {
-          AppState.shared.showToast("Device bound successfully!");
-          //configjump
-          Navigator.of(context).push(
-            CupertinoPageRoute(builder: (context) => const DeviceNamePage()),
-          );
-        }
+        AppState.shared.showToast("Device bound successfully!");
+        //configjump
+        Navigator.of(context).push(
+          CupertinoPageRoute(builder: (context) => const DeviceNamePage()),
+        );
       } else {
         _resetConnectState();
         //newIncrease / Add:binddevicefail
-                if (mounted) {
-          AppState.shared.showToast("Device binding failed. Please try again.");
-        }
+        AppState.shared.showToast("Device binding failed. Please try again.");
       }
-    } catch (e) {
+    } catch (error, stackTrace) {
+      debugPrint("Device activation failed: $error\n$stackTrace");
+      if (!_isActivationCurrent(generation)) return;
       _resetConnectState();
-            if (mounted) {
-        AppState.shared.showToast("Device activation exception.");
-      }
+      AppState.shared.showToast("Device activation exception.");
     }
   }
 
   //querydeviceconfig(StreamProcess / Threaderrorhint)
-  Future<bool> queryConfiguration(String macAddress) async {
+  Future<bool> queryConfiguration(String macAddress, int generation) async {
     try {
       //1. querydevicewhetheractivated (laterNotAgainquery directactivate)
       // final devices = await XiaoZhiUtil.shared.getDevice(macAddress);
@@ -275,16 +309,15 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
       final generateLicense = await XiaoZhiUtil.shared.generateLicense(
         macAddress,
       );
+      if (!_isActivationCurrent(generation)) return false;
       if (generateLicense == null || generateLicense.serialNumber == null) {
-                if (mounted) {
-          AppState.shared.showToast("Failed to generate device license.");
-        }
+        AppState.shared.showToast("Failed to generate device license.");
         return false;
       }
 
       //3. activatedevice
       final serialNumber = generateLicense.serialNumber!;
-      final mac = MacAddressValidator.formatMac(AppState.shared.deviceMac);
+      final mac = MacAddressValidator.formatMac(macAddress);
       if (mac == null) {
         AppState.shared.showToast("Failed to format device MAC address.");
         return false;
@@ -293,10 +326,9 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
         serialNumber,
         mac,
       );
+      if (!_isActivationCurrent(generation)) return false;
       if (!activateResult) {
-                if (mounted) {
-          AppState.shared.showToast("Device cloud activation failed.");
-        }
+        AppState.shared.showToast("Device cloud activation failed.");
         return false;
       }
 
@@ -304,15 +336,16 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
       final checkDevice = await XiaoZhiUtil.shared.serialNumberGetDevice(
         serialNumber,
       );
+      if (!_isActivationCurrent(generation)) return false;
       if (checkDevice == null || checkDevice.agent_id == null) {
         //activatefail
         return false;
       } else {
         AppState.shared.showToast("Device activation successful");
-                return true;
+        return true;
       }
     } catch (e) {
-            if (mounted) {
+      if (_isActivationCurrent(generation)) {
         AppState.shared.showToast("Failed to query device configuration.");
       }
       return false;
@@ -339,9 +372,14 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
               ),
               onPressed: () {
                 AppState.shared.manualShutdownTime = DateTime.now();
-                BlueUtil.shared.characteristicCallback = null;
-                BlueUtil.shared.wifiSetCharacteristicCall = null;
-                BlueUtil.shared.onReconnectSuccess = null;
+                _acceptBleCallbacks = false;
+                ++_activationGeneration;
+                _verificationDevice = null;
+                _verificationGeneration = null;
+                _connectTimer?.cancel();
+                _verifyTimer?.cancel();
+                _unregisterBlueCallbacks();
+                unawaited(BlueUtil.shared.disconnectCurrentPeripheral());
                 CupertinoSheetRoute.popSheet(context);
               },
             ),
@@ -389,8 +427,15 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
                               _connectTimer = Timer(
                                 Duration(seconds: _connectTimeout),
                                 () {
+                                  if (connectDeviceId.value != deviceRemoteId) {
+                                    return;
+                                  }
                                   _resetConnectState();
-                                                                    if (mounted) {
+                                  unawaited(
+                                    BlueUtil.shared
+                                        .disconnectCurrentPeripheral(),
+                                  );
+                                  if (mounted) {
                                     AppState.shared.showToast(
                                       "Device connection timed out. Please try again.",
                                     );
@@ -409,8 +454,13 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
                                   deviceInfo.device,
                                 );
                               } catch (e) {
+                                if (!_acceptBleCallbacks ||
+                                    !mounted ||
+                                    connectDeviceId.value != deviceRemoteId) {
+                                  return;
+                                }
                                 _resetConnectState();
-                                                                if (mounted) {
+                                if (mounted) {
                                   AppState.shared.showToast(
                                     "Bluetooth connection failed: ${e.toString()}",
                                   );
@@ -453,18 +503,21 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
   }
 
   //startverifydevice(senddata)
-  void startVerificationEquipment(
-    BluetoothCharacteristic characteristic,
+  Future<void> startVerificationEquipment(
+    BluetoothDevice device,
+    int generation,
   ) async {
+    if (!_isActiveBleConnection(device, generation)) return;
+
     try {
-      if (mounted) {
-        AppState.shared.showToast("Verifying device...");
-      }
+      AppState.shared.showToast("Verifying device...");
       //startverifytimeouttimer
       _verifyTimer?.cancel();
       _verifyTimer = Timer(Duration(seconds: _verifyTimeout), () {
+        if (!_isActiveBleConnection(device, generation)) return;
         _resetConnectState();
-                if (mounted) {
+        unawaited(BlueUtil.shared.disconnectCurrentPeripheral());
+        if (mounted) {
           AppState.shared.showToast(
             "Device verification timed out. Please try again.",
           );
@@ -479,23 +532,23 @@ class _SelectBlueDeviceState extends State<SelectBlueDevice> {
       final jsonString = jsonEncode(data.toJson());
 
       //senddata
-      bool result = await BlueUtil.shared.sendWifiSetData(jsonString);
-      if (result) {
-              } else {
+      final result = await BlueUtil.shared.sendWifiSetData(
+        jsonString,
+        expectedDevice: device,
+        connectionGeneration: generation,
+      );
+      if (!_isActiveBleConnection(device, generation)) return;
+      if (!result) {
         _verifyTimer?.cancel();
-        AppState.shared.showToast(
-          "The equipment may have been disconnected. Please reconfigure it on the StackChan end.",
+        throw StateError(
+          "The equipment may have been disconnected. "
+          "Please reconfigure it on the StackChan end.",
         );
-        _resetConnectState();
       }
-    } catch (e) {
+    } catch (error, stackTrace) {
+      if (!_isActiveBleConnection(device, generation)) return;
       _verifyTimer?.cancel();
-      _resetConnectState();
-            if (mounted) {
-        AppState.shared.showToast(
-          "Failed to send device verification command.",
-        );
-      }
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 }

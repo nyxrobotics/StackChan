@@ -47,6 +47,15 @@ class DanceModel extends GetxController {
 
 class _DanceState extends State<Dance> {
   late DanceModel model;
+  int _playbackGeneration = 0;
+  bool _disposed = false;
+
+  bool _isPlaybackCurrent(int generation) {
+    return !_disposed &&
+        mounted &&
+        generation == _playbackGeneration &&
+        model.isRun.value;
+  }
 
   @override
   void initState() {
@@ -57,10 +66,11 @@ class _DanceState extends State<Dance> {
 
   @override
   void dispose() {
+    _disposed = true;
     model.isRun.value = false;
     model.isLoop.value = false; //disposewhenresetloopstate
-    model.onClose();
     stopDance(); //disposewhenstopplay
+    model.onClose();
     super.dispose();
   }
 
@@ -109,6 +119,7 @@ class _DanceState extends State<Dance> {
     }
     //Single frameplayinThendirectreturn
     if (model.isPlayingSingle.value) return;
+    final generation = ++_playbackGeneration;
 
     final danceDataList = model.danceInfo.value.danceData;
     if (danceDataList.isEmpty) {
@@ -141,49 +152,49 @@ class _DanceState extends State<Dance> {
           await Future.delayed(Duration(milliseconds: currentData.durationMs));
         } else if (AppState.shared.deviceControlMode == 1) {
           //BluetoothControlmode:directsendFramedatatoBluetoothdevice
-          await BlueUtil.shared.sendDanceData(currentData);
-          //Delay(+70ms forAligneddeviceresponselogic)
-          await Future.delayed(
+          final sent = await BlueUtil.shared.sendDanceDataWithinFrame(
+            currentData,
             Duration(milliseconds: currentData.durationMs + 70),
           );
+          if (!sent) {
+            throw StateError("Bluetooth dance frame could not be sent");
+          }
         }
       } catch (e) {
-                Get.snackbar("错误", "播放失败: $e", snackPosition: SnackPosition.BOTTOM);
+        if (!_disposed && mounted && generation == _playbackGeneration) {
+          Get.snackbar("错误", "播放失败: $e", snackPosition: SnackPosition.BOTTOM);
+        }
       } finally {
         //playcompleteafterresetstate
-        model.isPlayingSingle.value = false;
-        model.dancePlayIndex.value = -1;
+        if (!_disposed && generation == _playbackGeneration) {
+          model.isPlayingSingle.value = false;
+          model.dancePlayIndex.value = -1;
+        }
       }
     }
 
-    playSingleFrame();
+    unawaited(playSingleFrame());
   }
 
   ///playwholedance（supportloop）
   void startDance() {
     //stopallCurrentlyinperformplay
-    stopDance();
+    stopDance(stopMusic: false);
+    final generation = _playbackGeneration;
 
     final danceDataList = model.danceInfo.value.danceData;
     if (danceDataList.isEmpty) {
       Get.snackbar("提示", "暂无舞蹈数据可播放", snackPosition: SnackPosition.BOTTOM);
       model.isRun.value = false;
+      unawaited(_stopMusicSafely());
       return;
     }
 
-    //playAssociatedmusic(ifhas)
-    if (model.danceInfo.value.musicUrl != null &&
-        model.danceInfo.value.musicUrl!.isNotEmpty) {
-      MusicUtil.shared.stopMusic(); //stoporiginalhasmusic
-      MusicUtil.shared.playMusic(
-        model.danceInfo.value.musicInfo,
-        isLoop: model.isLoop.value,
-      ); //musicsyncloop
-    }
+    unawaited(_replaceDanceMusic(generation));
 
     //wrapwholeplaylogic(forloopCall)
     void playFullDance() {
-      if (!model.isRun.value) return; //stopexit
+      if (!_isPlaybackCurrent(generation)) return; //stopexit
 
       if (AppState.shared.deviceControlMode == 0) {
         //NetworkControlmode:1One-timesendalldancedata
@@ -200,7 +211,7 @@ class _DanceState extends State<Dance> {
         model.playTimer = Timer.periodic(const Duration(milliseconds: 50), (
           timer,
         ) {
-          if (!model.isRun.value) {
+          if (!_isPlaybackCurrent(generation)) {
             timer.cancel();
             return;
           }
@@ -228,75 +239,71 @@ class _DanceState extends State<Dance> {
             timer.cancel();
 
             //ifenableloop,Thenreplay
-            if (model.isLoop.value && model.isRun.value) {
-              //replaymusic,Maintain / Keepsync
-              if (model.danceInfo.value.musicUrl != null &&
-                  model.danceInfo.value.musicUrl!.isNotEmpty) {
-                MusicUtil.shared.stopMusic();
-                MusicUtil.shared.playMusic(
-                  model.danceInfo.value.musicInfo,
-                  isLoop: true,
-                );
-              }
-              Future.delayed(const Duration(milliseconds: 100), () {
-                if (model.isRun.value) playFullDance();
-              });
-            } else {
-              stopDance();
+            if (model.isLoop.value && _isPlaybackCurrent(generation)) {
+              playFullDance();
+            } else if (_isPlaybackCurrent(generation)) {
               model.isRun.value = false;
+              stopDance();
             }
           }
         });
       } else if (AppState.shared.deviceControlMode == 1) {
         //BluetoothControlmode:frame by framesenddata(supportloop)
         Future<void> playAllFrames() async {
-          for (int i = 0; i < danceDataList.length; i++) {
-            //checkwhetherNeedstopplay
-            if (!model.isRun.value) break;
+          var sendFailed = false;
+          do {
+            for (int i = 0; i < danceDataList.length; i++) {
+              if (!_isPlaybackCurrent(generation)) return;
 
-            final DanceData currentData = danceDataList[i];
-            model.dancePlayIndex.value = i; //highlightcurrent frame
+              final DanceData currentData = danceDataList[i];
+              model.dancePlayIndex.value = i; //highlightcurrent frame
 
-            try {
-              //sendBluetoothdata
-              await BlueUtil.shared.sendDanceData(currentData);
-              //WaitFrameduration(+70ms forAligneddeviceresponse)
-              await Future.delayed(
-                Duration(milliseconds: currentData.durationMs + 70),
-              );
-            } catch (e) {
-                            break;
-            }
-          }
-
-          //playcompleteafterhandle
-          model.dancePlayIndex.value = -1;
-          if (model.isRun.value) {
-            //loopmodeThenreplay
-            if (model.isLoop.value) {
-              //replaymusic,Maintain / Keepsync
-              if (model.danceInfo.value.musicUrl != null &&
-                  model.danceInfo.value.musicUrl!.isNotEmpty) {
-                MusicUtil.shared.stopMusic();
-                MusicUtil.shared.playMusic(
-                  model.danceInfo.value.musicInfo,
-                  isLoop: true,
+              try {
+                final sent = await BlueUtil.shared.sendDanceDataWithinFrame(
+                  currentData,
+                  Duration(milliseconds: currentData.durationMs + 70),
                 );
+                if (!sent) {
+                  sendFailed = true;
+                  break;
+                }
+              } catch (_) {
+                sendFailed = true;
+                break;
               }
-              Future.delayed(const Duration(milliseconds: 100), () {
-                if (model.isRun.value) playAllFrames();
-              });
-            } else {
-              stopDance();
-              model.isRun.value = false;
             }
+          } while (!sendFailed &&
+              model.isLoop.value &&
+              _isPlaybackCurrent(generation));
+
+          if (!_isPlaybackCurrent(generation)) return;
+          if (sendFailed) {
+            model.isRun.value = false;
+            stopDance();
+            return;
           }
+          model.isRun.value = false;
+          stopDance();
         }
 
         //willtaskaddlist(For easycancel)
         final task = playAllFrames();
         model.bluetoothPlayTasks.add(task);
-        task.whenComplete(() => model.bluetoothPlayTasks.remove(task));
+        unawaited(
+          task.then<void>(
+            (_) => model.bluetoothPlayTasks.remove(task),
+            onError: (Object error, StackTrace stackTrace) {
+              debugPrint(
+                "Bluetooth dance playback failed: $error\n$stackTrace",
+              );
+              model.bluetoothPlayTasks.remove(task);
+              if (_isPlaybackCurrent(generation)) {
+                model.isRun.value = false;
+                stopDance();
+              }
+            },
+          ),
+        );
       }
     }
 
@@ -304,10 +311,41 @@ class _DanceState extends State<Dance> {
     playFullDance();
   }
 
+  Future<void> _replaceDanceMusic(int generation) async {
+    try {
+      await MusicUtil.shared.stopMusic();
+      if (!_isPlaybackCurrent(generation)) return;
+
+      final danceInfo = model.danceInfo.value;
+      if (danceInfo.musicUrl?.isNotEmpty != true ||
+          danceInfo.musicInfo == null) {
+        return;
+      }
+      await MusicUtil.shared.playMusic(
+        danceInfo.musicInfo,
+        isLoop: model.isLoop.value,
+      );
+    } catch (_) {
+      // Dance motion can continue when optional music playback fails.
+    }
+  }
+
+  Future<void> _stopMusicSafely() async {
+    try {
+      await MusicUtil.shared.stopMusic();
+    } catch (_) {
+      // Playback state below must still be reset if the audio player fails.
+    }
+  }
+
   ///stopallplay
-  void stopDance() {
+  void stopDance({bool stopMusic = true}) {
+    ++_playbackGeneration;
+
     //stopmusic
-    MusicUtil.shared.stopMusic();
+    if (stopMusic) {
+      unawaited(_stopMusicSafely());
+    }
 
     //resetplaystate
     model.isPlayingSingle.value = false;

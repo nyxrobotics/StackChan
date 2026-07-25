@@ -42,6 +42,16 @@ class _DanceListPageState extends State<DanceListPage> {
   bool isPlaying = false;
   Timer? _playTimer;
   final List<Future<void>?> _bluetoothPlayTasks = [];
+  int _playbackGeneration = 0;
+  bool _disposed = false;
+
+  bool _isPlaybackCurrent(int generation, int playId) {
+    return !_disposed &&
+        mounted &&
+        isPlaying &&
+        generation == _playbackGeneration &&
+        model.runId.value == playId;
+  }
 
   @override
   void initState() {
@@ -49,11 +59,7 @@ class _DanceListPageState extends State<DanceListPage> {
     BlueUtil.shared.connectionStateChanged = (device, status) {
       model.isConnectBlue.value = status;
     };
-    if (BlueUtil.shared.currentPeripheral == null) {
-      model.isConnectBlue.value = false;
-    } else {
-      model.isConnectBlue.value = true;
-    }
+    model.isConnectBlue.value = BlueUtil.shared.hasReadyConnection;
     if (AppState.shared.deviceControlMode == 1) {
       BlueUtil.shared.blueMode = 2;
     }
@@ -62,15 +68,14 @@ class _DanceListPageState extends State<DanceListPage> {
 
   @override
   void dispose() {
-    model.onClose();
+    _disposed = true;
     stopPlay();
     if (AppState.shared.deviceControlMode == 1) {
       BlueUtil.shared.blueMode = 1;
     }
     BlueUtil.shared.connectionStateChanged = null;
-    if (mounted) {
-      FocusScope.of(context).unfocus();
-    }
+    FocusManager.instance.primaryFocus?.unfocus();
+    model.onClose();
     super.dispose();
   }
 
@@ -606,8 +611,9 @@ class _DanceListPageState extends State<DanceListPage> {
       return;
     }
 
+    final currentPlayId = model.runId.value;
     final currentDance = model.list.firstWhere(
-      (dance) => dance.id == model.runId.value,
+      (dance) => dance.id == currentPlayId,
       orElse: () => DanceList(),
     );
 
@@ -620,34 +626,58 @@ class _DanceListPageState extends State<DanceListPage> {
     }
 
     final danceList = currentDance.danceData;
+    final generation = ++_playbackGeneration;
     isPlaying = true;
-    MusicUtil.shared.stopMusic();
+    unawaited(MusicUtil.shared.stopMusic());
 
     //checkmusicinfoandfilewhetherhas
     var musicInfo = currentDance.musicInfo;
-    if (musicInfo == null || !(await File(musicInfo.filePath).exists())) {
-      if (currentDance.musicUrl != null && currentDance.musicUrl!.isNotEmpty) {
-        //musicinfoinvalidorfilenot exist，reGet
-        currentDance.isLoading = true;
-        model.list.refresh();
-        musicInfo = await MusicUtil.shared.getMusicInfoAsync(
-          currentDance.musicUrl!,
-        );
-        currentDance.musicInfo = musicInfo;
-        currentDance.isLoading = false;
-        model.list.refresh();
-      }
+    try {
+      final musicFileExists =
+          musicInfo != null && await File(musicInfo.filePath).exists();
+      if (!_isPlaybackCurrent(generation, currentPlayId)) return;
 
-      if (musicInfo == null) {
-        AppState.shared.showToast(
-          "Music file is missing, please try again later.",
-        );
-        stopPlay();
-        return;
+      if (!musicFileExists) {
+        if (currentDance.musicUrl != null &&
+            currentDance.musicUrl!.isNotEmpty) {
+          //musicinfoinvalidorfilenot exist，reGet
+          currentDance.isLoading = true;
+          model.list.refresh();
+          try {
+            musicInfo = await MusicUtil.shared.getMusicInfoAsync(
+              currentDance.musicUrl!,
+            );
+          } finally {
+            if (!_disposed) {
+              currentDance.isLoading = false;
+              model.list.refresh();
+            }
+          }
+          if (!_isPlaybackCurrent(generation, currentPlayId)) return;
+          currentDance.musicInfo = musicInfo;
+          model.list.refresh();
+        }
+
+        if (musicInfo == null) {
+          AppState.shared.showToast(
+            "Music file is missing, please try again later.",
+          );
+          stopPlay();
+          return;
+        }
       }
+    } catch (error, stackTrace) {
+      debugPrint("Failed to prepare dance music: $error\n$stackTrace");
+      if (_isPlaybackCurrent(generation, currentPlayId)) {
+        AppState.shared.showToast("Failed to load the dance music.");
+        stopPlay();
+      }
+      return;
     }
-    MusicUtil.shared.playMusic(musicInfo);
-    final currentPlayId = model.runId.value;
+
+    if (!_isPlaybackCurrent(generation, currentPlayId)) return;
+    final playableMusic = musicInfo;
+    unawaited(_playDanceMusic(playableMusic, currentPlayId, generation));
     final currentLoopMode = model.isLoopMode.value;
     if (AppState.shared.deviceControlMode == 0) {
       sendDanceData(danceList);
@@ -656,20 +686,25 @@ class _DanceListPageState extends State<DanceListPage> {
         0,
         (sum, data) => sum + (data.durationMs),
       );
-      double totalDurationSeconds = totalDurationMs / 1000.0;
-
-      _playTimer = Timer(Duration(seconds: totalDurationSeconds.round()), () {
-        if (isPlaying && model.runId.value == currentPlayId) {
+      _playTimer = Timer(Duration(milliseconds: totalDurationMs), () {
+        if (_isPlaybackCurrent(generation, currentPlayId)) {
           if (currentLoopMode) {
             isPlaying = false;
-            startPlay(); //async，
+            unawaited(startPlay());
           } else {
             stopPlay();
           }
         }
       });
     } else if (AppState.shared.deviceControlMode == 1) {
-      _playBluetoothDance(danceList, currentPlayId, currentLoopMode);
+      unawaited(
+        _playBluetoothDance(
+          danceList,
+          currentPlayId,
+          currentLoopMode,
+          generation,
+        ),
+      );
     }
   }
 
@@ -677,11 +712,13 @@ class _DanceListPageState extends State<DanceListPage> {
     List<DanceData> danceList,
     int currentPlayId,
     bool currentLoopMode,
+    int generation,
   ) async {
     final task = _playBluetoothFrames(
       danceList,
       currentPlayId,
       currentLoopMode,
+      generation,
     );
     _bluetoothPlayTasks.add(task);
     await task;
@@ -692,32 +729,57 @@ class _DanceListPageState extends State<DanceListPage> {
     List<DanceData> danceList,
     int currentPlayId,
     bool currentLoopMode,
+    int generation,
   ) async {
+    var sendFailed = false;
     for (var danceData in danceList) {
-      if (!isPlaying || model.runId.value != currentPlayId) {
+      if (!_isPlaybackCurrent(generation, currentPlayId)) {
         break;
       }
 
-      await BlueUtil.shared.sendDanceData(danceData);
-
-      int waitMs = (danceData.durationMs) + 90;
-      await Future.delayed(Duration(milliseconds: waitMs));
+      final sent = await BlueUtil.shared.sendDanceDataWithinFrame(
+        danceData,
+        Duration(milliseconds: danceData.durationMs + 90),
+      );
+      if (!sent) {
+        sendFailed = true;
+        break;
+      }
     }
 
-    if (isPlaying && model.runId.value == currentPlayId) {
-      if (currentLoopMode) {
-        isPlaying = false;
-        startPlay(); //async，
-      } else {
+    if (!_isPlaybackCurrent(generation, currentPlayId)) return;
+    if (sendFailed) {
+      stopPlay();
+      return;
+    }
+    if (currentLoopMode) {
+      isPlaying = false;
+      unawaited(startPlay());
+    } else {
+      stopPlay();
+    }
+  }
+
+  Future<void> _playDanceMusic(
+    MusicInfo musicInfo,
+    int currentPlayId,
+    int generation,
+  ) async {
+    try {
+      await MusicUtil.shared.playMusic(musicInfo);
+    } catch (_) {
+      if (_isPlaybackCurrent(generation, currentPlayId)) {
+        AppState.shared.showToast("Failed to play the dance music.");
         stopPlay();
       }
     }
   }
 
   void stopPlay() {
+    ++_playbackGeneration;
     isPlaying = false;
     model.runId.value = -1;
-    MusicUtil.shared.stopMusic();
+    unawaited(MusicUtil.shared.stopMusic());
 
     _playTimer?.cancel();
     _playTimer = null;

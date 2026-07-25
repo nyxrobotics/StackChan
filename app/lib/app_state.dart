@@ -3,6 +3,7 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart' show Response;
@@ -40,26 +41,67 @@ class AppState extends GetxController {
   AppState();
 
   Future<void> initData() async {
-    deviceMac = await asyncPrefs.getString(ValueConstant.deviceMac) ?? "";
-    _deviceId.value =
-        await asyncPrefs.getString(ValueConstant.deviceId) ?? uuid.v4();
-    _deviceControlMode.value =
-        await asyncPrefs.getInt(ValueConstant.deviceControlMode) ?? 0;
-    isInitialization = true;
-    isLogin.value = await asyncPrefs.getBool(ValueConstant.isLogin) ?? false;
+    try {
+      _deviceMac.value =
+          await asyncPrefs.getString(ValueConstant.deviceMac) ?? "";
+    } catch (_) {
+      _deviceMac.value = "";
+    }
+
+    String? storedDeviceId;
+    try {
+      storedDeviceId = await asyncPrefs.getString(ValueConstant.deviceId);
+    } catch (_) {
+      storedDeviceId = null;
+    }
+    _deviceId.value = (storedDeviceId == null || storedDeviceId.isEmpty)
+        ? uuid.v4()
+        : storedDeviceId;
+    if (storedDeviceId == null || storedDeviceId.isEmpty) {
+      try {
+        await asyncPrefs.setString(ValueConstant.deviceId, _deviceId.value);
+      } catch (_) {
+        // A stable in-memory ID still allows this session to proceed.
+      }
+    }
+
+    try {
+      _deviceControlMode.value =
+          await asyncPrefs.getInt(ValueConstant.deviceControlMode) ?? 0;
+    } catch (_) {
+      _deviceControlMode.value = 0;
+    }
+
+    try {
+      isLogin.value = await asyncPrefs.getBool(ValueConstant.isLogin) ?? false;
+    } catch (_) {
+      isLogin.value = false;
+    }
 
     ///Set status bar and navigation bar to transparent
-    SystemUiOverlayStyle style = SystemUiOverlayStyle(
-      statusBarColor: CupertinoColors.transparent,
-    );
-    SystemChrome.setSystemUIOverlayStyle(style);
-    SystemChrome.setEnabledSystemUIMode(.manual, overlays: [.top, .bottom]);
+    try {
+      const style = SystemUiOverlayStyle(
+        statusBarColor: CupertinoColors.transparent,
+      );
+      SystemChrome.setSystemUIOverlayStyle(style);
+      await SystemChrome.setEnabledSystemUIMode(
+        .manual,
+        overlays: [.top, .bottom],
+      );
 
-    ///Lock screen orientation
-    SystemChrome.setPreferredOrientations([.portraitDown, .portraitUp]);
+      ///Lock screen orientation
+      await SystemChrome.setPreferredOrientations([.portraitDown, .portraitUp]);
+    } catch (_) {
+      // Platform UI configuration is optional and must not block app startup.
+    }
 
     ///Initialize package manager
-    packageInfo = await PackageInfo.fromPlatform();
+    try {
+      packageInfo = await PackageInfo.fromPlatform();
+    } catch (_) {
+      packageInfo = null;
+    }
+    isInitialization = true;
   }
 
   final uuid = Uuid();
@@ -71,18 +113,46 @@ class AppState extends GetxController {
   final RxBool isLogin = RxBool(false);
 
   Future<void> setIsLogin(bool login) async {
-    await asyncPrefs.setBool(ValueConstant.isLogin, login);
     isLogin.value = login;
+    try {
+      await asyncPrefs.setBool(ValueConstant.isLogin, login);
+    } catch (_) {
+      // Authentication state for this session must remain usable.
+    }
   }
 
   final RxString _deviceMac = "".obs;
+  Future<void> _deviceMacPersistTail = Future.value();
 
   String get deviceMac => _deviceMac.value;
 
   set deviceMac(String mac) {
+    final previousMac = _deviceMac.value;
     _deviceMac.value = mac;
-    asyncPrefs.setString(ValueConstant.deviceMac, _deviceMac.value);
-    startSearchXiaoZhiConfig(mac);
+    if (mac != previousMac) {
+      WebSocketUtil.shared.disconnect();
+    }
+    _deviceMacPersistTail = _deviceMacPersistTail.then(
+      (_) => _persistDeviceMac(mac),
+    );
+    unawaited(_deviceMacPersistTail);
+    unawaited(_refreshXiaoZhiConfig(mac));
+  }
+
+  Future<void> _persistDeviceMac(String mac) async {
+    try {
+      await asyncPrefs.setString(ValueConstant.deviceMac, mac);
+    } catch (_) {
+      // Keep the in-memory selection usable even when persistence is unavailable.
+    }
+  }
+
+  Future<void> _refreshXiaoZhiConfig(String mac) async {
+    try {
+      await startSearchXiaoZhiConfig(mac);
+    } catch (_) {
+      // Device switching must not fail because optional config refresh failed.
+    }
   }
 
   bool get hasValidDeviceMac => _deviceMac.isNotEmpty;
@@ -104,12 +174,24 @@ class AppState extends GetxController {
   Rxn<Device> deviceInfo = Rxn();
 
   final RxInt _deviceControlMode = RxInt(1);
+  Future<void> _controlModePersistTail = Future.value();
 
   int get deviceControlMode => _deviceControlMode.value;
 
   set deviceControlMode(int deviceControlMode) {
     _deviceControlMode.value = deviceControlMode;
-    asyncPrefs.setInt(ValueConstant.deviceControlMode, deviceControlMode);
+    _controlModePersistTail = _controlModePersistTail.then(
+      (_) => _persistControlMode(deviceControlMode),
+    );
+    unawaited(_controlModePersistTail);
+  }
+
+  Future<void> _persistControlMode(int mode) async {
+    try {
+      await asyncPrefs.setInt(ValueConstant.deviceControlMode, mode);
+    } catch (_) {
+      // The current session can continue with its in-memory control mode.
+    }
   }
 
   Function(String?)? toastFunction;
@@ -125,12 +207,22 @@ class AppState extends GetxController {
   ///Location info
   final Rxn<Position> currentLocation = Rxn<Position>();
   final RxBool isLocationAvailable = false.obs;
+  StreamSubscription<Position>? _locationSubscription;
+  int _locationGeneration = 0;
+  int _locationRequestGeneration = 0;
 
   bool showBlueDevicesSetStep = false;
 
   Future<void> logout() async {
+    WebSocketUtil.shared.disconnect();
+    await stopLocationUpdates();
+    currentLocation.value = null;
     await setIsLogin(false);
-    await asyncPrefs.remove(ValueConstant.token);
+    try {
+      await asyncPrefs.remove(ValueConstant.token);
+    } catch (_) {
+      // Local cleanup below must still complete if storage is unavailable.
+    }
     userInfo.value = null;
     deviceInfo.value = null;
     deviceMac = "";
@@ -221,8 +313,7 @@ class AppState extends GetxController {
               break;
           }
         }
-      } else if (message is String) {
-              }
+      } else if (message is String) {}
     });
   }
 
@@ -396,9 +487,11 @@ class AppState extends GetxController {
 
   ///Get current phone location
   Future<void> obtainLocation() async {
+    final generation = ++_locationRequestGeneration;
     try {
       //Check if location service is enabled
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (generation != _locationRequestGeneration) return;
       if (!serviceEnabled) {
         showToast(
           "Location service is not enabled. Please enable the location service first",
@@ -409,8 +502,10 @@ class AppState extends GetxController {
 
       //Check location permission
       LocationPermission permission = await Geolocator.checkPermission();
+      if (generation != _locationRequestGeneration) return;
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
+        if (generation != _locationRequestGeneration) return;
         if (permission == LocationPermission.denied) {
           showToast(
             "The location permission was denied, and thus the location information could not be obtained",
@@ -439,29 +534,72 @@ class AppState extends GetxController {
         ),
       );
 
+      if (generation != _locationRequestGeneration) return;
       currentLocation.value = position;
       isLocationAvailable.value = true;
-          } catch (e) {
+    } catch (e) {
+      if (generation != _locationRequestGeneration) return;
       showToast("Failed to obtain location: ${e.toString()}");
       isLocationAvailable.value = false;
-          }
+    }
   }
 
   ///Continuously listen for location changes
   void startLocationUpdates() {
-    Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 100,
-      ),
-    ).listen(
-      (Position position) {
-        currentLocation.value = position;
-        isLocationAvailable.value = true;
-      },
-      onError: (e) {
-                isLocationAvailable.value = false;
-      },
-    );
+    if (_locationSubscription != null) {
+      return;
+    }
+
+    ++_locationRequestGeneration;
+    final generation = ++_locationGeneration;
+    final subscription =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 100,
+          ),
+        ).listen(
+          (Position position) {
+            if (generation != _locationGeneration) {
+              return;
+            }
+            currentLocation.value = position;
+            isLocationAvailable.value = true;
+          },
+          onError: (Object _) {
+            if (generation == _locationGeneration) {
+              _locationSubscription = null;
+              isLocationAvailable.value = false;
+            }
+          },
+          onDone: () {
+            if (generation == _locationGeneration) {
+              _locationSubscription = null;
+              isLocationAvailable.value = false;
+            }
+          },
+          cancelOnError: true,
+        );
+    _locationSubscription = subscription;
+  }
+
+  Future<void> stopLocationUpdates() async {
+    ++_locationRequestGeneration;
+    ++_locationGeneration;
+    final subscription = _locationSubscription;
+    _locationSubscription = null;
+    isLocationAvailable.value = false;
+    try {
+      await subscription?.cancel();
+    } catch (_) {
+      // Location shutdown must not prevent logout or controller disposal.
+    }
+  }
+
+  @override
+  void onClose() {
+    unawaited(stopLocationUpdates());
+    WebSocketUtil.shared.disconnect();
+    super.onClose();
   }
 }

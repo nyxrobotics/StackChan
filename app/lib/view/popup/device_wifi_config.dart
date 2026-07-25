@@ -3,6 +3,7 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -34,6 +35,8 @@ class WifiCacheKeys {
 class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
   String _wifiName = "";
   String _wifiPassword = "";
+  int _wifiCallbackGeneration = 0;
+  bool _failureDialogVisible = false;
 
   late TextEditingController _nameTextEditingController;
   late TextEditingController _passwordTextEditingController;
@@ -51,6 +54,7 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
   /// Register native handler for iOS WiFi name callback
   void _registerNativeHandler() {
     NativeBridge.shared.registerHandler(Method.wifiName, (message) async {
+      if (!mounted) return;
       if (message.arguments is String) {
         final wifiName = message.arguments as String;
         if (wifiName.isNotEmpty) {
@@ -68,8 +72,9 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
     try {
       await AppState.asyncPrefs.setString(WifiCacheKeys.wifiName, name);
       await AppState.asyncPrefs.setString(WifiCacheKeys.wifiPassword, password);
-          } catch (e) {
-            AppState.shared.showToast("Failed to save WiFi information");
+    } catch (error, stackTrace) {
+      debugPrint("Failed to cache WiFi information: $error\n$stackTrace");
+      AppState.shared.showToast("Failed to save WiFi information");
     }
   }
 
@@ -82,6 +87,8 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
       final cachedPassword =
           await AppState.asyncPrefs.getString(WifiCacheKeys.wifiPassword) ?? "";
 
+      if (!mounted) return false;
+
       if (cachedName.isNotEmpty) {
         setState(() {
           _wifiName = cachedName;
@@ -89,19 +96,21 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
           _nameTextEditingController.text = cachedName;
           _passwordTextEditingController.text = cachedPassword;
         });
-                return true;
+        return true;
       }
       return false;
-    } catch (e) {
-            return false;
+    } catch (error, stackTrace) {
+      debugPrint("Failed to load cached WiFi information: $error\n$stackTrace");
+      return false;
     }
   }
 
   /// Initialize WiFi info - cache first, then system if no cache
   Future<void> _initializeWifiInfo() async {
     final hasCache = await _loadCachedWifiInfo();
+    if (!mounted) return;
     if (!hasCache) {
-            await _fetchSystemWifiName();
+      await _fetchSystemWifiName();
     }
   }
 
@@ -110,14 +119,15 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
     if (Platform.isAndroid) {
       // Android: Request permission first, then fetch if granted
       final status = await Permission.location.request();
+      if (!mounted) return;
       if (status.isGranted) {
         await _fetchAndroidWifiName();
-      } else {
-              }
+      }
     } else if (Platform.isIOS) {
       // iOS: Request permission and immediately fetch via native bridge
       // (no need to wait for permission result on iOS)
       await Permission.locationWhenInUse.request();
+      if (!mounted) return;
       NativeBridge.shared.sendMessage(Method.wifiName);
     }
   }
@@ -128,6 +138,8 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
       final networkInfo = NetworkInfo();
       String? wifiName = await networkInfo.getWifiName();
 
+      if (!mounted) return;
+
       if (wifiName != null && wifiName.isNotEmpty) {
         final cleanWifiName = wifiName.replaceAll('"', '');
         if (cleanWifiName.isNotEmpty && cleanWifiName != "unknown ssid") {
@@ -135,29 +147,30 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
             _wifiName = cleanWifiName;
             _nameTextEditingController.text = cleanWifiName;
           });
-                  }
+        }
       }
-    } on PlatformException catch (e) {
-          }
+    } on PlatformException catch (error, stackTrace) {
+      debugPrint("Failed to read Android WiFi name: $error\n$stackTrace");
+    }
   }
 
   @override
   void dispose() {
+    ++_wifiCallbackGeneration;
     NativeBridge.shared.unregisterHandler(Method.wifiName);
     _nameTextEditingController.dispose();
     _passwordTextEditingController.dispose();
     BlueUtil.shared.characteristicCallback = null;
     BlueUtil.shared.wifiSetCharacteristicCall = null;
     BlueUtil.shared.onReconnectSuccess = null;
-    if (mounted) {
-      FocusScope.of(context).unfocus();
-    }
+    FocusManager.instance.primaryFocus?.unfocus();
     super.dispose();
   }
 
   bool isSuccess = false;
 
   void dismiss() {
+    ++_wifiCallbackGeneration;
     AppState.shared.manualShutdownTime = DateTime.now();
     BlueUtil.shared.characteristicCallback = null;
     BlueUtil.shared.wifiSetCharacteristicCall = null;
@@ -172,50 +185,63 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
   }
 
   void _onAppear() {
+    final generation = ++_wifiCallbackGeneration;
     BlueUtil.shared.wifiSetCharacteristicCall = (data) {
-      String json = utf8.decode(data);
-      final model = BlueNotifyStateModel.fromJson(json);
-      if (model?.data?.state != null) {
-        String state = model!.data!.state!;
+      if (!mounted || generation != _wifiCallbackGeneration) return;
+      try {
+        final json = utf8.decode(data);
+        final state = BlueNotifyStateModel.fromJson(json)?.data?.state;
         if (state == "wifiConnecting") {
           setState(() {});
         } else if (state == "wifiConnected") {
-          if (isSuccess) {
-            return;
-          }
+          if (isSuccess) return;
           isSuccess = true;
           setState(() {});
           dismiss();
-        } else if (state == "wifiConnectFailed") {
+        } else if (state == "wifiConnectFailed" && !_failureDialogVisible) {
+          _failureDialogVisible = true;
           setState(() {});
-          Future.delayed(const Duration(seconds: 1), () {
-            if (mounted) {
-              showCupertinoDialog(
-                context: context,
-                builder: (context) {
-                  return CupertinoAlertDialog(
-                    title: const Text("Configuration failed"),
-                    content: const Text(
-                      "Configuration failed, please re-enter wifi name and password",
-                    ),
-                    actions: [
-                      CupertinoDialogAction(
-                        child: const Text("OK"),
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                          _passwordTextEditingController.clear();
-                          FocusScope.of(context).requestFocus(FocusNode());
-                        },
-                      ),
-                    ],
-                  );
-                },
-              );
-            }
-          });
+          unawaited(_showWifiFailureDialog(generation));
         }
+      } catch (_) {
+        // Ignore malformed or stale Bluetooth status notifications.
       }
     };
+  }
+
+  Future<void> _showWifiFailureDialog(int generation) async {
+    try {
+      if (!mounted || generation != _wifiCallbackGeneration) return;
+      await showCupertinoDialog<void>(
+        context: context,
+        builder: (dialogContext) {
+          return CupertinoAlertDialog(
+            title: const Text("Configuration failed"),
+            content: const Text(
+              "Configuration failed, please re-enter wifi name and password",
+            ),
+            actions: [
+              CupertinoDialogAction(
+                child: const Text("OK"),
+                onPressed: () {
+                  Navigator.of(dialogContext).pop();
+                  if (mounted && generation == _wifiCallbackGeneration) {
+                    _passwordTextEditingController.clear();
+                    FocusManager.instance.primaryFocus?.unfocus();
+                  }
+                },
+              ),
+            ],
+          );
+        },
+      );
+    } catch (_) {
+      // The page may have been dismissed while the dialog was opening.
+    } finally {
+      if (generation == _wifiCallbackGeneration) {
+        _failureDialogVisible = false;
+      }
+    }
   }
 
   @override
@@ -316,6 +342,7 @@ class _DeviceWifiConfigState extends State<DeviceWifiConfig> {
     final jsonString = model.toJson();
     if (jsonString != null) {
       final result = await BlueUtil.shared.sendWifiSetData(jsonString);
+      if (!mounted) return;
       if (!result) {
         dismiss();
         App.showDialog(

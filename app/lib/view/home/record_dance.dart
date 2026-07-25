@@ -104,7 +104,7 @@ class _RecordDanceState extends State<RecordDance> {
       durationMs: 100,
     );
     recordedDanceFrames.add(danceFrame);
-      }
+  }
 
   Widget buildBandFrequencyChart(List<double> frequencies, double progress) {
     if (frequencies.isEmpty) {
@@ -517,6 +517,21 @@ class _RecordDanceState extends State<RecordDance> {
     }
   }
 
+  Future<void> _playRecordingMusic(MusicInfo musicInfo) async {
+    try {
+      await MusicUtil.shared.playMusicOnce(musicInfo, () {
+        if (mounted) {
+          stopRecordingAndPlayback();
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        AppState.shared.showToast("Failed to play the selected music.");
+        stopRecordingAndPlayback();
+      }
+    }
+  }
+
   void startRecordingAndPlayback() {
     final musicInfo = model.musicInfo.value;
     if (musicInfo == null) return;
@@ -528,9 +543,7 @@ class _RecordDanceState extends State<RecordDance> {
     recordTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
       recordDanceFrame();
     });
-    MusicUtil.shared.playMusicOnce(musicInfo, () {
-      stopRecordingAndPlayback();
-    });
+    unawaited(_playRecordingMusic(musicInfo));
 
     playbackTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
       final duration = MusicUtil.shared.getMusicDuration();
@@ -568,7 +581,7 @@ class _RecordDanceState extends State<RecordDance> {
           pitchServo: model.motionData.value.pitchServo,
           durationMs: 0,
         );
-        BlueUtil.shared.sendDanceData(danceData);
+        unawaited(BlueUtil.shared.sendDanceData(danceData));
         lastBluetoothSendTime = currentTime;
       }
     }

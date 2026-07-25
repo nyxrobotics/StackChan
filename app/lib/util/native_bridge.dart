@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT
 
 import 'dart:async';
 
-import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 class NativeBridge {
@@ -74,10 +74,14 @@ class NativeBridge {
       if (method != Method.unknown && _handlers.containsKey(method)) {
         return await _handlers[method]!(call);
       } else {
-                return null;
+        return null;
       }
-    } catch (e) {
-            return null;
+    } catch (error, stackTrace) {
+      debugPrint(
+        'NativeBridge: native callback "${call.method}" failed: $error\n'
+        '$stackTrace',
+      );
+      return null;
     }
   }
 
@@ -85,17 +89,22 @@ class NativeBridge {
   Future<dynamic> sendMessage(Method method, [dynamic arguments]) async {
     try {
       return await _channel.invokeMethod(method.name, arguments);
-    } catch (e) {
-            return null;
+    } catch (error, stackTrace) {
+      debugPrint(
+        'NativeBridge: method "${method.name}" failed: $error\n$stackTrace',
+      );
+      return null;
     }
   }
 
   /// Send PCM audio stream to native side for playback
   Future<dynamic> sendAudioStream(ByteData pcmData) async {
     try {
-      await _audioPlayChannel.send(pcmData);
-    } catch (e) {
-          }
+      return await _audioPlayChannel.send(pcmData);
+    } catch (error, stackTrace) {
+      debugPrint('NativeBridge: PCM delivery failed: $error\n$stackTrace');
+      rethrow;
+    }
   }
 }
 
