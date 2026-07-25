@@ -17,9 +17,11 @@ void Hal::initIoExpander()
 {
     mclog::tagInfo(_tag, "init");
 
+    const bool servo_power_enabled = _registry.isAvailable(DeviceCapability::ServoPower);
+    const bool rgb_enabled         = _registry.isAvailable(DeviceCapability::RgbLed);
+
     // Skip if force_disabled by config
-    if (!_registry.isAvailable(DeviceCapability::ServoPower) &&
-        !_registry.isAvailable(DeviceCapability::RgbLed)) {
+    if (!servo_power_enabled && !rgb_enabled) {
         // Both were already pre-registered Unavailable by force_disabled
         mclog::tagInfo(_tag, "IO Expander skipped (both ServoPower and RgbLed force-disabled)");
         return;
@@ -46,39 +48,43 @@ void Hal::initIoExpander()
     }
 
     if (_io_expander) {
-        // VM EN
-        _io_expander->setDirection(0, true);  // Output
-        _io_expander->setPullMode(0, true);   // Pull-up
-        // Power rail is turned on by initPowerRails() – not here
+        if (servo_power_enabled) {
+            // VM EN
+            _io_expander->setDirection(0, true);  // Output
+            _io_expander->setPullMode(0, true);   // Pull-up
+            // Power rail is turned on by initPowerRails() – not here
+        }
 
-        // RGB
-        _io_expander->setDirection(13, true);   // Output
-        _io_expander->setPullMode(13, true);    // Pull-up
-        _io_expander->setDriveMode(13, false);  // Push-pull
-        _io_expander->setLedCount(12);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        GetHAL().showRgbColor(0, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        GetHAL().showRgbColor(0, 0, 0);
-
-        // Register capabilities
-        _registry.set(DeviceCapability::ServoPower, true);
-        _registry.set(DeviceCapability::RgbLed,     true);
+        if (rgb_enabled) {
+            // RGB
+            _io_expander->setDirection(13, true);   // Output
+            _io_expander->setPullMode(13, true);    // Pull-up
+            _io_expander->setDriveMode(13, false);  // Push-pull
+            _io_expander->setLedCount(12);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            GetHAL().showRgbColor(0, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            GetHAL().showRgbColor(0, 0, 0);
+        }
 
         mclog::tagInfo(_tag, "init done");
     } else {
         // IO Expander absent: servo power control and RGB unavailable
-        _registry.set(DeviceCapability::ServoPower, false);
-        _registry.set(DeviceCapability::RgbLed,     false);
-        _registry.setUnavailableReason(DeviceCapability::ServoPower, "IO expander not found");
-        _registry.setUnavailableReason(DeviceCapability::RgbLed,     "IO expander not found");
+        if (servo_power_enabled) {
+            _registry.set(DeviceCapability::ServoPower, false);
+            _registry.setUnavailableReason(DeviceCapability::ServoPower, "IO expander not found");
+        }
+        if (rgb_enabled) {
+            _registry.set(DeviceCapability::RgbLed, false);
+            _registry.setUnavailableReason(DeviceCapability::RgbLed, "IO expander not found");
+        }
         mclog::tagWarn(_tag, "IO Expander not found – ServoPower and RgbLed unavailable");
     }
 }
 
 void Hal::setServoPowerEnabled(bool enabled)
 {
-    if (!_io_expander) {
+    if (!_io_expander || !_registry.isAvailable(DeviceCapability::ServoPower)) {
         return;
     }
     _io_expander->digitalWrite(0, enabled ? true : false);
@@ -86,7 +92,7 @@ void Hal::setServoPowerEnabled(bool enabled)
 
 void Hal::setRgbColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 {
-    if (!_io_expander) {
+    if (!_io_expander || !_registry.isAvailable(DeviceCapability::RgbLed)) {
         return;
     }
     _io_expander->setLedColor(index, r, g, b);
@@ -94,7 +100,7 @@ void Hal::setRgbColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 
 void Hal::refreshRgb()
 {
-    if (!_io_expander) {
+    if (!_io_expander || !_registry.isAvailable(DeviceCapability::RgbLed)) {
         return;
     }
     _io_expander->refreshLeds();

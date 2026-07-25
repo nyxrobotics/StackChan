@@ -59,6 +59,21 @@ void Hal::initCoreSystem()
     _registry.set(DeviceCapability::Microphone, true);
     _registry.set(DeviceCapability::Speaker,    true);
 
+    // DeviceRegistry starts with every bit cleared. Enable only capabilities
+    // that have a probe below; force-disabled settings may clear them again.
+    static constexpr DeviceCapability kProbeCandidates[] = {
+        DeviceCapability::ServoYaw,
+        DeviceCapability::ServoPitch,
+        DeviceCapability::ServoPower,
+        DeviceCapability::RgbLed,
+        DeviceCapability::HeadTouch,
+        DeviceCapability::Imu,
+        DeviceCapability::Rtc,
+    };
+    for (auto cap : kProbeCandidates) {
+        _registry.set(cap, true);
+    }
+
     // Read NVS force_disabled table (§6.2, §9.2)
     // A key set to 1 means the capability is pre-registered as Unavailable
     // and its probe step will be skipped.
