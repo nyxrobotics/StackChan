@@ -145,23 +145,23 @@ void handle_running_screen(void *pvParam)
 {
     joystick_data_t *joystick_data = (joystick_data_t *)pvParam;
     // communicate packet
-    uint8_t pkt[8];
-    pkt[0]              = joystick_data->id;  // id: 0 for broadcast
-    int16_t yaw_angle   = 0;
-    int16_t pitch_angle = 0;
-    int16_t last_yaw    = 0;
-    int16_t last_pitch  = 0;
-    int16_t speed_val   = 600;
+    uint8_t pkt[8]              = {0};
+    int16_t yaw_angle           = 0;
+    int16_t pitch_angle         = 0;
+    int16_t last_yaw            = 0;
+    int16_t last_pitch          = 0;
+    int16_t speed_val           = 600;
+    uint8_t last_id             = 0;
+    bool last_btnB_status       = false;
+    bool packet_sent_in_session = false;
 
     while (1) {
         // update screen and send packet when in running mode
         if (joystick_data->screen_mode == MODE_RUNNING) {
             joystick_read_xy(&joystick_data->joyX, &joystick_data->joyY);
 
-            if (running_screen != NULL && lv_obj_is_valid(running_screen)) {
-                update_running_screen(joystick_data->joyX, joystick_data->joyY, joystick_data->channel,
-                                      joystick_data->id, joystick_data->bat);
-            }
+            update_running_screen(joystick_data->joyX, joystick_data->joyY, joystick_data->channel, joystick_data->id,
+                                  joystick_data->bat);
 
             // handle data from joystick
             if ((joystick_data->joyX < X_CENTER + DEAD_ZONE) && (joystick_data->joyX > X_CENTER - DEAD_ZONE)) {
@@ -174,32 +174,34 @@ void handle_running_screen(void *pvParam)
             yaw_angle   = (int16_t)map(joystick_data->joyX, X_MIN, X_MAX, 1280, -1280);
             pitch_angle = (int16_t)map(joystick_data->joyY, Y_MIN, Y_MAX, 0, 900);
 
-            // send pitch_angle and yaw_angle only when changes exceed threshold
-            if (abs(yaw_angle - last_yaw) < 5 && abs(pitch_angle - last_pitch) < 5) {
-                if (pkt[7] != joystick_data->btnB_status) {
-                    pkt[7] = joystick_data->btnB_status;
-                    espnow_send_data(pkt, sizeof(pkt));
-                }
-                vTaskDelay(30 / portTICK_PERIOD_MS);
-                continue;
-            }
+            uint8_t current_id       = (uint8_t)joystick_data->id;
+            bool current_btnB_status = joystick_data->btnB_status;
+            bool should_send         = !packet_sent_in_session || abs(yaw_angle - last_yaw) >= 5 ||
+                               abs(pitch_angle - last_pitch) >= 5 || current_id != last_id ||
+                               current_btnB_status != last_btnB_status;
 
-            pkt[0] = joystick_data->id;
-            memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
-            memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
-            memcpy(&pkt[5], &speed_val, sizeof(int16_t));
-            pkt[7] = joystick_data->btnB_status;
+            if (should_send) {
+                pkt[0] = current_id;
+                memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
+                memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
+                memcpy(&pkt[5], &speed_val, sizeof(int16_t));
+                pkt[7] = current_btnB_status;
 
-#if 0 
-            ESP_LOGI("handle_running_screen", "Yaw: %d, Pitch: %d, Speed: %d, id: %u, Button: %u", 
-                        yaw_angle, pitch_angle, speed_val, joystick_data->id, joystick_data->btnB_status);
+#if 0
+                ESP_LOGI("handle_running_screen", "Yaw: %d, Pitch: %d, Speed: %d, id: %u, Button: %u",
+                         yaw_angle, pitch_angle, speed_val, current_id, current_btnB_status);
 #endif
 
-            last_yaw   = yaw_angle;
-            last_pitch = pitch_angle;
-            espnow_send_data(pkt, sizeof(pkt));
+                espnow_send_data(pkt, sizeof(pkt));
+                last_yaw               = yaw_angle;
+                last_pitch             = pitch_angle;
+                last_id                = current_id;
+                last_btnB_status       = current_btnB_status;
+                packet_sent_in_session = true;
+            }
             vTaskDelay(30 / portTICK_PERIOD_MS);
         } else {
+            packet_sent_in_session = false;
             vTaskDelay(200 / portTICK_PERIOD_MS);
         }
     }
@@ -231,16 +233,16 @@ void handle_imu_screen(void *pvParam)
 {
     joystick_data_t *joystick_data = (joystick_data_t *)pvParam;
 
-    static IMU_Angle_t last_imu_angle = {0.0f, 0.0f};
-
     // communicate packet
-    uint8_t pkt[8];
-    pkt[0]              = joystick_data->id;  // id: 0 for broadcast
-    int16_t yaw_angle   = 0;
-    int16_t pitch_angle = 0;
-    int16_t last_yaw    = 0;
-    int16_t last_pitch  = 0;
-    int16_t speed_val   = 600;
+    uint8_t pkt[8]              = {0};
+    int16_t yaw_angle           = 0;
+    int16_t pitch_angle         = 0;
+    int16_t last_yaw            = 0;
+    int16_t last_pitch          = 0;
+    int16_t speed_val           = 600;
+    uint8_t last_id             = 0;
+    bool last_btnB_status       = false;
+    bool packet_sent_in_session = false;
 
     while (1) {
         // update screen and send packet when in running mode
@@ -257,27 +259,35 @@ void handle_imu_screen(void *pvParam)
             yaw_angle   = (int16_t)map(limited_roll, -1.5, 1.5, -1280, 1280);
             pitch_angle = (int16_t)map(limited_pitch, 0, 1.5, 900, 0);
 
-            if (abs(yaw_angle - last_yaw) < 10 && abs(last_pitch - pitch_angle) < 10) {
-                vTaskDelay(30 / portTICK_PERIOD_MS);
-                continue;
+            uint8_t current_id       = (uint8_t)joystick_data->id;
+            bool current_btnB_status = joystick_data->btnB_status;
+            bool should_send         = !packet_sent_in_session || abs(yaw_angle - last_yaw) >= 10 ||
+                               abs(pitch_angle - last_pitch) >= 10 || current_id != last_id ||
+                               current_btnB_status != last_btnB_status;
+
+            if (should_send) {
+                pkt[0] = current_id;
+                memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
+                memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
+                memcpy(&pkt[5], &speed_val, sizeof(int16_t));
+                pkt[7] = current_btnB_status;
+                espnow_send_data(pkt, sizeof(pkt));
+
+                last_yaw               = yaw_angle;
+                last_pitch             = pitch_angle;
+                last_id                = current_id;
+                last_btnB_status       = current_btnB_status;
+                packet_sent_in_session = true;
             }
-            last_yaw   = yaw_angle;
-            last_pitch = pitch_angle;
 
-            pkt[0] = joystick_data->id;
-            memcpy(&pkt[1], &yaw_angle, sizeof(int16_t));
-            memcpy(&pkt[3], &pitch_angle, sizeof(int16_t));
-            memcpy(&pkt[5], &speed_val, sizeof(int16_t));
-            pkt[7] = joystick_data->btnB_status;
-            espnow_send_data(pkt, sizeof(pkt));
-
-#if 0 
-            // ESP_LOGI("handle_imu_screen", "yaw_angle: %.2f, pitch_angle:%.2f, yaw: %d, pitch: %d\n", 
-                                            imu_angle.roll, imu_angle.pitch, yaw_angle, pitch_angle);
+#if 0
+            ESP_LOGI("handle_imu_screen", "yaw_angle: %.2f, pitch_angle: %.2f, yaw: %d, pitch: %d",
+                     imu_angle.roll, imu_angle.pitch, yaw_angle, pitch_angle);
 #endif
 
             vTaskDelay(30 / portTICK_PERIOD_MS);
         } else {
+            packet_sent_in_session = false;
             vTaskDelay(200 / portTICK_PERIOD_MS);
         }
     }
