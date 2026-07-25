@@ -6,6 +6,7 @@
 #include "workers.h"
 #include <mooncake_log.h>
 #include <hal/hal.h>
+#include <algorithm>
 #include <array>
 #include <vector>
 
@@ -151,6 +152,9 @@ XiaozhiGeneralWorker::XiaozhiGeneralWorker()
     mclog::info("XiaozhiGeneralWorker start");
 
     _config = GetHAL().getXiaozhiConfig();
+    _config.idleRandomMovementLevel =
+        static_cast<uint8_t>(std::clamp(static_cast<int>(_config.idleRandomMovementLevel), 0,
+                                        static_cast<int>(_idle_motion_level_labels.size()) - 1));
 
     for (uint8_t level = 0; level < _idle_motion_level_labels.size(); ++level) {
         _idle_motion_levels.push_back(level);
