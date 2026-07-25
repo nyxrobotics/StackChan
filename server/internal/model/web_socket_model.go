@@ -190,6 +190,24 @@ func (a *AppClient) SetConn(conn *websocket.Conn) {
 	a.conn = conn
 }
 
+func (a *AppClient) ReplaceConn(conn *websocket.Conn) *websocket.Conn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	previous := a.conn
+	a.conn = conn
+	return previous
+}
+
+func (a *AppClient) ClearConnIf(conn *websocket.Conn) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.conn != conn {
+		return false
+	}
+	a.conn = nil
+	return true
+}
+
 func (a *AppClient) SetDeviceId(deviceId string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -238,6 +256,24 @@ func (s *StackChanClient) SetConn(conn *websocket.Conn) {
 	s.conn = conn
 }
 
+func (s *StackChanClient) ReplaceConn(conn *websocket.Conn) *websocket.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.conn
+	s.conn = conn
+	return previous
+}
+
+func (s *StackChanClient) ClearConnIf(conn *websocket.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != conn {
+		return false
+	}
+	s.conn = nil
+	return true
+}
+
 func (s *StackChanClient) SetCameraSubscriptionList(cameraSubscriptionList []*AppClient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -262,6 +298,21 @@ func (s *StackChanClient) SetAudioSubscriptionList(audioSubscriptionList []*AppC
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.audioSubscriptionList = audioSubscriptionList
+}
+
+func (s *StackChanClient) AddAudioSubscriptionIfAbsent(appClient *AppClient) bool {
+	if appClient == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.audioSubscriptionList {
+		if existing == appClient {
+			return false
+		}
+	}
+	s.audioSubscriptionList = append(s.audioSubscriptionList, appClient)
+	return true
 }
 
 func (s *StackChanClient) GetAudioSubscriptionList() []*AppClient {

@@ -204,9 +204,9 @@ func CheckExpiredLinks(ctx context.Context) {
 				}
 			}()
 			client.CloseWriterCoroutine()
-			if client.GetConn() != nil {
-				_ = client.GetConn().Close()
-				client.SetConn(nil)
+			conn := client.GetConn()
+			if conn != nil && client.ClearConnIf(conn) {
+				_ = conn.Close()
 			}
 		}()
 	}
@@ -268,9 +268,8 @@ func CheckExpiredLinks(ctx context.Context) {
 
 		stackChanClient.CloseWriterCoroutine()
 		conn := stackChanClient.GetConn()
-		stackChanClient.SetConn(nil)
 
-		if conn != nil {
+		if conn != nil && stackChanClient.ClearConnIf(conn) {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {

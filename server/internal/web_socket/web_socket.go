@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"regexp"
 	"stackChan/internal/model"
 	"stackChan/internal/service"
 	"stackChan/utility"
@@ -59,6 +60,9 @@ const (
 	OffAudio byte = 0x19
 
 	AimedTakePhoto byte = 0x1A
+
+	websocketReadLimit int64 = 8 * 1024 * 1024
+	authTokenMaxSkew         = 10 * time.Second
 )
 
 var (
@@ -72,6 +76,9 @@ var (
 	stackChanClientPool = sync.Map{}
 	appClientPool       = sync.Map{}
 	appClientMu         sync.Mutex
+	validMacPattern     = regexp.MustCompile(
+		`^(?:[0-9A-Fa-f]{12}|(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2})$`,
+	)
 )
 
 // GetMac get MAC address from request header
@@ -89,17 +96,21 @@ func GetMac(r *ghttp.Request) (string, error) {
 		}
 		tokenStr := string(decrypted)
 		parts := strings.Split(tokenStr, "|")
-		if len(parts) < 2 {
+		if len(parts) != 3 {
 			return "", errors.New("invalid token")
 		}
 		mac := parts[0]
+		if !validMacPattern.MatchString(mac) {
+			return "", errors.New("invalid MAC address")
+		}
 		tsStr := parts[2]
 		ts, err := strconv.ParseInt(tsStr, 10, 64)
 		if err != nil {
 			return "", errors.New("invalid timestamp")
 		}
 		now := time.Now().Unix()
-		if now-ts > 10 || ts-now > 10 {
+		maxSkewSeconds := int64(authTokenMaxSkew / time.Second)
+		if ts < now-maxSkewSeconds || ts > now+maxSkewSeconds {
 			return "", errors.New("token expired or not yet valid")
 		}
 		return mac, nil
@@ -117,8 +128,19 @@ func Handler(r *ghttp.Request) {
 		return
 	}
 	deviceType := r.Get("deviceType").String()
-	if deviceType == "" {
-		r.Response.Write("The mac and deviceType parameters are empty.")
+	deviceId := ""
+	switch deviceType {
+	case "StackChan":
+	case "App":
+		deviceId = r.Get("deviceId").String()
+		if deviceId == "" {
+			r.Response.WriteHeader(http.StatusBadRequest)
+			r.Response.Write("The deviceId parameter in the App end is empty.")
+			return
+		}
+	default:
+		r.Response.WriteHeader(http.StatusBadRequest)
+		r.Response.Write("The deviceType parameter is invalid.")
 		return
 	}
 
@@ -127,6 +149,7 @@ func Handler(r *ghttp.Request) {
 		r.Response.Write(err.Error())
 		return
 	}
+	ws.SetReadLimit(websocketReadLimit)
 
 	if deviceType == "StackChan" {
 		isHave := false
@@ -139,7 +162,10 @@ func Handler(r *ghttp.Request) {
 			if macAddr == mac {
 				isHave = true
 				client = stackChanClient
-				client.SetConn(ws)
+				previousConn := client.ReplaceConn(ws)
+				if previousConn != nil && previousConn != ws {
+					_ = previousConn.Close()
+				}
 				if client.GetCallAppClient() != nil {
 					reconnectMsg := createStringMessage(TextMessage, "The equipment has been reconnected.")
 					stackChanSendMessage(ctx, client, new(websocket.BinaryMessage), reconnectMsg)
@@ -175,10 +201,8 @@ func Handler(r *ghttp.Request) {
 		logger.Info(ctx, "There is a StackChen connected to the service.", client.GetMac())
 		defer func() {
 			logger.Info(ctx, "There is a StackChan that has disconnected.", mac, deviceType)
-			if client.GetConn() != nil {
-				_ = client.GetConn().Close()
-				client.SetConn(nil)
-			}
+			client.ClearConnIf(ws)
+			_ = ws.Close()
 		}()
 		for {
 			messageType, msg, err := ws.ReadMessage()
@@ -200,11 +224,6 @@ func Handler(r *ghttp.Request) {
 			readStackChanMessage(ctx, client, &messageType, &msg)
 		}
 	} else if deviceType == "App" {
-		deviceId := r.Get("deviceId").String()
-		if deviceId == "" {
-			r.Response.Write("The deviceId parameter in the App end is empty.")
-			return
-		}
 		var client *model.AppClient
 		found := false
 		clients := getAppClients(mac)
@@ -212,7 +231,10 @@ func Handler(r *ghttp.Request) {
 			if appClient.GetDeviceId() == deviceId && appClient.GetMac() == mac {
 				// Already available. Update the connection.
 				client = appClient
-				client.SetConn(ws)
+				previousConn := client.ReplaceConn(ws)
+				if previousConn != nil && previousConn != ws {
+					_ = previousConn.Close()
+				}
 				client.SetLastTime(time.Now())
 				found = true
 				break
@@ -236,10 +258,8 @@ func Handler(r *ghttp.Request) {
 
 		defer func() {
 			logger.Info(ctx, "There is an App that has disconnected.", mac, deviceType)
-			if client.GetConn() != nil {
-				_ = client.GetConn().Close()
-				client.SetConn(nil)
-			}
+			client.ClearConnIf(ws)
+			_ = ws.Close()
 		}()
 		for {
 			messageType, msg, err := ws.ReadMessage()
@@ -305,21 +325,20 @@ func getStackChanClient(mac string) *model.StackChanClient {
 
 // Parse custom binary protocol messages, return message type, data length, payload and success status
 func parseBinaryMessage(ctx context.Context, msg *[]byte) (byte, int, []byte, bool) {
-	if len(*msg) < 1+4 {
+	if msg == nil || len(*msg) < 1+4 {
 		logger.Warning(ctx, "Message too short, cannot parse header, message not forwarded")
 		return 0, 0, nil, false
 	}
 
 	msgType := (*msg)[0]
-	dataLen := int(binary.BigEndian.Uint32((*msg)[1:5]))
-	payload := (*msg)[5 : 5+dataLen]
-
-	if len(*msg)-5 != dataLen {
-		logger.Warningf(ctx, "Length mismatch: header says %d, actual is %d, message not forwarded", dataLen, len(*msg)-5)
+	declaredLength := binary.BigEndian.Uint32((*msg)[1:5])
+	actualLength := len(*msg) - 5
+	if uint64(declaredLength) != uint64(actualLength) {
+		logger.Warningf(ctx, "Length mismatch: header says %d, actual is %d, message not forwarded", declaredLength, actualLength)
 		return 0, 0, nil, false
 	}
 
-	return msgType, dataLen, payload, true
+	return msgType, int(declaredLength), (*msg)[5:], true
 }
 
 // Handle WebSocket messages from StackChan devices
@@ -353,8 +372,7 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 					onType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &onType, onMsg)
 				}
-				client.SetAudioSubscriptionList(append(client.GetAudioSubscriptionList(), appClient))
-				if len(client.GetAudioSubscriptionList()) == 1 {
+				if client.AddAudioSubscriptionIfAbsent(appClient) && len(client.GetAudioSubscriptionList()) == 1 {
 					onMsg := createMessage(OnAudio, nil)
 					onType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &onType, onMsg)
@@ -389,9 +407,9 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 				}
 				client.SetAudioSubscriptionList(newAudioList)
 				if len(client.GetAudioSubscriptionList()) == 0 {
-					onMsg := createMessage(OnAudio, nil)
-					onType := websocket.BinaryMessage
-					stackChanSendMessage(ctx, client, &onType, onMsg)
+					offMsg := createMessage(OffAudio, nil)
+					offType := websocket.BinaryMessage
+					stackChanSendMessage(ctx, client, &offType, offMsg)
 				}
 			}
 			break
@@ -493,7 +511,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			// Query device name
 			name, err := service.GetDeviceName(ctx, client.GetMac())
 			if err != nil {
-				logger.Errorf(ctx, err.Error())
+				logger.Errorf(ctx, "Failed to get device name: %v", err)
 				return
 			}
 			if name == "" {
@@ -501,7 +519,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 				return
 			}
 			newMsg := createStringMessage(GetDeviceName, name)
-			logger.Infof(ctx, "Device name found, returning: "+name)
+			logger.Infof(ctx, "Device name found, returning: %s", name)
 			appSendMessage(ctx, client, messageType, newMsg)
 			break
 		case UpdateDeviceName:
@@ -643,15 +661,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			macAddr := string(payload)
 			stackChanClient := getStackChanClient(macAddr)
 			if stackChanClient != nil {
-				alreadySubscribed := false
-				for _, sub := range stackChanClient.GetAudioSubscriptionList() {
-					if sub == client {
-						alreadySubscribed = true
-						break
-					}
-				}
-				stackChanClient.SetAudioSubscriptionList(append(stackChanClient.GetAudioSubscriptionList(), client))
-				if !alreadySubscribed {
+				if stackChanClient.AddAudioSubscriptionIfAbsent(client) {
 					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 				}
 			}
