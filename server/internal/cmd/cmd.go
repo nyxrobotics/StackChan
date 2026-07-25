@@ -8,7 +8,6 @@ package cmd
 import (
 	"context"
 	"net/http"
-	"path/filepath"
 	"stackChan/internal/boot"
 	"stackChan/internal/controller/admin"
 	"stackChan/internal/controller/appstore"
@@ -21,13 +20,13 @@ import (
 	"stackChan/internal/controller/stackchandevice"
 	"stackChan/internal/controller/user"
 	"stackChan/internal/controller/xiaozhi"
+	"stackChan/internal/filesafe"
 	"stackChan/internal/middleware"
 	"stackChan/internal/web_socket"
 
 	"github.com/gogf/gf/v2/frame/g"
 	"github.com/gogf/gf/v2/net/ghttp"
 	"github.com/gogf/gf/v2/os/gcmd"
-	"github.com/gogf/gf/v2/os/gfile"
 )
 
 var (
@@ -49,19 +48,37 @@ var (
 			///Configuration file access
 			s.Group("/file", func(group *ghttp.RouterGroup) {
 				group.GET("/*filepath", func(r *ghttp.Request) {
+					writeNotFound := func() {
+						r.Response.WriteHeader(http.StatusNotFound)
+						r.Response.Write("File not found")
+					}
+
 					relativePath := r.Get("filepath").String()
 					if relativePath == "" {
-						r.Response.WriteHeader(http.StatusNotFound)
-						r.Response.Write("File not found")
+						writeNotFound()
 						return
 					}
-					filePath := filepath.Join("file", relativePath)
-					if !gfile.Exists(filePath) {
-						r.Response.WriteHeader(http.StatusNotFound)
-						r.Response.Write("File not found")
+
+					fileRoot, err := filesafe.Open(filesafe.DefaultRootDirectory)
+					if err != nil {
+						writeNotFound()
 						return
 					}
-					r.Response.ServeFile(filePath)
+					defer fileRoot.Close()
+
+					servedFile, err := fileRoot.OpenFile(relativePath)
+					if err != nil {
+						writeNotFound()
+						return
+					}
+					defer servedFile.Close()
+
+					info, err := servedFile.Stat()
+					if err != nil || info.IsDir() {
+						writeNotFound()
+						return
+					}
+					r.Response.ServeContent(info.Name(), info.ModTime(), servedFile)
 				})
 			})
 
