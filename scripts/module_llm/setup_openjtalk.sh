@@ -18,6 +18,8 @@ Environment:
   TOHOKU_VOICE_URL            Override the tohoku-f01 neutral voice URL.
   TOHOKU_COPYRIGHT_URL        Override the tohoku voice copyright URL.
   STACKCHAN_OPENJTALK_HELPER  Path to openjtalk_tts.sh to install.
+  STACKCHAN_DOWNLOAD_TOTAL_TIMEOUT_SECONDS
+                              Overall timeout for each download (default: 900).
 EOF
 }
 
@@ -39,7 +41,7 @@ install_openjtalk_helper() {
     mkdir -p /opt/stackchan/voices
 
     if [ -f "$OPENJTALK_HELPER_SOURCE" ]; then
-        install -m 0755 "$OPENJTALK_HELPER_SOURCE" "$OPENJTALK_HELPER_TARGET" \
+        install_file_atomic "$OPENJTALK_HELPER_SOURCE" "$OPENJTALK_HELPER_TARGET" 0755 \
             || die "Failed to install $OPENJTALK_HELPER_TARGET."
         ok "$OPENJTALK_HELPER_TARGET"
     elif [ -x "$OPENJTALK_HELPER_TARGET" ]; then
@@ -49,21 +51,50 @@ install_openjtalk_helper() {
     fi
 }
 
+validate_tohoku_voice() {
+    local voice_file="$1"
+    local size
+
+    [ -s "$voice_file" ] || return 1
+    size="$(wc -c < "$voice_file")"
+    [ "$size" -ge 1048576 ] || return 1
+    grep -q '^\[GLOBAL\]$' "$voice_file" &&
+        grep -q '^\[STREAM\]$' "$voice_file" &&
+        grep -q '^\[POSITION\]$' "$voice_file" &&
+        grep -q '^\[DATA\]$' "$voice_file"
+}
+
+validate_tohoku_copyright() {
+    local copyright_file="$1"
+
+    [ -s "$copyright_file" ] &&
+        grep -qi 'copyright' "$copyright_file"
+}
+
 install_tohoku_voice() {
+    local voice_file="/opt/stackchan/voices/tohoku-f01-neutral.htsvoice"
+    local copyright_file="/opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt"
+
     info "Checking tohoku-f01 neutral voice..."
     mkdir -p /opt/stackchan/voices
 
-    if [ -f /opt/stackchan/voices/tohoku-f01-neutral.htsvoice ]; then
+    if validate_tohoku_voice "$voice_file"; then
         ok "tohoku-f01-neutral.htsvoice (already installed)"
     else
+        if [ -e "$voice_file" ]; then
+            warn "Existing tohoku-f01 neutral voice is invalid; downloading a replacement."
+        fi
         info "Downloading tohoku-f01-neutral.htsvoice..."
-        wget -qO /opt/stackchan/voices/tohoku-f01-neutral.htsvoice "$TOHOKU_VOICE_URL" \
+        download_atomic "$TOHOKU_VOICE_URL" "$voice_file" validate_tohoku_voice \
             || die "Failed to download tohoku-f01-neutral.htsvoice."
         ok "tohoku-f01-neutral.htsvoice"
     fi
 
-    if [ ! -f /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt ]; then
-        wget -qO /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt "$TOHOKU_COPYRIGHT_URL" \
+    if ! validate_tohoku_copyright "$copyright_file"; then
+        if [ -e "$copyright_file" ]; then
+            warn "Existing tohoku voice COPYRIGHT.txt is invalid; downloading a replacement."
+        fi
+        download_atomic "$TOHOKU_COPYRIGHT_URL" "$copyright_file" validate_tohoku_copyright \
             || warn "Failed to download tohoku voice COPYRIGHT.txt."
     fi
 }

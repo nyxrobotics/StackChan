@@ -9,6 +9,8 @@ DICT_PATH="${STACKCHAN_OPENJTALK_DIC:-}"
 SPEED="${STACKCHAN_OPENJTALK_SPEED:-1.05}"
 PITCH_SHIFT="${STACKCHAN_OPENJTALK_PITCH_SHIFT:-0}"
 ALPHA="${STACKCHAN_OPENJTALK_ALPHA:-0.55}"
+SYNTH_TIMEOUT="${STACKCHAN_OPENJTALK_SYNTH_TIMEOUT:-120}"
+PLAYBACK_TIMEOUT="${STACKCHAN_OPENJTALK_PLAYBACK_TIMEOUT:-300}"
 TMP_FILES=()
 
 cleanup_tmp_files() {
@@ -18,11 +20,18 @@ cleanup_tmp_files() {
 }
 
 trap cleanup_tmp_files EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 usage() {
-    echo "Usage: $0 --check | --text TEXT"
+    cat <<'EOF'
+Usage: openjtalk_tts.sh --check | --text TEXT
+
+Environment:
+  STACKCHAN_OPENJTALK_SYNTH_TIMEOUT     Synthesis timeout in seconds (default: 120).
+  STACKCHAN_OPENJTALK_PLAYBACK_TIMEOUT  Playback timeout in seconds (default: 300).
+EOF
 }
 
 find_first_file() {
@@ -75,6 +84,19 @@ resolve_paths() {
         echo "STACKCHAN_OPENJTALK_ERROR aplay not found"
         return 1
     }
+    command -v timeout >/dev/null 2>&1 &&
+        timeout --help 2>&1 | grep -- '--kill-after' >/dev/null || {
+        echo "STACKCHAN_OPENJTALK_ERROR GNU timeout not found"
+        return 1
+    }
+    [[ "$SYNTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+        echo "STACKCHAN_OPENJTALK_ERROR invalid synthesis timeout"
+        return 1
+    }
+    [[ "$PLAYBACK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+        echo "STACKCHAN_OPENJTALK_ERROR invalid playback timeout"
+        return 1
+    }
     [ -n "$DICT_PATH" ] && [ -d "$DICT_PATH" ] || {
         echo "STACKCHAN_OPENJTALK_ERROR dictionary not found"
         return 1
@@ -110,7 +132,8 @@ speak_text() {
     printf '%s\n' "$text" > "$txt"
 
     echo "STACKCHAN_OPENJTALK_BEGIN voice=${VOICE_PATH}"
-    open_jtalk \
+    timeout --foreground --signal=TERM --kill-after=5s "${SYNTH_TIMEOUT}s" \
+        open_jtalk \
         -x "$DICT_PATH" \
         -m "$VOICE_PATH" \
         -ow "$wav" \
@@ -120,15 +143,17 @@ speak_text() {
         "$txt"
 
     set +e
-    aplay -q -D "$AUDIO_DEVICE" "$wav"
+    timeout --foreground --signal=TERM --kill-after=5s "${PLAYBACK_TIMEOUT}s" \
+        aplay -q -D "$AUDIO_DEVICE" "$wav"
     play_status=$?
     set -e
 
-    if [ "$play_status" -ge 128 ]; then
+    if [ "$play_status" -eq 124 ] || [ "$play_status" -ge 128 ]; then
         return "$play_status"
     fi
     if [ "$play_status" -ne 0 ]; then
-        aplay -q "$wav"
+        timeout --foreground --signal=TERM --kill-after=5s "${PLAYBACK_TIMEOUT}s" \
+            aplay -q "$wav"
     fi
 
     echo "STACKCHAN_OPENJTALK_DONE"

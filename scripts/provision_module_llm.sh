@@ -17,11 +17,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODULE_SCRIPT_DIR="${SCRIPT_DIR}/module_llm"
-REMOTE_DIR="/tmp/stackchan_module_llm_setup"
+REMOTE_DIR_BASE="/tmp/stackchan_module_llm_setup"
+REMOTE_DIR="${REMOTE_DIR_BASE}.$(date +%s).$$.${RANDOM}"
+REMOTE_LOCK="/tmp/stackchan_module_llm_setup.lock"
 
 ADB="${ADB:-adb}"
 ADB_RETRY_COUNT=10
 ADB_RETRY_DELAY=2
+ADB_COMMAND_TIMEOUT="${ADB_COMMAND_TIMEOUT:-60}"
+ADB_TRANSFER_TIMEOUT="${ADB_TRANSFER_TIMEOUT:-300}"
+ADB_SETUP_TIMEOUT="${ADB_SETUP_TIMEOUT:-7200}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +73,11 @@ Examples:
 This script is the normal entry point from the host PC. It transfers the
 module-side setup scripts over ADB and runs the selected target on the
 Module LLM.
+
+Environment:
+  ADB_COMMAND_TIMEOUT   Timeout in seconds for short ADB operations (default: 60).
+  ADB_TRANSFER_TIMEOUT  Timeout in seconds for the script transfer (default: 300).
+  ADB_SETUP_TIMEOUT     Timeout in seconds for module setup (default: 7200).
 EOF
 }
 
@@ -117,11 +127,137 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-adb_shell() {
+validate_timeout_setting() {
+    local name="$1"
+    local value="$2"
+
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] \
+        || die "$name must be a positive integer number of seconds."
+}
+
+run_with_timeout() (
+    local timeout_seconds="$1"
+    shift
+
+    local command_pid=""
+    local watchdog_pid=""
+    local timeout_command=""
+    local watchdog_directory=""
+    local timeout_marker=""
+
+    cleanup_timeout_processes() {
+        if [ -n "$watchdog_pid" ]; then
+            kill "$watchdog_pid" 2>/dev/null || true
+            wait "$watchdog_pid" 2>/dev/null || true
+            watchdog_pid=""
+        fi
+        if [ -n "$command_pid" ] && kill -0 "$command_pid" 2>/dev/null; then
+            kill -TERM "$command_pid" 2>/dev/null || true
+            kill -KILL "$command_pid" 2>/dev/null || true
+            wait "$command_pid" 2>/dev/null || true
+            command_pid=""
+        fi
+        if [ -n "$watchdog_directory" ]; then
+            rm -f -- "$timeout_marker"
+            rmdir -- "$watchdog_directory" 2>/dev/null || true
+            watchdog_directory=""
+            timeout_marker=""
+        fi
+    }
+    trap cleanup_timeout_processes EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if command -v timeout >/dev/null 2>&1 &&
+        timeout --help 2>&1 | grep -- '--kill-after' >/dev/null; then
+        timeout_command="timeout"
+    elif command -v gtimeout >/dev/null 2>&1 &&
+        gtimeout --help 2>&1 | grep -- '--kill-after' >/dev/null; then
+        timeout_command="gtimeout"
+    fi
+
+    if [ -n "$timeout_command" ]; then
+        "$timeout_command" \
+            --foreground \
+            --signal=TERM \
+            --kill-after=10s \
+            "${timeout_seconds}s" \
+            "$@"
+        return
+    fi
+
+    local status
+
+    watchdog_directory="$(mktemp -d "${TMPDIR:-/tmp}/stackchan_adb_timeout.XXXXXX")" \
+        || {
+            printf 'Failed to create timeout watchdog state directory.\n' >&2
+            return 1
+        }
+    timeout_marker="${watchdog_directory}/expired"
+
+    "$@" &
+    command_pid=$!
+    (
+        local sleep_pid=""
+
+        cleanup_watchdog() {
+            if [ -n "$sleep_pid" ]; then
+                kill "$sleep_pid" 2>/dev/null || true
+                wait "$sleep_pid" 2>/dev/null || true
+            fi
+        }
+        trap cleanup_watchdog EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        sleep "$timeout_seconds" &
+        sleep_pid=$!
+        if ! wait "$sleep_pid"; then
+            exit 0
+        fi
+        sleep_pid=""
+
+        if kill -0 "$command_pid" 2>/dev/null; then
+            : > "$timeout_marker"
+            printf 'ADB command timed out after %s seconds.\n' "$timeout_seconds" >&2
+            kill -TERM "$command_pid" 2>/dev/null || true
+            sleep 10 &
+            sleep_pid=$!
+            if ! wait "$sleep_pid"; then
+                exit 0
+            fi
+            sleep_pid=""
+            kill -KILL "$command_pid" 2>/dev/null || true
+        fi
+    ) &
+    watchdog_pid=$!
+
+    if wait "$command_pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    command_pid=""
+
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    watchdog_pid=""
+    if [ -e "$timeout_marker" ]; then
+        status=124
+    fi
+    return "$status"
+)
+
+adb_shell_timeout() {
+    local timeout_seconds="$1"
+    shift
+
     local marker="__STACKCHAN_ADB_EXIT__"
     local output clean rc
 
-    output="$("$ADB" shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; $*; rc=\$?; printf '\n${marker}%s\n' \"\$rc\"" 2>&1)" \
+    output="$(run_with_timeout "$timeout_seconds" "$ADB" shell "export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none; $*; rc=\$?; printf '\n${marker}%s\n' \"\$rc\"" 2>&1)" \
         || {
             printf '%s\n' "$output"
             return 1
@@ -132,6 +268,10 @@ adb_shell() {
     printf '%s\n' "$clean" | grep -v "^${marker}" || true
 
     [ "$rc" = "0" ]
+}
+
+adb_shell() {
+    adb_shell_timeout "$ADB_COMMAND_TIMEOUT" "$@"
 }
 
 remote_quote_args() {
@@ -228,11 +368,11 @@ check_adb() {
         || die "adb was not found. Install Android platform-tools and rerun this script."
 
     info "Checking ADB device..."
-    "$ADB" start-server >/dev/null 2>&1 || true
+    run_with_timeout "$ADB_COMMAND_TIMEOUT" "$ADB" start-server >/dev/null 2>&1 || true
 
     if [ -n "${ANDROID_SERIAL:-}" ]; then
         local state
-        state="$("$ADB" get-state 2>&1 || true)"
+        state="$(run_with_timeout "$ADB_COMMAND_TIMEOUT" "$ADB" get-state 2>&1 || true)"
         if [ "$state" = "device" ]; then
             ok "Module LLM detected: $ANDROID_SERIAL"
             return
@@ -250,7 +390,9 @@ check_adb() {
     local attempt
     for attempt in $(seq 1 "$ADB_RETRY_COUNT"); do
         local adb_list
-        adb_list="$("$ADB" devices | grep -v "List of" | grep -v '^$' || true)"
+        adb_list="$(run_with_timeout "$ADB_COMMAND_TIMEOUT" "$ADB" devices |
+            grep -v "List of" |
+            grep -v '^$' || true)"
         devices="$(printf '%s\n' "$adb_list" | grep 'device$' || true)"
         denied="$(printf '%s\n' "$adb_list" | grep 'no permissions' || true)"
         unauthorized="$(printf '%s\n' "$adb_list" | grep 'unauthorized' || true)"
@@ -302,9 +444,10 @@ push_module_scripts() {
         || die "Missing ${MODULE_SCRIPT_DIR}/openjtalk_tts.sh"
 
     info "Transferring Module LLM setup scripts..."
-    adb_shell "rm -rf '$REMOTE_DIR' && mkdir -p '$REMOTE_DIR'" >/dev/null \
+    adb_shell "mkdir -m 0700 '$REMOTE_DIR'" >/dev/null \
         || die "Failed to prepare $REMOTE_DIR on the Module LLM."
-    "$ADB" push "${MODULE_SCRIPT_DIR}/." "${REMOTE_DIR}/" >/dev/null \
+    run_with_timeout "$ADB_TRANSFER_TIMEOUT" \
+        "$ADB" push "${MODULE_SCRIPT_DIR}/." "${REMOTE_DIR}/" >/dev/null \
         || die "Failed to transfer Module LLM setup scripts."
     adb_shell "chmod 0755 '$REMOTE_DIR'/*.sh" >/dev/null \
         || die "Failed to chmod setup scripts on the Module LLM."
@@ -314,14 +457,25 @@ push_module_scripts() {
 run_module_setup() {
     local script
     local args
+    local setup_command
+    local quoted_setup_command
+
     script="$(target_script)"
     build_target_args
     args="$(remote_quote_args "${TARGET_ARGS[@]}")"
+    setup_command="bash '$REMOTE_DIR/$script'${args}"
+    printf -v quoted_setup_command '%q' "$setup_command"
 
     info "Running ${TARGET} setup on the Module LLM..."
-    adb_shell "bash '$REMOTE_DIR/$script'${args}" \
-        || die "Module LLM setup failed."
+    if ! adb_shell_timeout "$ADB_SETUP_TIMEOUT" \
+        "flock -n '$REMOTE_LOCK' bash -c $quoted_setup_command"; then
+        warn "The remote staging directory was retained for diagnosis: $REMOTE_DIR"
+        die "Module LLM setup failed or another provisioning process holds $REMOTE_LOCK."
+    fi
     ok "Module LLM ${TARGET} setup finished"
+
+    adb_shell "rm -rf '$REMOTE_DIR'" >/dev/null \
+        || warn "Failed to remove the remote staging directory: $REMOTE_DIR"
 }
 
 maybe_reboot() {
@@ -329,8 +483,11 @@ maybe_reboot() {
     case "$REBOOT_MODE" in
         yes)
             info "Rebooting Module LLM..."
-            adb_shell "reboot" || true
-            ok "Reboot command sent"
+            if adb_shell "reboot"; then
+                ok "Reboot command sent"
+            else
+                warn "ADB disconnected before reboot confirmation; verify that the Module LLM restarted."
+            fi
             ;;
         no)
             warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
@@ -343,8 +500,11 @@ maybe_reboot() {
                 case "${answer,,}" in
                     y|yes)
                         info "Rebooting Module LLM..."
-                        adb_shell "reboot" || true
-                        ok "Reboot command sent"
+                        if adb_shell "reboot"; then
+                            ok "Reboot command sent"
+                        else
+                            warn "ADB disconnected before reboot confirmation; verify that the Module LLM restarted."
+                        fi
                         ;;
                     *)
                         warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
@@ -364,7 +524,12 @@ main() {
     echo "======================================================"
     echo ""
 
+    validate_timeout_setting "ADB_COMMAND_TIMEOUT" "$ADB_COMMAND_TIMEOUT"
+    validate_timeout_setting "ADB_TRANSFER_TIMEOUT" "$ADB_TRANSFER_TIMEOUT"
+    validate_timeout_setting "ADB_SETUP_TIMEOUT" "$ADB_SETUP_TIMEOUT"
     check_adb
+    adb_shell "command -v flock >/dev/null 2>&1" \
+        || die "flock is required on the Module LLM for safe provisioning."
     push_module_scripts
     run_module_setup
     maybe_reboot
