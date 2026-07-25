@@ -277,13 +277,52 @@ func (s *StackChanClient) ClearConnIf(conn *websocket.Conn) bool {
 func (s *StackChanClient) SetCameraSubscriptionList(cameraSubscriptionList []*AppClient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cameraSubscriptionList = cameraSubscriptionList
+	s.cameraSubscriptionList = append([]*AppClient(nil), cameraSubscriptionList...)
 }
 
 func (s *StackChanClient) AppendCameraSubscriptionList(appClient *AppClient) {
+	_, _ = s.SubscribeCamera(appClient)
+}
+
+// SubscribeCamera adds appClient once and reports whether it was added and
+// whether it became the first camera subscriber.
+func (s *StackChanClient) SubscribeCamera(appClient *AppClient) (added bool, first bool) {
+	if appClient == nil {
+		return false, false
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	for _, existing := range s.cameraSubscriptionList {
+		if existing == appClient {
+			return false, false
+		}
+	}
 	s.cameraSubscriptionList = append(s.cameraSubscriptionList, appClient)
+	return true, len(s.cameraSubscriptionList) == 1
+}
+
+// UnsubscribeCamera removes every occurrence of appClient atomically and
+// reports whether it was present and whether the resulting list is empty.
+func (s *StackChanClient) UnsubscribeCamera(appClient *AppClient) (removed bool, empty bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if appClient == nil {
+		return false, len(s.cameraSubscriptionList) == 0
+	}
+
+	newList := make([]*AppClient, 0, len(s.cameraSubscriptionList))
+	for _, existing := range s.cameraSubscriptionList {
+		if existing == appClient {
+			removed = true
+			continue
+		}
+		newList = append(newList, existing)
+	}
+	s.cameraSubscriptionList = newList
+	return removed, len(newList) == 0
 }
 
 func (s *StackChanClient) GetCameraSubscriptionList() []*AppClient {
@@ -297,22 +336,53 @@ func (s *StackChanClient) GetCameraSubscriptionList() []*AppClient {
 func (s *StackChanClient) SetAudioSubscriptionList(audioSubscriptionList []*AppClient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.audioSubscriptionList = audioSubscriptionList
+	s.audioSubscriptionList = append([]*AppClient(nil), audioSubscriptionList...)
 }
 
 func (s *StackChanClient) AddAudioSubscriptionIfAbsent(appClient *AppClient) bool {
+	added, _ := s.SubscribeAudio(appClient)
+	return added
+}
+
+// SubscribeAudio adds appClient once and reports whether it was added and
+// whether it became the first audio subscriber.
+func (s *StackChanClient) SubscribeAudio(appClient *AppClient) (added bool, first bool) {
 	if appClient == nil {
-		return false
+		return false, false
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for _, existing := range s.audioSubscriptionList {
 		if existing == appClient {
-			return false
+			return false, false
 		}
 	}
 	s.audioSubscriptionList = append(s.audioSubscriptionList, appClient)
-	return true
+	return true, len(s.audioSubscriptionList) == 1
+}
+
+// UnsubscribeAudio removes every occurrence of appClient atomically and
+// reports whether it was present and whether the resulting list is empty.
+func (s *StackChanClient) UnsubscribeAudio(appClient *AppClient) (removed bool, empty bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if appClient == nil {
+		return false, len(s.audioSubscriptionList) == 0
+	}
+
+	newList := make([]*AppClient, 0, len(s.audioSubscriptionList))
+	for _, existing := range s.audioSubscriptionList {
+		if existing == appClient {
+			removed = true
+			continue
+		}
+		newList = append(newList, existing)
+	}
+	s.audioSubscriptionList = newList
+	return removed, len(newList) == 0
 }
 
 func (s *StackChanClient) GetAudioSubscriptionList() []*AppClient {

@@ -75,7 +75,7 @@ var (
 	logger              = g.Log()
 	stackChanClientPool = sync.Map{}
 	appClientPool       = sync.Map{}
-	appClientMu         sync.Mutex
+	appClientMu         sync.RWMutex
 	validMacPattern     = regexp.MustCompile(
 		`^(?:[0-9A-Fa-f]{12}|(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2})$`,
 	)
@@ -294,25 +294,59 @@ func addStackChenClient(ctx context.Context, c *model.StackChanClient) {
 
 // Handle WebSocket connection requests from App devices
 func addAppClient(c *model.AppClient) {
+	mac := c.GetMac()
+
 	appClientMu.Lock()
 	defer appClientMu.Unlock()
 
-	val, _ := appClientPool.Load(c.GetMac())
 	var clients []*model.AppClient
-	if val != nil {
-		clients = append(val.([]*model.AppClient), c)
-	} else {
-		clients = []*model.AppClient{c}
+	if val, ok := appClientPool.Load(mac); ok {
+		if existing, valid := val.([]*model.AppClient); valid {
+			clients = make([]*model.AppClient, len(existing), len(existing)+1)
+			copy(clients, existing)
+		}
 	}
-	appClientPool.Store(c.GetMac(), clients)
+	clients = append(clients, c)
+	appClientPool.Store(mac, clients)
 }
 
 // Get all App clients with specified MAC address
 func getAppClients(mac string) []*model.AppClient {
+	appClientMu.RLock()
+	defer appClientMu.RUnlock()
+
 	if val, ok := appClientPool.Load(mac); ok {
-		return val.([]*model.AppClient)
+		if clients, valid := val.([]*model.AppClient); valid {
+			out := make([]*model.AppClient, len(clients))
+			copy(out, clients)
+			return out
+		}
 	}
 	return nil
+}
+
+type appClientPoolEntry struct {
+	key     any
+	clients []*model.AppClient
+	valid   bool
+}
+
+func getAppClientPoolSnapshot() []appClientPoolEntry {
+	appClientMu.RLock()
+	defer appClientMu.RUnlock()
+
+	var entries []appClientPoolEntry
+	appClientPool.Range(func(key, value any) bool {
+		clients, valid := value.([]*model.AppClient)
+		entry := appClientPoolEntry{key: key, valid: valid}
+		if valid {
+			entry.clients = make([]*model.AppClient, len(clients))
+			copy(entry.clients, clients)
+		}
+		entries = append(entries, entry)
+		return true
+	})
+	return entries
 }
 
 // Get StackChan client with specified MAC address
@@ -366,13 +400,14 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 			appClient := client.GetCallAppClient()
 			if appClient != nil {
 				appSendMessage(ctx, appClient, messageType, msg)
-				client.AppendCameraSubscriptionList(appClient)
-				if len(client.GetCameraSubscriptionList()) == 1 {
+				_, firstCameraSubscriber := client.SubscribeCamera(appClient)
+				if firstCameraSubscriber {
 					onMsg := createMessage(OnCamera, nil)
 					onType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &onType, onMsg)
 				}
-				if client.AddAudioSubscriptionIfAbsent(appClient) && len(client.GetAudioSubscriptionList()) == 1 {
+				_, firstAudioSubscriber := client.SubscribeAudio(appClient)
+				if firstAudioSubscriber {
 					onMsg := createMessage(OnAudio, nil)
 					onType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &onType, onMsg)
@@ -385,28 +420,16 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 			if appClient != nil {
 				appSendMessage(ctx, appClient, messageType, msg)
 				// Remove the client from the subscription list
-				newList := client.GetCameraSubscriptionList()[:0]
-				for _, subClient := range client.GetCameraSubscriptionList() {
-					if subClient != appClient {
-						newList = append(newList, subClient)
-					}
-				}
-				client.SetCameraSubscriptionList(newList)
+				_, cameraSubscriptionsEmpty := client.UnsubscribeCamera(appClient)
 				// If the subscription list is empty, notify to turn off the camera
-				if len(client.GetCameraSubscriptionList()) == 0 {
+				if cameraSubscriptionsEmpty {
 					offMsg := createMessage(OffCamera, nil)
 					offType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &offType, offMsg)
 				}
 
-				newAudioList := client.GetAudioSubscriptionList()[:0]
-				for _, subClient := range client.GetAudioSubscriptionList() {
-					if subClient != appClient {
-						newAudioList = append(newAudioList, subClient)
-					}
-				}
-				client.SetAudioSubscriptionList(newAudioList)
-				if len(client.GetAudioSubscriptionList()) == 0 {
+				_, audioSubscriptionsEmpty := client.UnsubscribeAudio(appClient)
+				if audioSubscriptionsEmpty {
 					offMsg := createMessage(OffAudio, nil)
 					offType := websocket.BinaryMessage
 					stackChanSendMessage(ctx, client, &offType, offMsg)
@@ -430,7 +453,7 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 			subscribers := client.GetAudioSubscriptionList()
 			if len(subscribers) > 0 {
 				var isAll = true
-				for _, subClient := range client.GetAudioSubscriptionList() {
+				for _, subClient := range subscribers {
 					if subClient.GetConn() != nil {
 						isAll = false
 					}
@@ -626,27 +649,15 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 					stackChanClient.SetCallAppClient(nil)
 					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 
-					newList := stackChanClient.GetCameraSubscriptionList()[:0]
-					for _, sub := range stackChanClient.GetCameraSubscriptionList() {
-						if sub != client {
-							newList = append(newList, sub)
-						}
-					}
-					stackChanClient.SetCameraSubscriptionList(newList)
-					if len(stackChanClient.GetCameraSubscriptionList()) == 0 {
+					_, cameraSubscriptionsEmpty := stackChanClient.UnsubscribeCamera(client)
+					if cameraSubscriptionsEmpty {
 						offMsg := createMessage(OffCamera, nil)
 						offType := websocket.BinaryMessage
 						stackChanSendMessage(ctx, stackChanClient, &offType, offMsg)
 					}
 
-					newAudio := stackChanClient.GetAudioSubscriptionList()[:0]
-					for _, sub := range stackChanClient.GetAudioSubscriptionList() {
-						if sub != client {
-							newAudio = append(newAudio, sub)
-						}
-					}
-					stackChanClient.SetAudioSubscriptionList(newAudio)
-					if len(stackChanClient.GetAudioSubscriptionList()) == 0 {
+					_, audioSubscriptionsEmpty := stackChanClient.UnsubscribeAudio(client)
+					if audioSubscriptionsEmpty {
 						offMsg := createMessage(OffAudio, nil)
 						offType := websocket.BinaryMessage
 						stackChanSendMessage(ctx, stackChanClient, &offType, offMsg)
@@ -661,7 +672,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			macAddr := string(payload)
 			stackChanClient := getStackChanClient(macAddr)
 			if stackChanClient != nil {
-				if stackChanClient.AddAudioSubscriptionIfAbsent(client) {
+				if added, _ := stackChanClient.SubscribeAudio(client); added {
 					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 				}
 			}
@@ -670,17 +681,8 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			macAddr := string(payload)
 			stackChanClient := getStackChanClient(macAddr)
 			if stackChanClient != nil {
-				existed := false
-				newList := stackChanClient.GetAudioSubscriptionList()[:0]
-				for _, subClient := range stackChanClient.GetAudioSubscriptionList() {
-					if subClient == client {
-						existed = true
-					} else {
-						newList = append(newList, subClient)
-					}
-				}
-				shouldNotify := existed && len(newList) == 0
-				stackChanClient.SetAudioSubscriptionList(newList)
+				existed, empty := stackChanClient.UnsubscribeAudio(client)
+				shouldNotify := existed && empty
 				if shouldNotify {
 					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 				}
@@ -690,30 +692,17 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			macAddr := string(payload)
 			stackChanClient := getStackChanClient(macAddr)
 			if stackChanClient != nil {
-				for _, sub := range stackChanClient.GetCameraSubscriptionList() {
-					if sub == client {
-						return
-					}
+				if added, _ := stackChanClient.SubscribeCamera(client); added {
+					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 				}
-				stackChanClient.AppendCameraSubscriptionList(client)
-				stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 			}
 			break
 		case OffCamera:
 			macAddr := string(payload)
 			stackChanClient := getStackChanClient(macAddr)
 			if stackChanClient != nil {
-				existed := false
-				newList := stackChanClient.GetCameraSubscriptionList()[:0]
-				for _, subClient := range stackChanClient.GetCameraSubscriptionList() {
-					if subClient == client {
-						existed = true
-					} else {
-						newList = append(newList, subClient)
-					}
-				}
-				shouldNotify := existed && len(newList) == 0
-				stackChanClient.SetCameraSubscriptionList(newList)
+				existed, empty := stackChanClient.UnsubscribeCamera(client)
+				shouldNotify := existed && empty
 				if shouldNotify {
 					stackChanSendMessage(ctx, stackChanClient, messageType, msg)
 				}

@@ -65,18 +65,15 @@ func StartPingTime(ctx context.Context) {
 		return true // continue iteration
 	})
 
-	// Iterate over AppClientPool
-	appClientPool.Range(func(_, value any) bool {
-		if value == nil {
-			return true
+	// Iterate over an immutable snapshot of AppClientPool.
+	for _, entry := range getAppClientPoolSnapshot() {
+		if !entry.valid {
+			logger.Warningf(ctx, "StartPingTime: invalid type in AppClientPool for key %v, skip", entry.key)
+			continue
 		}
-		clients, ok := value.([]*model.AppClient)
-		if !ok {
-			logger.Warningf(ctx, "StartPingTime: invalid type in AppClientPool, skip")
-			return true
-		}
+		clients := entry.clients
 		if len(clients) == 0 {
-			return true
+			continue
 		}
 
 		for _, client := range clients {
@@ -96,8 +93,7 @@ func StartPingTime(ctx context.Context) {
 				appSendMessage(ctx, client, &messageType, message)
 			}()
 		}
-		return true // continue iteration
-	})
+	}
 }
 
 // CheckExpiredLinks checks and cleans up App client connections that have been inactive for over 60 seconds
@@ -109,93 +105,43 @@ func CheckExpiredLinks(ctx context.Context) {
 	}()
 
 	now := time.Now()
-	var expiredClients []*model.AppClient
-
-	// 1. Clean up expired AppClient
-	appClientPool.Range(func(mac, value any) bool {
-		if mac == nil || value == nil {
-			return true
-		}
-		clients, ok := value.([]*model.AppClient)
-		if !ok {
-			logger.Warningf(ctx, "AppClientPool invalid type for mac: %v, delete invalid entry", mac)
-			appClientPool.Delete(mac)
-			return true
-		}
-
-		newClients := clients[:0]
-		for _, client := range clients {
-			if client == nil {
-				continue
-			}
-			if now.Sub(client.GetLastTime()) > ClientExpireTimeout {
-				stackChanClientPool.Range(func(_, scValue any) bool {
-					defer func() {
-						if r := recover(); r != nil {
-							logger.Errorf(ctx, "Clean StackChanClient panic: %v", r)
-						}
-					}()
-					stackChanClient, ok := scValue.(*model.StackChanClient)
-					if !ok || stackChanClient == nil {
-						return true
-					}
-					if stackChanClient.GetCallAppClient() == client {
-						stackChanClient.SetCallAppClient(nil)
-					}
-
-					//Remove camera subscription
-					newCamera := make([]*model.AppClient, 0, len(stackChanClient.GetCameraSubscriptionList()))
-					removedCamera := false
-					for _, sub := range stackChanClient.GetCameraSubscriptionList() {
-						if sub != nil && sub != client {
-							newCamera = append(newCamera, sub)
-						} else if sub == client {
-							removedCamera = true
-						}
-					}
-					stackChanClient.SetCameraSubscriptionList(newCamera)
-
-					if removedCamera && len(newCamera) == 0 && stackChanClient.GetConn() != nil {
-						msg := createMessage(OffCamera, nil)
-						msgType := websocket.BinaryMessage
-						stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
-					}
-
-					//Remove audio subscription
-					newAudio := make([]*model.AppClient, 0, len(stackChanClient.GetAudioSubscriptionList()))
-					removedAudio := false
-					for _, sub := range stackChanClient.GetAudioSubscriptionList() {
-						if sub != nil && sub != client {
-							newAudio = append(newAudio, sub)
-						} else if sub == client {
-							removedAudio = true
-						}
-					}
-					stackChanClient.SetAudioSubscriptionList(newAudio)
-					if removedAudio && len(newAudio) == 0 && stackChanClient.GetConn() != nil {
-						msg := createMessage(OffAudio, nil)
-						msgType := websocket.BinaryMessage
-						stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
-					}
-					return true
-				})
-				expiredClients = append(expiredClients, client)
-			} else {
-				newClients = append(newClients, client)
-			}
-		}
-		if len(newClients) == 0 {
-			appClientPool.Delete(mac)
-		} else {
-			appClientPool.Store(mac, newClients)
-		}
-		return true
-	})
+	expiredClients := removeExpiredAppClients(ctx, now)
 
 	for _, client := range expiredClients {
 		if client == nil {
 			continue
 		}
+
+		stackChanClientPool.Range(func(_, scValue any) bool {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf(ctx, "Clean StackChanClient panic: %v", r)
+				}
+			}()
+			stackChanClient, ok := scValue.(*model.StackChanClient)
+			if !ok || stackChanClient == nil {
+				return true
+			}
+			if stackChanClient.GetCallAppClient() == client {
+				stackChanClient.SetCallAppClient(nil)
+			}
+
+			removedCamera, cameraSubscriptionsEmpty := stackChanClient.UnsubscribeCamera(client)
+			if removedCamera && cameraSubscriptionsEmpty && stackChanClient.GetConn() != nil {
+				msg := createMessage(OffCamera, nil)
+				msgType := websocket.BinaryMessage
+				stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
+			}
+
+			removedAudio, audioSubscriptionsEmpty := stackChanClient.UnsubscribeAudio(client)
+			if removedAudio && audioSubscriptionsEmpty && stackChanClient.GetConn() != nil {
+				msg := createMessage(OffAudio, nil)
+				msgType := websocket.BinaryMessage
+				stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
+			}
+			return true
+		})
+
 		logger.Infof(ctx, "Kicked out expired App client: %s", client.GetMac())
 		func() {
 			defer func() {
@@ -280,6 +226,44 @@ func CheckExpiredLinks(ctx context.Context) {
 			}()
 		}
 	}
+}
+
+func removeExpiredAppClients(ctx context.Context, now time.Time) []*model.AppClient {
+	appClientMu.Lock()
+	defer appClientMu.Unlock()
+
+	var expiredClients []*model.AppClient
+	appClientPool.Range(func(mac, value any) bool {
+		if mac == nil || value == nil {
+			return true
+		}
+		clients, ok := value.([]*model.AppClient)
+		if !ok {
+			logger.Warningf(ctx, "AppClientPool invalid type for mac: %v, delete invalid entry", mac)
+			appClientPool.Delete(mac)
+			return true
+		}
+
+		newClients := make([]*model.AppClient, 0, len(clients))
+		for _, client := range clients {
+			if client == nil {
+				continue
+			}
+			if now.Sub(client.GetLastTime()) > ClientExpireTimeout {
+				expiredClients = append(expiredClients, client)
+				continue
+			}
+			newClients = append(newClients, client)
+		}
+
+		if len(newClients) == 0 {
+			appClientPool.Delete(mac)
+		} else {
+			appClientPool.Store(mac, newClients)
+		}
+		return true
+	})
+	return expiredClients
 }
 
 // GetRandomStackChanDevice get Random StackChan Device list
