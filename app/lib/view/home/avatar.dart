@@ -44,6 +44,7 @@ class _AvatarViewState extends State<Avatar> {
 
   @override
   void dispose() {
+    WebSocketUtil.shared.removeConnectionObserver(tag);
     WebSocketUtil.shared.removeObserver(tag);
     AppState.shared.sendWebSocketMessage(
       .offPhoneScreen,
@@ -64,10 +65,8 @@ class _AvatarViewState extends State<Avatar> {
   void initState() {
     super.initState();
     model = AvatarModel();
+    WebSocketUtil.shared.addConnectionObserver(tag, initCameraAndSocket);
     initCameraAndSocket();
-    WebSocketUtil.shared.connectionSuccessful = () {
-      initCameraAndSocket();
-    };
   }
 
   void initCameraAndSocket() {

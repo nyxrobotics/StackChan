@@ -37,10 +37,8 @@ class _MonitoringCameraState extends State<MonitoringCamera> {
   @override
   void initState() {
     super.initState();
+    WebSocketUtil.shared.addConnectionObserver(tag, initCameraAndSocket);
     initCameraAndSocket();
-    WebSocketUtil.shared.connectionSuccessful = () {
-      initCameraAndSocket();
-    };
   }
 
   @override
@@ -100,6 +98,7 @@ class _MonitoringCameraState extends State<MonitoringCamera> {
 
   //cleanAsset / Resource
   void _cleanResources() {
+    WebSocketUtil.shared.removeConnectionObserver(tag);
     WebSocketUtil.shared.removeObserver(tag);
     if (AppState.shared.deviceMac.isNotEmpty) {
       AppState.shared.sendWebSocketMessage(
