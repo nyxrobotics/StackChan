@@ -16,12 +16,12 @@
 #define LV_ATTRIBUTE_MEM_ALIGN
 #endif
 
-#ifndef LV_ATTRIBUTE_IMAGE_DEFAULT_BUBBLE_ARROW
-#define LV_ATTRIBUTE_IMAGE_DEFAULT_BUBBLE_ARROW
+#ifndef LV_ATTRIBUTE_IMAGE_SPEECH_BUBBLE_ARROW
+#define LV_ATTRIBUTE_IMAGE_SPEECH_BUBBLE_ARROW
 #endif
 
-const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST LV_ATTRIBUTE_IMAGE_DEFAULT_BUBBLE_ARROW uint8_t
-    default_bubble_arrow_map[] = {
+const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST LV_ATTRIBUTE_IMAGE_SPEECH_BUBBLE_ARROW uint8_t
+    speech_bubble_arrow_map[] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -175,11 +175,11 @@ const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST LV_ATTRIBUTE_IMAGE_DEFAULT
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-const lv_image_dsc_t default_bubble_arrow = {
+const lv_image_dsc_t speech_bubble_arrow = {
     .header.cf    = LV_COLOR_FORMAT_RGB565A8,
     .header.magic = LV_IMAGE_HEADER_MAGIC,
     .header.w     = 28,
     .header.h     = 32,
     .data_size    = 896 * 3,
-    .data         = default_bubble_arrow_map,
+    .data         = speech_bubble_arrow_map,
 };

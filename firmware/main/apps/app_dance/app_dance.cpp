@@ -52,10 +52,9 @@ void AppDance::onOpen()
     // Destroy loading page
     loading_page.reset();
 
-    // Create default avatar
-    auto avatar = std::make_unique<avatar::DefaultAvatar>();
-    avatar->init(lv_screen_active());
-    GetStackChan().attachAvatar(std::move(avatar));
+    // Create selected avatar skin
+    auto selected_avatar = avatar::createSelectedAvatar(lv_screen_active());
+    GetStackChan().attachAvatar(std::move(selected_avatar));
 
     /* ------------------------------- BLE events ------------------------------- */
     GetHAL().onBleAvatarData.connect([&](const char* data) {

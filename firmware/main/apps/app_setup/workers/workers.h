@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace setup_workers {
@@ -276,6 +277,27 @@ private:
     uint8_t _original_brightness = 0;
     int32_t _target_brightness   = -1;
     bool _confirmed              = false;
+};
+
+class FaceSetupWorker : public WorkerBase {
+public:
+    FaceSetupWorker();
+    ~FaceSetupWorker();
+    void update() override;
+
+private:
+    void update_button_styles();
+
+    // Keep the root first so child widgets are destroyed before it.
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_title;
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_skins;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_default;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_cat;
+    std::unique_ptr<uitk::lvgl_cpp::Button> _btn_confirm;
+
+    std::string _selected_skin_id;
+    bool _confirm_flag = false;
 };
 
 /**

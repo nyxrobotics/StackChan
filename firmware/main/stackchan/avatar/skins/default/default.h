@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #pragma once
+#include "../common/speech_bubble.h"
 #include "../../avatar/avatar.h"
 #include "../../avatar/elements/feature.h"
 #include <lvgl.h>
@@ -22,10 +23,6 @@ public:
     lv_color_t secondaryColor = lv_color_black();
 
     void init(lv_obj_t* parent, const lv_font_t* font = &lv_font_montserrat_16);
-    uitk::lvgl_cpp::Container* getPanel() const;
-
-private:
-    std::unique_ptr<uitk::lvgl_cpp::Container> _pannel;
 };
 
 /**
@@ -75,21 +72,6 @@ private:
  * @brief
  *
  */
-class DefaultSpeechBubble : public SpeechBubble {
-public:
-    DefaultSpeechBubble(lv_obj_t* parent, lv_color_t primaryColor, lv_color_t secondaryColor, const lv_font_t* font);
-    ~DefaultSpeechBubble();
-
-    void setSpeech(std::string_view text) override;
-    void clearSpeech() override;
-    void setVisible(bool visible) override;
-    void setTextFont(void* font) override;
-
-private:
-    std::unique_ptr<uitk::lvgl_cpp::Container> _container;
-    std::unique_ptr<uitk::lvgl_cpp::Image> _arrow;
-    std::unique_ptr<uitk::lvgl_cpp::Container> _bubble;
-    std::unique_ptr<uitk::lvgl_cpp::Label> _text;
-};
+using DefaultSpeechBubble = CommonSpeechBubble;
 
 }  // namespace stackchan::avatar

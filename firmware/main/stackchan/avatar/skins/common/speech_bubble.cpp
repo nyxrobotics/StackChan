@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: MIT
  */
-#include "default.h"
+#include "speech_bubble.h"
 
 using namespace uitk;
 using namespace uitk::lvgl_cpp;
@@ -19,10 +19,10 @@ static const int _bubble_height       = 52;
 static const int _bubble_min_offset_x = 66;
 static const int _bubble_max_offset_x = 0;
 
-LV_IMAGE_DECLARE(default_bubble_arrow);
+LV_IMAGE_DECLARE(speech_bubble_arrow);
 
-DefaultSpeechBubble::DefaultSpeechBubble(lv_obj_t* parent, lv_color_t primaryColor, lv_color_t secondaryColor,
-                                         const lv_font_t* font)
+CommonSpeechBubble::CommonSpeechBubble(lv_obj_t* parent, lv_color_t primaryColor, lv_color_t secondaryColor,
+                                       const lv_font_t* font)
 {
     _container = std::make_unique<Container>(parent);
     _container->setRadius(0);
@@ -35,7 +35,7 @@ DefaultSpeechBubble::DefaultSpeechBubble(lv_obj_t* parent, lv_color_t primaryCol
     _container->setPadding(0, 0, 0, 0);
 
     _arrow = std::make_unique<Image>(_container->get());
-    _arrow->setSrc(&default_bubble_arrow);
+    _arrow->setSrc(&speech_bubble_arrow);
     _arrow->setAlign(LV_ALIGN_CENTER);
     _arrow->setPos(_arrow_offset.x, _arrow_offset.y);
     _arrow->setImageRecolorOpa(LV_OPA_COVER);
@@ -62,7 +62,7 @@ DefaultSpeechBubble::DefaultSpeechBubble(lv_obj_t* parent, lv_color_t primaryCol
     clearSpeech();
 }
 
-DefaultSpeechBubble::~DefaultSpeechBubble()
+CommonSpeechBubble::~CommonSpeechBubble()
 {
     _text.reset();
     _bubble.reset();
@@ -70,7 +70,7 @@ DefaultSpeechBubble::~DefaultSpeechBubble()
     _container.reset();
 }
 
-void DefaultSpeechBubble::setSpeech(std::string_view text)
+void CommonSpeechBubble::setSpeech(std::string_view text)
 {
     if (text.empty()) {
         clearSpeech();
@@ -94,20 +94,20 @@ void DefaultSpeechBubble::setSpeech(std::string_view text)
     setVisible(true);
 }
 
-void DefaultSpeechBubble::clearSpeech()
+void CommonSpeechBubble::clearSpeech()
 {
     _text->setText("");
     setVisible(false);
 }
 
-void DefaultSpeechBubble::setVisible(bool visible)
+void CommonSpeechBubble::setVisible(bool visible)
 {
     SpeechBubble::setVisible(visible);
 
     _container->setHidden(!visible);
 }
 
-void DefaultSpeechBubble::setTextFont(void* font)
+void CommonSpeechBubble::setTextFont(void* font)
 {
     if (_text && font) {
         _text->setTextFont((lv_font_t*)font);

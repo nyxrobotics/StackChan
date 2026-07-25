@@ -24,13 +24,12 @@ WifiSetupWorker::WifiSetupWorker()
     _last_state  = State::None;
     _is_first_in = true;
 
-    // Create default avatar
-    auto avatar = std::make_unique<avatar::DefaultAvatar>();
-    avatar->init(lv_screen_active(), &lv_font_montserrat_24);
-    avatar->leftEye().setVisible(false);
-    avatar->rightEye().setVisible(false);
-    avatar->mouth().setVisible(false);
-    GetStackChan().attachAvatar(std::move(avatar));
+    // Create selected avatar skin
+    auto selected_avatar = avatar::createSelectedAvatar(lv_screen_active(), &lv_font_montserrat_24);
+    selected_avatar->leftEye().setVisible(false);
+    selected_avatar->rightEye().setVisible(false);
+    selected_avatar->mouth().setVisible(false);
+    GetStackChan().attachAvatar(std::move(selected_avatar));
 }
 
 WifiSetupWorker::~WifiSetupWorker()

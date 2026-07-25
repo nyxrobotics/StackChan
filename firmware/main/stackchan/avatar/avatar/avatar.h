@@ -6,6 +6,7 @@
 #pragma once
 #include "elements/key_elements.h"
 #include "decorator.h"
+#include <smooth_lvgl.hpp>
 #include <memory>
 
 namespace stackchan::avatar {
@@ -16,6 +17,18 @@ namespace stackchan::avatar {
  */
 class Avatar {
 public:
+    virtual ~Avatar() = default;
+
+    uitk::lvgl_cpp::Container* getPanel() const
+    {
+        return _panel.get();
+    }
+
+    virtual bool hasNativeSleepIndicator() const
+    {
+        return false;
+    }
+
     /**
      * @brief Update avatar, trigger all elements, decorators and modifiers to update
      *
@@ -127,6 +140,8 @@ public:
 protected:
     Avatar() = default;
 
+    // Declare the LVGL root before its children so it is destroyed last.
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
     Emotion _emotion = Emotion::Neutral;
     KeyElements_t _key_elements;
     ObjectPool<Decorator> _decorator_pool;

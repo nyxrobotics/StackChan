@@ -251,9 +251,8 @@ void StackChanAvatarDisplay::SetupUI()
 
     ESP_LOGI(TAG, "Creating Stack-chan Avatar...");
 
-    auto avatar = std::make_unique<DefaultAvatar>();
-    avatar->init(lv_screen_active());
-    avatar->getPanel()->onClick().connect([]() {
+    auto selected_avatar = createSelectedAvatar(lv_screen_active());
+    selected_avatar->getPanel()->onClick().connect([]() {
         static uint32_t last_toggle_tick = 0;
         const uint32_t now               = GetHAL().millis();
         if (last_toggle_tick != 0 && now - last_toggle_tick < 2000) {
@@ -266,7 +265,7 @@ void StackChanAvatarDisplay::SetupUI()
         }
     });
 
-    stackchan.attachAvatar(std::move(avatar));
+    stackchan.attachAvatar(std::move(selected_avatar));
     stackchan.addModifier(std::make_unique<BreathModifier>());
     blink_modifier_id_ = stackchan.addModifier(std::make_unique<BlinkModifier>());
     stackchan.addModifier(std::make_unique<HeadPetModifier>());
@@ -347,7 +346,11 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
         avatar.setEmotion(Emotion::Sad);
     } else if (strcmp(emotion, "sleepy") == 0) {
         avatar.setEmotion(Emotion::Sleepy);
-        avatar.setSpeech("Zzz…");
+        if (avatar.hasNativeSleepIndicator()) {
+            avatar.clearSpeech();
+        } else {
+            avatar.setSpeech("Zzz…");
+        }
         is_sleeping_ = true;
         // avatar.mouth().setWeight(10);
 
@@ -366,6 +369,12 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
 
     } else if (strcmp(emotion, "doubtful") == 0) {
         avatar.setEmotion(Emotion::Doubt);
+    } else if (strcmp(emotion, "cute") == 0 || strcmp(emotion, "loving") == 0 || strcmp(emotion, "love") == 0) {
+        avatar.setEmotion(Emotion::Cute);
+    } else if (strcmp(emotion, "dizzy") == 0 || strcmp(emotion, "confused") == 0) {
+        avatar.setEmotion(Emotion::Dizzy);
+    } else if (strcmp(emotion, "wink") == 0 || strcmp(emotion, "winking") == 0) {
+        avatar.setEmotion(Emotion::Wink);
     } else {
         ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
         avatar.setEmotion(Emotion::Neutral);
@@ -568,6 +577,7 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     // Clear sleep state
     if (is_sleeping_) {
         avatar.setSpeech("");
+        is_sleeping_ = false;
     }
 }
 

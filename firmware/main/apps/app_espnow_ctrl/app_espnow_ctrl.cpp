@@ -72,9 +72,8 @@ void AppEspnowControl::onOpen()
 
     auto& stackchan = GetStackChan();
 
-    auto avatar = std::make_unique<avatar::DefaultAvatar>();
-    avatar->init(lv_screen_active());
-    stackchan.attachAvatar(std::move(avatar));
+    auto selected_avatar = avatar::createSelectedAvatar(lv_screen_active());
+    stackchan.attachAvatar(std::move(selected_avatar));
 
     stackchan.clearModifiers();
     stackchan.addModifier(std::make_unique<BreathModifier>());

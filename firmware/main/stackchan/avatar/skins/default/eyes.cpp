@@ -118,6 +118,15 @@ void DefaultEyes::setEmotion(const Emotion& emotion)
         case Emotion::Sleepy:
             apply_style(35, -50);
             break;
+        case Emotion::Cute:
+            apply_style(85, 0);
+            break;
+        case Emotion::Dizzy:
+            apply_style(75, 0);
+            break;
+        case Emotion::Wink:
+            apply_style(_is_left_eye ? 100 : 25, 0);
+            break;
         default:
             break;
     }
