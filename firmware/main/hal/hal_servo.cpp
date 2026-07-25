@@ -117,7 +117,7 @@ public:
 
     bool is_moving_impl() override
     {
-        return _scs_bus.ReadMove(_config.id) != 0;
+        return _scs_bus.ReadMove(_config.id) > 0;
     }
 
     void setTorqueEnabled(bool enabled) override
