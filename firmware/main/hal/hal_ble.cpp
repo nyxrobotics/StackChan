@@ -8,11 +8,14 @@
 #include "utils/secret_logic/secret_logic.h"
 #include <ArduinoJson.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <mooncake_log.h>
 #include <mooncake.h>
 #include <settings.h>
 #include <esp_mac.h>
+#include "host/ble_att.h"
 
 static const std::string_view _tag              = "HAL-BLE";
 static const uint8_t _ble_fragment_magic0       = 0xAA;
@@ -21,20 +24,19 @@ static const uint8_t _ble_fragment_magic2       = 0xC3;
 static const uint8_t _ble_fragment_version      = 1;
 static const uint16_t _ble_fragment_header_len  = 10;
 static const uint16_t _ble_fallback_payload_len = 23 - 3;
-static uint16_t _ble_dynamic_payload            = _ble_fallback_payload_len;
 
 using BleNotifyCallback = int (*)(const char*, uint16_t);
 
-static void _recordIncomingWritePayload(uint16_t len)
-{
-    if (len > _ble_dynamic_payload && len <= STACKCHAN_MAX_JSON_LEN) {
-        _ble_dynamic_payload = len;
-    }
-}
-
 static bool _sendFragmentedNotify(BleNotifyCallback notify, const char* json_data, uint16_t json_len, const char* tag)
 {
-    const uint16_t usable_payload = std::max(_ble_dynamic_payload, stackchan_ble_get_notify_payload_len());
+    if (notify == nullptr) {
+        mclog::tagWarn(_tag, "{} notify callback is unavailable", tag);
+        return false;
+    }
+
+    const uint16_t negotiated_payload = stackchan_ble_get_notify_payload_len();
+    const uint16_t usable_payload =
+        negotiated_payload == 0 ? _ble_fallback_payload_len : negotiated_payload;
 
     if (json_data == nullptr || json_len == 0) {
         return true;
@@ -65,30 +67,38 @@ static bool _sendFragmentedNotify(BleNotifyCallback notify, const char* json_dat
     mclog::tagInfo(_tag, "{} fragmented notify: total={}, mtu_payload={}, chunk_payload={}, packets={}", tag, json_len,
                    usable_payload, max_chunk_payload, total_packets);
 
-    for (uint16_t idx = 0; idx < total_packets; idx++) {
-        const uint16_t start     = idx * max_chunk_payload;
-        const uint16_t chunk_len = std::min<uint16_t>(max_chunk_payload, json_len - start);
+    try {
+        for (uint16_t idx = 0; idx < total_packets; idx++) {
+            const uint16_t start     = idx * max_chunk_payload;
+            const uint16_t chunk_len = std::min<uint16_t>(max_chunk_payload, json_len - start);
 
-        std::string packet;
-        packet.reserve(_ble_fragment_header_len + chunk_len);
-        packet.push_back(static_cast<char>(_ble_fragment_magic0));
-        packet.push_back(static_cast<char>(_ble_fragment_magic1));
-        packet.push_back(static_cast<char>(_ble_fragment_magic2));
-        packet.push_back(static_cast<char>(_ble_fragment_version));
+            std::string packet;
+            packet.reserve(_ble_fragment_header_len + chunk_len);
+            packet.push_back(static_cast<char>(_ble_fragment_magic0));
+            packet.push_back(static_cast<char>(_ble_fragment_magic1));
+            packet.push_back(static_cast<char>(_ble_fragment_magic2));
+            packet.push_back(static_cast<char>(_ble_fragment_version));
 
-        packet.push_back(static_cast<char>((idx >> 8) & 0xFF));
-        packet.push_back(static_cast<char>(idx & 0xFF));
-        packet.push_back(static_cast<char>((total_packets >> 8) & 0xFF));
-        packet.push_back(static_cast<char>(total_packets & 0xFF));
-        packet.push_back(static_cast<char>((json_len >> 8) & 0xFF));
-        packet.push_back(static_cast<char>(json_len & 0xFF));
+            packet.push_back(static_cast<char>((idx >> 8) & 0xFF));
+            packet.push_back(static_cast<char>(idx & 0xFF));
+            packet.push_back(static_cast<char>((total_packets >> 8) & 0xFF));
+            packet.push_back(static_cast<char>(total_packets & 0xFF));
+            packet.push_back(static_cast<char>((json_len >> 8) & 0xFF));
+            packet.push_back(static_cast<char>(json_len & 0xFF));
 
-        packet.append(json_data + start, json_data + start + chunk_len);
+            packet.append(json_data + start, json_data + start + chunk_len);
 
-        if (notify(packet.data(), static_cast<uint16_t>(packet.size())) != 0) {
-            mclog::tagWarn(_tag, "{} fragmented notify failed at packet={}", tag, idx);
-            return false;
+            if (notify(packet.data(), static_cast<uint16_t>(packet.size())) != 0) {
+                mclog::tagWarn(_tag, "{} fragmented notify failed at packet={}", tag, idx);
+                return false;
+            }
         }
+    } catch (const std::exception& error) {
+        mclog::tagError(_tag, "{} fragmentation failed: {}", tag, error.what());
+        return false;
+    } catch (...) {
+        mclog::tagError(_tag, "{} fragmentation failed with an unknown exception", tag);
+        return false;
     }
 
     return true;
@@ -98,6 +108,11 @@ class BleFragmentAssembler {
 public:
     bool consume(const char* data, uint16_t len, std::string& out_data, uint16_t& out_len)
     {
+        if (data == nullptr || len == 0 || len > STACKCHAN_MAX_JSON_LEN) {
+            reset();
+            return false;
+        }
+
         if (!isFragmentFrame(data, len)) {
             out_data.assign(data, data + len);
             reset();
@@ -236,65 +251,81 @@ static const char* _cachePayload(std::string& cache, const std::string& payload)
 
 static int _handle_ble_motion_write(const char* json_data, uint16_t len, uint16_t conn_handle)
 {
-    std::string payload;
-    uint16_t payload_len = len;
     (void)conn_handle;
-    _recordIncomingWritePayload(len);
-    if (!_motion_assembler.consume(json_data, len, payload, payload_len)) {
-        return 0;
+    try {
+        std::string payload;
+        uint16_t payload_len = len;
+        if (!_motion_assembler.consume(json_data, len, payload, payload_len) || payload_len == 0) {
+            return 0;
+        }
+        GetHAL().onBleMotionData.emit(_cachePayload(_motion_payload_cache, payload));
+    } catch (const std::exception& error) {
+        mclog::tagError(_tag, "motion callback failed: {}", error.what());
+        return BLE_ATT_ERR_UNLIKELY;
+    } catch (...) {
+        mclog::tagError(_tag, "motion callback failed with an unknown exception");
+        return BLE_ATT_ERR_UNLIKELY;
     }
-    if (payload_len == 0) {
-        return 0;
-    }
-    GetHAL().onBleMotionData.emit(_cachePayload(_motion_payload_cache, payload));
     return 0;
 }
 
 static int _handle_ble_avatar_write(const char* json_data, uint16_t len, uint16_t conn_handle)
 {
-    std::string payload;
-    uint16_t payload_len = len;
     (void)conn_handle;
-    _recordIncomingWritePayload(len);
-    if (!_avatar_assembler.consume(json_data, len, payload, payload_len)) {
-        return 0;
+    try {
+        std::string payload;
+        uint16_t payload_len = len;
+        if (!_avatar_assembler.consume(json_data, len, payload, payload_len) || payload_len == 0) {
+            return 0;
+        }
+        GetHAL().onBleAvatarData.emit(_cachePayload(_avatar_payload_cache, payload));
+    } catch (const std::exception& error) {
+        mclog::tagError(_tag, "avatar callback failed: {}", error.what());
+        return BLE_ATT_ERR_UNLIKELY;
+    } catch (...) {
+        mclog::tagError(_tag, "avatar callback failed with an unknown exception");
+        return BLE_ATT_ERR_UNLIKELY;
     }
-    if (payload_len == 0) {
-        return 0;
-    }
-    GetHAL().onBleAvatarData.emit(_cachePayload(_avatar_payload_cache, payload));
     return 0;
 }
 
 static int _handle_ble_config_write(const char* json_data, uint16_t len, uint16_t conn_handle)
 {
-    std::string payload;
-    uint16_t payload_len = len;
     (void)conn_handle;
-    _recordIncomingWritePayload(len);
-    if (!_config_assembler.consume(json_data, len, payload, payload_len)) {
-        return 0;
+    try {
+        std::string payload;
+        uint16_t payload_len = len;
+        if (!_config_assembler.consume(json_data, len, payload, payload_len) || payload_len == 0) {
+            return 0;
+        }
+        GetHAL().onBleConfigData.emit(_cachePayload(_config_payload_cache, payload));
+    } catch (const std::exception& error) {
+        mclog::tagError(_tag, "config callback failed: {}", error.what());
+        return BLE_ATT_ERR_UNLIKELY;
+    } catch (...) {
+        mclog::tagError(_tag, "config callback failed with an unknown exception");
+        return BLE_ATT_ERR_UNLIKELY;
     }
-    if (payload_len == 0) {
-        return 0;
-    }
-    GetHAL().onBleConfigData.emit(_cachePayload(_config_payload_cache, payload));
     return 0;
 }
 
 static int _handle_ble_rgb_write(const char* json_data, uint16_t len, uint16_t conn_handle)
 {
-    std::string payload;
-    uint16_t payload_len = len;
     (void)conn_handle;
-    _recordIncomingWritePayload(len);
-    if (!_rgb_assembler.consume(json_data, len, payload, payload_len)) {
-        return 0;
+    try {
+        std::string payload;
+        uint16_t payload_len = len;
+        if (!_rgb_assembler.consume(json_data, len, payload, payload_len) || payload_len == 0) {
+            return 0;
+        }
+        GetHAL().onBleRgbData.emit(_cachePayload(_rgb_payload_cache, payload));
+    } catch (const std::exception& error) {
+        mclog::tagError(_tag, "RGB callback failed: {}", error.what());
+        return BLE_ATT_ERR_UNLIKELY;
+    } catch (...) {
+        mclog::tagError(_tag, "RGB callback failed with an unknown exception");
+        return BLE_ATT_ERR_UNLIKELY;
     }
-    if (payload_len == 0) {
-        return 0;
-    }
-    GetHAL().onBleRgbData.emit(_cachePayload(_rgb_payload_cache, payload));
     return 0;
 }
 
@@ -304,9 +335,9 @@ static uint8_t _handle_ble_battery_read(void)
     return 96;
 }
 
-void Hal::ble_init(bool useAltUuid)
+bool Hal::ble_init(bool useAltUuid)
 {
-    mclog::tagInfo(_tag, "init");
+    mclog::tagInfo(_tag, "init (uuid mode: {})", useAltUuid ? "alternate" : "normal");
 
     static stackchan_ble_callbacks_t ble_callbacks = {
         .motion_cb       = _handle_ble_motion_write,
@@ -317,18 +348,28 @@ void Hal::ble_init(bool useAltUuid)
     };
     stackchan_ble_register_callbacks(&ble_callbacks);
 
-    ble_prph_init(useAltUuid);
+    uint8_t mac[6] = {};
+    const esp_err_t mac_result = esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+    if (mac_result != ESP_OK) {
+        mclog::tagError(_tag, "failed to read factory MAC: {}", esp_err_to_name(mac_result));
+        return false;
+    }
 
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+    const int rc = ble_prph_init(useAltUuid);
+    if (rc != 0) {
+        mclog::tagError(_tag, "BLE initialization failed: {}", rc);
+        return false;
+    }
+
     mclog::tagInfo(_tag, "init done, factory mac: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2],
                    mac[3], mac[4], mac[5]);
+    return true;
 }
 
-void Hal::startBleServer()
+bool Hal::startBleServer()
 {
     mclog::tagInfo(_tag, "start ble server");
-    ble_init(false);
+    return ble_init(false);
 }
 
 bool Hal::isBleConnected()
@@ -343,13 +384,22 @@ bool Hal::isBleConnected()
 #include <string_view>
 #include <queue>
 #include <mutex>
-#include <atomic>
 
 class WifiConfigServer {
 public:
+    ~WifiConfigServer()
+    {
+        if (_ble_config_signal_connected) {
+            GetHAL().onBleConfigData.disconnect(_ble_config_signal_id);
+            _ble_config_signal_connected = false;
+        }
+    }
+
     void init()
     {
-        GetHAL().onBleConfigData.connect([this](const char* data) { on_config_data(data); });
+        _ble_config_signal_id =
+            GetHAL().onBleConfigData.connect([this](const char* data) { on_config_data(data); });
+        _ble_config_signal_connected = true;
         _was_connected = stackchan_ble_is_connected();
 
         // Setup WifiStation callbacks
@@ -375,7 +425,10 @@ public:
             GetHAL().onAppConfigEvent.emit(AppConfigEvent::WifiConnectFailed);
         });
 
-        _wifi_station->Start();
+        if (!_wifi_station->Start()) {
+            mclog::tagError(_tag, "failed to start WiFi configuration station");
+            notify_state(2, "wifiConnectFailed: WiFi unavailable");
+        }
     }
 
     void update()
@@ -410,15 +463,28 @@ public:
 
 private:
     static constexpr std::string_view _tag = "WifiConfigServer";
+    static constexpr size_t _max_pending_messages = 16;
     std::queue<std::string> _msg_queue;
     std::mutex _mutex;
+    std::mutex _notify_mutex;
     bool _was_connected = false;
     std::atomic<bool> _is_wifi_connecting{false};
     std::unique_ptr<StackChanWifiStation> _wifi_station;
+    size_t _ble_config_signal_id = 0;
+    bool _ble_config_signal_connected = false;
 
     void on_config_data(const char* json_data)
     {
+        if (json_data == nullptr) {
+            mclog::tagWarn(_tag, "ignoring null BLE config payload");
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(_mutex);
+        if (_msg_queue.size() >= _max_pending_messages) {
+            mclog::tagWarn(_tag, "BLE config queue full, dropping oldest payload");
+            _msg_queue.pop();
+        }
         _msg_queue.push(json_data);
     }
 
@@ -463,11 +529,14 @@ private:
 
         const char* ssid     = data["ssid"];
         const char* password = data["password"];
+        if (ssid == nullptr || password == nullptr) {
+            mclog::tagWarn(_tag, "setWifi request is missing credentials");
+            notify_state(2, "wifiConnectFailed: Invalid credentials");
+            return;
+        }
 
         mclog::tagInfo(_tag, "get wifi config: {}", ssid);
 
-        // Notify state: connecting
-        notify_state(0, "wifiConnecting");
         GetHAL().onAppConfigEvent.emit(AppConfigEvent::TryWifiConnect);
 
         connect_wifi(ssid, password);
@@ -487,6 +556,8 @@ private:
 
     void notify_state(int type, const char* state)
     {
+        std::lock_guard<std::mutex> lock(_notify_mutex);
+
         ArduinoJson::JsonDocument doc;
         doc["cmd"]           = "notifyState";
         doc["data"]["type"]  = type;
@@ -534,13 +605,35 @@ private:
     uint32_t _last_tick = 0;
 };
 
-void Hal::startAppConfigServer()
+bool Hal::startAppConfigServer()
 {
+    static std::mutex server_mutex;
+    static int server_ability_id = -1;
+    std::lock_guard<std::mutex> lock(server_mutex);
+
     mclog::tagInfo(_tag, "start app config server");
 
-    ble_init(true);
+    auto* extension_manager = mooncake::GetMooncake().extensionManager();
+    if (extension_manager == nullptr) {
+        mclog::tagError(_tag, "app config server manager is unavailable");
+        return false;
+    }
+    if (server_ability_id >= 0 && extension_manager->isAbilityExist(server_ability_id)) {
+        mclog::tagInfo(_tag, "app config server is already running");
+        return true;
+    }
 
-    mooncake::GetMooncake().extensionManager()->createAbility(std::make_unique<AppConfigServerWorker>());
+    if (!ble_init(true)) {
+        mclog::tagError(_tag, "app config server not started because BLE is unavailable");
+        return false;
+    }
+
+    server_ability_id = extension_manager->createAbility(std::make_unique<AppConfigServerWorker>());
+    if (server_ability_id < 0) {
+        mclog::tagError(_tag, "failed to create app config server worker");
+        return false;
+    }
+    return true;
 }
 
 bool Hal::isAppConfiged()

@@ -12,6 +12,8 @@ static const char* TAG = "PCF8563";
 
 namespace m5 {
 
+static constexpr int kI2cTimeoutMs = 50;
+
 static std::uint8_t bcd2ToByte(std::uint8_t value)
 {
     return ((value >> 4) * 10) + (value & 0x0F);
@@ -23,14 +25,18 @@ static std::uint8_t byteToBcd2(std::uint8_t value)
     return (bcdhigh << 4) | (value - (bcdhigh * 10));
 }
 
-PCF8563_Class::PCF8563_Class(i2c_master_bus_handle_t i2c_bus_handle, uint8_t addr) : _addr(addr), _init(false)
+PCF8563_Class::PCF8563_Class(i2c_master_bus_handle_t i2c_bus_handle, uint8_t addr)
+    : _i2c_dev(nullptr), _addr(addr), _init(false)
 {
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = _addr,
         .scl_speed_hz    = 400000,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev));
+    esp_err_t err = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register I2C device: %s", esp_err_to_name(err));
+    }
 }
 
 PCF8563_Class::~PCF8563_Class()
@@ -42,6 +48,8 @@ PCF8563_Class::~PCF8563_Class()
 
 bool PCF8563_Class::begin()
 {
+    if (_i2c_dev == nullptr) return false;
+
     // TimerCamera's internal RTC sometimes failed to initialize, so execute a dummy write first
     writeRegister8(0x00, 0x00);
     _init = (writeRegister8(0x00, 0x00) == ESP_OK) && (writeRegister8(0x0E, 0x03) == ESP_OK);
@@ -50,14 +58,16 @@ bool PCF8563_Class::begin()
 
 esp_err_t PCF8563_Class::writeRegister8(uint8_t reg, uint8_t value)
 {
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
     uint8_t buf[2] = {reg, value};
-    return i2c_master_transmit(_i2c_dev, buf, sizeof(buf), 1000);
+    return i2c_master_transmit(_i2c_dev, buf, sizeof(buf), kI2cTimeoutMs);
 }
 
 uint8_t PCF8563_Class::readRegister8(uint8_t reg)
 {
+    if (_i2c_dev == nullptr) return 0;
     uint8_t val   = 0;
-    esp_err_t err = i2c_master_transmit_receive(_i2c_dev, &reg, 1, &val, 1, 1000);
+    esp_err_t err = i2c_master_transmit_receive(_i2c_dev, &reg, 1, &val, 1, kI2cTimeoutMs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "readRegister8 failed: %s", esp_err_to_name(err));
         return 0;
@@ -67,21 +77,22 @@ uint8_t PCF8563_Class::readRegister8(uint8_t reg)
 
 esp_err_t PCF8563_Class::writeRegister(uint8_t reg, const uint8_t* data, size_t len)
 {
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
     if (len == 0) return ESP_OK;
-    uint8_t* buf = (uint8_t*)malloc(len + 1);
-    if (!buf) return ESP_ERR_NO_MEM;
+    if (len > 7) return ESP_ERR_INVALID_SIZE;
 
+    uint8_t buf[8];
     buf[0] = reg;
     memcpy(buf + 1, data, len);
 
-    esp_err_t err = i2c_master_transmit(_i2c_dev, buf, len + 1, 1000);
-    free(buf);
+    esp_err_t err = i2c_master_transmit(_i2c_dev, buf, len + 1, kI2cTimeoutMs);
     return err;
 }
 
 esp_err_t PCF8563_Class::readRegister(uint8_t reg, uint8_t* data, size_t len)
 {
-    return i2c_master_transmit_receive(_i2c_dev, &reg, 1, data, len, 1000);
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
+    return i2c_master_transmit_receive(_i2c_dev, &reg, 1, data, len, kI2cTimeoutMs);
 }
 
 esp_err_t PCF8563_Class::bitOn(uint8_t reg, uint8_t mask)

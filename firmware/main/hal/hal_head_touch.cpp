@@ -126,11 +126,21 @@ static void _head_touch_update_task(void* param)
     GestureRecognizer recognizer;
     HeadPetGesture gesture;
 
-    vTaskDelay(pdMS_TO_TICKS(200));
-
+    uint32_t consecutive_read_failures = 0;
     while (1) {
         // Read data
-        si12t_read_touch_result(si12t, &touch_result);
+        esp_err_t err = si12t_read_touch_result(si12t, &touch_result);
+        if (err != ESP_OK) {
+            ++consecutive_read_failures;
+            if (consecutive_read_failures == 1 || consecutive_read_failures % 20 == 0) {
+                mclog::tagWarn(_tag, "touch read failed: {} (count={})", esp_err_to_name(err),
+                               consecutive_read_failures);
+            }
+            uint32_t shift = consecutive_read_failures > 5 ? 4 : consecutive_read_failures - 1;
+            vTaskDelay(pdMS_TO_TICKS(50U << shift));
+            continue;
+        }
+        consecutive_read_failures = 0;
         si12t_parse_touch_result_to(touch_result, data.intensity);
         data.timestamp = xTaskGetTickCount();
 
@@ -155,8 +165,7 @@ bool Hal::head_touch_init_impl()
         .dev_addr = SI12T_GND_ADDRESS,
     };
 
-    // Allocate handle on heap so it survives after this function returns
-    static si12t_handle_t si12t = nullptr;
+    si12t_handle_t si12t = nullptr;
 
     esp_err_t err = si12t_init(&si12t_cfg, &si12t);
     if (err != ESP_OK) {
@@ -167,12 +176,19 @@ bool Hal::head_touch_init_impl()
     err = si12t_setup(si12t, SI12T_TYPE_LOW, SI12T_SENSITIVITY_LEVEL_3);
     if (err != ESP_OK) {
         mclog::tagWarn(_tag, "SI12T setup failed (err={})", static_cast<int>(err));
+        si12t_delete(si12t);
         return false;
     }
 
     // Start update task only when hardware is confirmed present
-    xTaskCreatePinnedToCoreWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, 1,
-                                    MALLOC_CAP_SPIRAM);
+    BaseType_t task_created =
+        xTaskCreatePinnedToCoreWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, 1,
+                                        MALLOC_CAP_SPIRAM);
+    if (task_created != pdPASS) {
+        mclog::tagWarn(_tag, "failed to create SI12T update task");
+        si12t_delete(si12t);
+        return false;
+    }
 
     mclog::tagInfo(_tag, "SI12T init ok, update task started");
     return true;

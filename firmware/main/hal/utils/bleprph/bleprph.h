@@ -75,10 +75,11 @@ struct ble_gatt_register_ctxt;
  * @param conn_handle BLE connection handle
  * @return           0 on success, error code otherwise
  */
-typedef int (*stackchan_ble_motion_callback_t)(const char *json_data, uint16_t len, uint16_t conn_handle);
-typedef int (*stackchan_ble_avatar_callback_t)(const char *json_data, uint16_t len, uint16_t conn_handle);
-typedef int (*stackchan_ble_config_callback_t)(const char *json_data, uint16_t len, uint16_t conn_handle);
-typedef int (*stackchan_ble_rgb_callback_t)(const char *json_data, uint16_t len, uint16_t conn_handle);
+typedef int (*stackchan_ble_data_callback_t)(const char *json_data, uint16_t len, uint16_t conn_handle);
+typedef stackchan_ble_data_callback_t stackchan_ble_motion_callback_t;
+typedef stackchan_ble_data_callback_t stackchan_ble_avatar_callback_t;
+typedef stackchan_ble_data_callback_t stackchan_ble_config_callback_t;
+typedef stackchan_ble_data_callback_t stackchan_ble_rgb_callback_t;
 
 /**
  * Battery level callback function type
@@ -173,7 +174,30 @@ uint16_t stackchan_ble_get_notify_payload_len(void);
 void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg);
 int gatt_svr_init(bool use_alt_uuid);
 
-void ble_prph_init(bool use_alt_uuid);
+/**
+ * Release resources from an incomplete GATT initialization.
+ *
+ * Internal lifecycle helper: the NimBLE host task must not be running when
+ * this is called.
+ */
+void gatt_svr_cleanup_init_failure(void);
+
+/**
+ * Stop and release the optional pairing CLI task and its owned resources.
+ * The NimBLE host must not be blocked in scli_receive_key() when called.
+ */
+int scli_deinit(void);
+
+/**
+ * Initialize the BLE peripheral.
+ *
+ * Repeating the call with the same UUID mode is idempotent. Switching UUID
+ * modes after the host has started is rejected because NimBLE's registered
+ * GATT table cannot be replaced safely while callbacks may still be active.
+ *
+ * @return 0 on success, otherwise an ESP-IDF or NimBLE error code.
+ */
+int ble_prph_init(bool use_alt_uuid);
 
 #ifdef __cplusplus
 }

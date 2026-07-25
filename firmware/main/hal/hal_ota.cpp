@@ -62,15 +62,12 @@ bool Hal::updateFirmware(std::function<void(std::string_view)> onLog)
 
     if (!upgrade_success) {
         mclog::tagError(_tag, "firmware upgrade failed: version={}, url={}", firmware_version, firmware_url);
-        onLog("Firmware upgrade failed, rebooting...");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        reboot();
+        onLog("Firmware upgrade failed. Please retry.");
         return false;
     }
 
     mclog::tagInfo(_tag, "firmware upgrade successful, rebooting");
     onLog("Upgrade successful, rebooting...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
     reboot();
     return true;
 }

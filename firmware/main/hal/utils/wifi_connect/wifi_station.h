@@ -3,6 +3,7 @@
 
 #include <string>
 #include <functional>
+#include <mutex>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -18,21 +19,17 @@ class StackChanWifiStation {
 public:
     StackChanWifiStation();
     ~StackChanWifiStation();
+    StackChanWifiStation(const StackChanWifiStation&)            = delete;
+    StackChanWifiStation& operator=(const StackChanWifiStation&) = delete;
 
-    void AddAuth(const std::string& ssid, const std::string& password);
-    void Start();
+    bool AddAuth(const std::string& ssid, const std::string& password);
+    bool Start();
     void Stop();
     bool IsConnected();
     bool WaitForConnected(int timeout_ms = 10000);
     int8_t GetRssi();
-    std::string GetSsid() const
-    {
-        return ssid_;
-    }
-    std::string GetIpAddress() const
-    {
-        return ip_address_;
-    }
+    std::string GetSsid() const;
+    std::string GetIpAddress() const;
     uint8_t GetChannel();
     void SetPowerSaveMode(bool enabled);
 
@@ -41,10 +38,16 @@ public:
     void OnConnectFailed(std::function<void(const std::string& ssid)> on_connect_failed);
 
 private:
+    void CleanupStartFailure();
+
     EventGroupHandle_t event_group_;
     esp_event_handler_instance_t instance_any_id_ = nullptr;
     esp_event_handler_instance_t instance_got_ip_ = nullptr;
     esp_netif_t* station_netif_                   = nullptr;
+    bool netif_created_here_                      = false;
+    bool wifi_initialized_here_                   = false;
+    std::mutex operation_mutex_;
+    mutable std::mutex state_mutex_;
     std::string ssid_;
     std::string ip_address_;
     int reconnect_count_ = 0;

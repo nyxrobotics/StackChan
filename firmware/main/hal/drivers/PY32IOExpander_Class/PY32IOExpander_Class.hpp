@@ -25,6 +25,8 @@ public:
      * @return false if failed
      */
     bool begin();
+    bool isRegistered() const { return _i2c_dev != nullptr; }
+    bool isInitialized() const { return _initialized; }
 
     // IOExpander methods
     // false input, true output
@@ -70,8 +72,8 @@ public:
     void setLedColor(uint8_t index, uint16_t color565);
     void setLedColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
     void setLedColor(uint8_t index, uint32_t color);
-    void setLedData(const uint8_t* data, size_t len);
-    void refreshLeds();
+    esp_err_t setLedData(const uint8_t* data, size_t len);
+    esp_err_t refreshLeds();
 
 private:
     i2c_master_dev_handle_t _i2c_dev;

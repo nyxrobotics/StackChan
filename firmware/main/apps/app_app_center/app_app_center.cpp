@@ -43,17 +43,22 @@ void AppAppCenter::onOpen()
     }
 
     // Start network
-    GetHAL().startNetwork([&](std::string_view msg) {
+    bool network_ready = GetHAL().startNetwork([&](std::string_view msg) {
         LvglLockGuard lock;
         loading_page->setMessage(msg);
     });
 
-    // Fetch app list
-    {
-        LvglLockGuard lock;
-        loading_page->setMessage("Fetching app list...");
+    if (network_ready) {
+        // Fetch app list
+        {
+            LvglLockGuard lock;
+            loading_page->setMessage("Fetching app list...");
+        }
+        _app_list = GetHAL().fetchAppList();
+    } else {
+        mclog::tagWarn(getAppInfo().name, "skipping app list request because network is unavailable");
+        _app_list.clear();
     }
-    _app_list = GetHAL().fetchAppList();
 
     LvglLockGuard lock;
 

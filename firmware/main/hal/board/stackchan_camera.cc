@@ -7,6 +7,7 @@
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 #include "esp_imgfx_color_convert.h"
 #include "esp_video_device.h"
@@ -58,6 +59,19 @@
 
 #define TAG "StackChanCamera"
 
+namespace {
+
+#ifdef CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
+constexpr uint32_t kCameraWarmupMs = 5000;
+#endif
+constexpr uint32_t kInitTaskStopWaitMs        = 1500;
+constexpr uint32_t kInitTaskCompletionGraceMs = 250;
+constexpr uint32_t kJpegQueueSendTimeoutMs    = 1000;
+constexpr uint32_t kJpegQueueReceiveTimeoutMs = 15000;
+constexpr int kExplainHttpTimeoutMs           = 30000;
+
+}  // namespace
+
 #if defined(CONFIG_CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER) || defined(CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP)
 #warning \
     "CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER or CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP is enabled, which may cause image corruption in YUV422 format!"
@@ -100,12 +114,130 @@ static void log_available_video_devices()
 #define CAM_PRINT_FOURCC(pixelformat) (void)0;
 #endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_DEBUG_MODE
 
+void StackChanCamera::StopInitTask()
+{
+    shutting_down_.store(true, std::memory_order_release);
+    streaming_on_.store(false, std::memory_order_release);
+
+    // DQBUF may be sleeping in the video driver. Stop the stream first so the
+    // driver can release the waiter and let the task leave cooperatively.
+    // Deleting a task from inside ioctl risks leaving driver locks behind.
+    if (stream_started_ && video_fd_ >= 0) {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(video_fd_, VIDIOC_STREAMOFF, &type) == 0) {
+            stream_started_ = false;
+        } else {
+            ESP_LOGW(TAG, "VIDIOC_STREAMOFF failed while stopping init task, errno=%d(%s)", errno, strerror(errno));
+        }
+    }
+
+    SemaphoreHandle_t done = init_task_done_;
+    if (done == nullptr) {
+        return;
+    }
+
+    bool completed = xSemaphoreTake(done, pdMS_TO_TICKS(kInitTaskStopWaitMs)) == pdTRUE;
+    TaskHandle_t task_to_delete = nullptr;
+    bool completion_in_progress = false;
+
+    if (!completed) {
+        portENTER_CRITICAL(&init_task_state_lock_);
+        if (init_task_state_ == InitTaskState::kRunning) {
+            // The task will observe kStopping before it can self-delete, so this handle
+            // cannot become stale while vTaskDelete() is called below.
+            init_task_state_ = InitTaskState::kStopping;
+            task_to_delete   = init_task_handle_;
+        } else if (init_task_state_ == InitTaskState::kCompleted) {
+            // The task no longer accesses this object, but may not have given the
+            // completion semaphore yet.
+            completion_in_progress = true;
+        }
+        portEXIT_CRITICAL(&init_task_state_lock_);
+
+        if (task_to_delete != nullptr) {
+            ESP_LOGE(TAG, "Camera init task remained blocked after STREAMOFF; forcing final task cleanup");
+            vTaskDelete(task_to_delete);
+            completed = true;
+        } else if (completion_in_progress) {
+            completed = xSemaphoreTake(done, pdMS_TO_TICKS(kInitTaskCompletionGraceMs)) == pdTRUE;
+        } else {
+            // No running task owns the semaphore.
+            completed = true;
+        }
+    }
+
+    portENTER_CRITICAL(&init_task_state_lock_);
+    init_task_handle_ = nullptr;
+    init_task_state_  = InitTaskState::kIdle;
+    portEXIT_CRITICAL(&init_task_state_lock_);
+    init_task_done_ = nullptr;
+
+    if (completed) {
+        vSemaphoreDelete(done);
+    } else {
+        // A task in kCompleted only retains this local semaphore handle and never
+        // accesses StackChanCamera again. Keep the semaphore alive rather than race
+        // its final xSemaphoreGive(); this exceptional path leaks only the semaphore.
+        ESP_LOGE(TAG, "Camera init completion signal was delayed; preserving its semaphore");
+    }
+}
+
+void StackChanCamera::CleanupVideoResources()
+{
+    streaming_on_.store(false, std::memory_order_release);
+
+    if (stream_started_ && video_fd_ >= 0) {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(video_fd_, VIDIOC_STREAMOFF, &type) != 0) {
+            ESP_LOGW(TAG, "VIDIOC_STREAMOFF failed during cleanup, errno=%d(%s)", errno, strerror(errno));
+        }
+    }
+    stream_started_ = false;
+
+    for (auto& buffer : mmap_buffers_) {
+        if (buffer.start != nullptr && buffer.length != 0) {
+            munmap(buffer.start, buffer.length);
+            buffer.start  = nullptr;
+            buffer.length = 0;
+        }
+    }
+    mmap_buffers_.clear();
+
+    if (video_fd_ >= 0) {
+        close(video_fd_);
+        video_fd_ = -1;
+    }
+
+    if (frame_.data != nullptr) {
+        heap_caps_free(frame_.data);
+        frame_.data = nullptr;
+    }
+    frame_.len     = 0;
+    frame_.width   = 0;
+    frame_.height  = 0;
+    frame_.format  = 0;
+    sensor_format_ = 0;
+#ifdef CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+    sensor_width_  = 0;
+    sensor_height_ = 0;
+#endif
+
+    if (video_initialized_) {
+        esp_err_t ret = esp_video_deinit();
+        if (ret != ESP_OK && ret != ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "esp_video_deinit failed: %d (%s)", static_cast<int>(ret), esp_err_to_name(ret));
+        }
+        video_initialized_ = false;
+    }
+}
+
 StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 {
     if (esp_video_init(&config) != ESP_OK) {
         ESP_LOGE(TAG, "esp_video_init failed");
         return;
     }
+    video_initialized_ = true;
 
 #ifdef CONFIG_XIAOZHI_ENABLE_CAMERA_DEBUG_MODE
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
@@ -143,6 +275,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 
     if (video_device_name == nullptr) {
         ESP_LOGE(TAG, "no video device is enabled");
+        CleanupVideoResources();
         return;
     }
 
@@ -153,14 +286,14 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 #if CONFIG_XIAOZHI_ENABLE_CAMERA_DEBUG_MODE
         log_available_video_devices();
 #endif  // CONFIG_XIAOZHI_ENABLE_CAMERA_DEBUG_MODE
+        CleanupVideoResources();
         return;
     }
 
     struct v4l2_capability cap = {};
     if (ioctl(video_fd_, VIDIOC_QUERYCAP, &cap) != 0) {
         ESP_LOGE(TAG, "VIDIOC_QUERYCAP failed, errno=%d(%s)", errno, strerror(errno));
-        close(video_fd_);
-        video_fd_ = -1;
+        CleanupVideoResources();
         return;
     }
 
@@ -173,8 +306,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
     format.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(video_fd_, VIDIOC_G_FMT, &format) != 0) {
         ESP_LOGE(TAG, "VIDIOC_G_FMT failed, errno=%d(%s)", errno, strerror(errno));
-        close(video_fd_);
-        video_fd_ = -1;
+        CleanupVideoResources();
         return;
     }
     ESP_LOGD(TAG, "VIDIOC_G_FMT: pixelformat=0x%08lx, width=%ld, height=%ld", format.fmt.pix.pixelformat,
@@ -255,9 +387,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 
     if (!setformat.fmt.pix.pixelformat) {
         ESP_LOGE(TAG, "no supported pixel format found");
-        close(video_fd_);
-        video_fd_      = -1;
-        sensor_format_ = 0;
+        CleanupVideoResources();
         return;
     }
 
@@ -265,9 +395,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 
     if (ioctl(video_fd_, VIDIOC_S_FMT, &setformat) != 0) {
         ESP_LOGE(TAG, "VIDIOC_S_FMT failed, errno=%d(%s)", errno, strerror(errno));
-        close(video_fd_);
-        video_fd_      = -1;
-        sensor_format_ = 0;
+        CleanupVideoResources();
         return;
     }
 
@@ -286,9 +414,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
     req.memory                     = V4L2_MEMORY_MMAP;
     if (ioctl(video_fd_, VIDIOC_REQBUFS, &req) != 0) {
         ESP_LOGE(TAG, "VIDIOC_REQBUFS failed");
-        close(video_fd_);
-        video_fd_      = -1;
-        sensor_format_ = 0;
+        CleanupVideoResources();
         return;
     }
     mmap_buffers_.resize(req.count);
@@ -299,17 +425,13 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
         buf.index              = i;
         if (ioctl(video_fd_, VIDIOC_QUERYBUF, &buf) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QUERYBUF failed");
-            close(video_fd_);
-            video_fd_      = -1;
-            sensor_format_ = 0;
+            CleanupVideoResources();
             return;
         }
         void* start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, video_fd_, buf.m.offset);
         if (start == MAP_FAILED) {
             ESP_LOGE(TAG, "mmap failed");
-            close(video_fd_);
-            video_fd_      = -1;
-            sensor_format_ = 0;
+            CleanupVideoResources();
             return;
         }
         mmap_buffers_[i].start  = start;
@@ -317,9 +439,7 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 
         if (ioctl(video_fd_, VIDIOC_QBUF, &buf) != 0) {
             ESP_LOGE(TAG, "VIDIOC_QBUF failed");
-            close(video_fd_);
-            video_fd_      = -1;
-            sensor_format_ = 0;
+            CleanupVideoResources();
             return;
         }
     }
@@ -327,27 +447,38 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(video_fd_, VIDIOC_STREAMON, &type) != 0) {
         ESP_LOGE(TAG, "VIDIOC_STREAMON failed");
-        close(video_fd_);
-        video_fd_      = -1;
-        sensor_format_ = 0;
+        CleanupVideoResources();
         return;
     }
+    stream_started_ = true;
 
 #ifdef CONFIG_ESP_VIDEO_ENABLE_ISP_VIDEO_DEVICE
     // 当启用 ISP 时，ISP 需要一些照片来初始化参数，因此开启后后台拍摄5s照片并丢弃
-    xTaskCreate(
+    init_task_done_ = xSemaphoreCreateBinary();
+    if (init_task_done_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create camera init completion semaphore");
+        CleanupVideoResources();
+        return;
+    }
+
+    portENTER_CRITICAL(&init_task_state_lock_);
+    init_task_state_ = InitTaskState::kRunning;
+    portEXIT_CRITICAL(&init_task_state_lock_);
+
+    BaseType_t task_created = xTaskCreate(
         [](void* arg) {
-            Esp32Camera* self      = static_cast<Esp32Camera*>(arg);
+            StackChanCamera* self  = static_cast<StackChanCamera*>(arg);
             uint16_t capture_count = 0;
             TickType_t start       = xTaskGetTickCount();
-            TickType_t duration    = 5000 / portTICK_PERIOD_MS;  // 5s
-            while ((xTaskGetTickCount() - start) < duration) {
+            TickType_t duration    = pdMS_TO_TICKS(kCameraWarmupMs);
+            while (!self->shutting_down_.load(std::memory_order_acquire) &&
+                   (xTaskGetTickCount() - start) < duration) {
                 struct v4l2_buffer buf = {};
                 buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE;
                 buf.memory             = V4L2_MEMORY_MMAP;
                 if (ioctl(self->video_fd_, VIDIOC_DQBUF, &buf) != 0) {
                     ESP_LOGE(TAG, "VIDIOC_DQBUF failed during init");
-                    vTaskDelay(10 / portTICK_PERIOD_MS);
+                    vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
                 }
                 if (ioctl(self->video_fd_, VIDIOC_QBUF, &buf) != 0) {
@@ -355,12 +486,44 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
                 }
                 capture_count++;
             }
-            ESP_LOGI(TAG, "Camera init success, captured %d frames in %dms", capture_count,
-                     (xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
-            self->streaming_on_.store(true, std::memory_order_release);
-            vTaskDelete(NULL);
+
+            SemaphoreHandle_t done = self->init_task_done_;
+            bool complete_normally = false;
+            portENTER_CRITICAL(&self->init_task_state_lock_);
+            if (self->init_task_state_ == InitTaskState::kRunning) {
+                if (!self->shutting_down_.load(std::memory_order_acquire)) {
+                    self->streaming_on_.store(true, std::memory_order_release);
+                }
+                self->init_task_state_  = InitTaskState::kCompleted;
+                self->init_task_handle_ = nullptr;
+                complete_normally       = true;
+            }
+            portEXIT_CRITICAL(&self->init_task_state_lock_);
+
+            if (complete_normally) {
+                ESP_LOGI(TAG, "Camera init success, captured %d frames in %dms", capture_count,
+                         (xTaskGetTickCount() - start) * portTICK_PERIOD_MS);
+                // All accesses through self are complete before this signal.
+                xSemaphoreGive(done);
+                vTaskDelete(nullptr);
+            }
+
+            // StopInitTask() owns and will delete this task. Do not access self
+            // after observing kStopping.
+            vTaskSuspend(nullptr);
         },
-        "CameraInitTask", 4096, this, 5, nullptr);
+        "CameraInitTask", 4096, this, 5, &init_task_handle_);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create CameraInitTask");
+        portENTER_CRITICAL(&init_task_state_lock_);
+        init_task_handle_ = nullptr;
+        init_task_state_  = InitTaskState::kIdle;
+        portEXIT_CRITICAL(&init_task_state_lock_);
+        vSemaphoreDelete(init_task_done_);
+        init_task_done_ = nullptr;
+        CleanupVideoResources();
+        return;
+    }
 #else
     ESP_LOGI(TAG, "Camera init success");
     streaming_on_.store(true, std::memory_order_release);
@@ -369,21 +532,16 @@ StackChanCamera::StackChanCamera(const esp_video_init_config_t& config)
 
 StackChanCamera::~StackChanCamera()
 {
-    if (streaming_on_.load(std::memory_order_acquire) && video_fd_ >= 0) {
-        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        ioctl(video_fd_, VIDIOC_STREAMOFF, &type);
-    }
-    for (auto& b : mmap_buffers_) {
-        if (b.start && b.length) {
-            munmap(b.start, b.length);
+    StopInitTask();
+
+    {
+        std::lock_guard<std::mutex> lock(encoder_mutex_);
+        if (encoder_thread_.joinable()) {
+            encoder_thread_.join();
         }
     }
-    if (video_fd_ >= 0) {
-        close(video_fd_);
-        video_fd_ = -1;
-    }
-    sensor_format_ = 0;
-    esp_video_deinit();
+
+    CleanupVideoResources();
 }
 
 void StackChanCamera::SetExplainUrl(const std::string& url, const std::string& token)
@@ -394,10 +552,6 @@ void StackChanCamera::SetExplainUrl(const std::string& url, const std::string& t
 
 bool StackChanCamera::Capture()
 {
-    if (encoder_thread_.joinable()) {
-        encoder_thread_.join();
-    }
-
     if (!streaming_on_.load(std::memory_order_acquire) || video_fd_ < 0) {
         return false;
     }
@@ -405,6 +559,7 @@ bool StackChanCamera::Capture()
     // Play shutter sfx
     hal_bridge::app_play_sound(OGG_CAMERA_SHUTTER);
 
+    std::unique_lock<std::mutex> frame_lock;
     for (int i = 0; i < 3; i++) {
         struct v4l2_buffer buf = {};
         buf.type               = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -414,6 +569,13 @@ bool StackChanCamera::Capture()
             return false;
         }
         if (i == 2) {
+            // DQBUF can block in the driver, so only lock once a frame is ready
+            // and immediately before replacing memory used by the encoder.
+            frame_lock = std::unique_lock<std::mutex>(encoder_mutex_);
+            if (encoder_thread_.joinable()) {
+                encoder_thread_.join();
+            }
+
             // 保存帧副本到PSRAM
             if (frame_.data) {
                 heap_caps_free(frame_.data);
@@ -853,10 +1015,6 @@ bool StackChanCamera::Capture()
 
 bool StackChanCamera::StreamCaptures()
 {
-    if (encoder_thread_.joinable()) {
-        encoder_thread_.join();
-    }
-
     if (!streaming_on_.load(std::memory_order_acquire) || video_fd_ < 0) {
         return false;
     }
@@ -869,6 +1027,13 @@ bool StackChanCamera::StreamCaptures()
             ESP_LOGE(TAG, "VIDIOC_DQBUF failed");
             return false;
         }
+
+        // Do not hold this lock across the driver's potentially blocking DQBUF.
+        std::lock_guard<std::mutex> frame_lock(encoder_mutex_);
+        if (encoder_thread_.joinable()) {
+            encoder_thread_.join();
+        }
+
         {
             // 保存帧副本到PSRAM
             if (frame_.data) {
@@ -1030,6 +1195,48 @@ std::string StackChanCamera::Explain(const std::string& question)
         throw std::runtime_error("Image explain URL or token is not set");
     }
 
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        throw std::runtime_error("Network is not available");
+    }
+
+    auto http = network->CreateHttp(3);
+    if (http == nullptr) {
+        throw std::runtime_error("Failed to create HTTP client");
+    }
+    http->SetTimeout(kExplainHttpTimeoutMs);
+
+    struct HttpCleanup {
+        Http* client;
+
+        ~HttpCleanup()
+        {
+            try {
+                Close();
+            } catch (...) {
+                ESP_LOGE(TAG, "Failed to close the image explain HTTP client");
+            }
+        }
+
+        void Close()
+        {
+            if (client != nullptr) {
+                Http* client_to_close = client;
+                client                = nullptr;
+                client_to_close->Close();
+            }
+        }
+    } http_cleanup{http.get()};
+
+    std::unique_lock<std::mutex> frame_lock(encoder_mutex_);
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
+
+    if (frame_.data == nullptr || frame_.len == 0 || frame_.format == 0) {
+        throw std::runtime_error("No camera frame is available to explain");
+    }
+
     // 创建局部的 JPEG 队列, 40 entries is about to store 512 * 40 = 20480 bytes of JPEG data
     QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
     if (jpeg_queue == nullptr) {
@@ -1037,40 +1244,100 @@ std::string StackChanCamera::Explain(const std::string& question)
         throw std::runtime_error("Failed to create JPEG queue");
     }
 
-    // We spawn a thread to encode the image to JPEG using optimized encoder (cost about 500ms and 8KB SRAM)
-    encoder_thread_ = std::thread([this, jpeg_queue]() {
-        uint16_t w             = frame_.width ? frame_.width : 320;
-        uint16_t h             = frame_.height ? frame_.height : 240;
-        v4l2_pix_fmt_t enc_fmt = frame_.format;
-        bool ok                = image_to_jpeg_cb(
-                           frame_.data, frame_.len, w, h, enc_fmt, 80,
-                           [](void* arg, size_t index, const void* data, size_t len) -> size_t {
-                auto jpeg_queue = static_cast<QueueHandle_t>(arg);
-                JpegChunk chunk = {.data = nullptr, .len = len};
-                if (index == 0 && data != nullptr && len > 0) {
-                    chunk.data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    if (chunk.data == nullptr) {
-                        ESP_LOGE(TAG, "Failed to allocate %zu bytes for JPEG chunk", len);
-                        chunk.len = 0;
-                    } else {
-                        memcpy(chunk.data, data, len);
-                    }
-                } else {
-                    chunk.len = 0;  // Sentinel or error
+    struct JpegQueueCleanup {
+        QueueHandle_t queue;
+        std::mutex& mutex;
+        std::thread& thread;
+        bool cleaned = false;
+
+        void Drain()
+        {
+            JpegChunk chunk = {};
+            while (queue != nullptr && xQueueReceive(queue, &chunk, 0) == pdPASS) {
+                if (chunk.data != nullptr) {
+                    heap_caps_free(chunk.data);
                 }
-                xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
-                return len;
-                           },
-                           jpeg_queue);
-
-        if (!ok) {
-            JpegChunk chunk = {.data = nullptr, .len = 0};
-            xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
+            }
         }
-    });
 
-    auto network = Board::GetInstance().GetNetwork();
-    auto http    = network->CreateHttp(3);
+        void Cleanup()
+        {
+            if (cleaned) {
+                return;
+            }
+
+            // Draining first also releases an encoder that is waiting for queue space.
+            Drain();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+            Drain();
+            vQueueDelete(queue);
+            queue   = nullptr;
+            cleaned = true;
+        }
+
+        ~JpegQueueCleanup()
+        {
+            Cleanup();
+        }
+    } jpeg_cleanup{jpeg_queue, encoder_mutex_, encoder_thread_};
+
+    uint8_t* frame_data         = frame_.data;
+    size_t frame_len            = frame_.len;
+    uint16_t frame_width        = frame_.width ? frame_.width : 320;
+    uint16_t frame_height       = frame_.height ? frame_.height : 240;
+    v4l2_pix_fmt_t frame_format = frame_.format;
+
+    // We spawn a thread to encode the image to JPEG using optimized encoder (cost about 500ms and 8KB SRAM)
+    try {
+        encoder_thread_ =
+            std::thread([frame_data, frame_len, frame_width, frame_height, frame_format, jpeg_queue]() {
+                bool ok = image_to_jpeg_cb(
+                    frame_data, frame_len, frame_width, frame_height, frame_format, 80,
+                    [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+                        auto jpeg_queue = static_cast<QueueHandle_t>(arg);
+                        JpegChunk chunk = {.data = nullptr, .len = len};
+                        if (index == 0 && data != nullptr && len > 0) {
+                            chunk.data =
+                                (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                            if (chunk.data == nullptr) {
+                                ESP_LOGE(TAG, "Failed to allocate %zu bytes for JPEG chunk", len);
+                                chunk.len = 0;
+                            } else {
+                                memcpy(chunk.data, data, len);
+                            }
+                        } else {
+                            chunk.len = 0;  // Sentinel or error
+                        }
+
+                        if (xQueueSend(jpeg_queue, &chunk, pdMS_TO_TICKS(kJpegQueueSendTimeoutMs)) != pdPASS) {
+                            if (chunk.data != nullptr) {
+                                heap_caps_free(chunk.data);
+                            }
+                            ESP_LOGE(TAG, "Timed out while queueing a JPEG chunk");
+                            return 0;
+                        }
+                        return len;
+                    },
+                    jpeg_queue);
+
+                if (!ok) {
+                    JpegChunk chunk = {.data = nullptr, .len = 0};
+                    if (xQueueSend(jpeg_queue, &chunk, pdMS_TO_TICKS(kJpegQueueSendTimeoutMs)) != pdPASS) {
+                        ESP_LOGE(TAG, "Timed out while queueing the JPEG error marker");
+                    }
+                }
+            });
+    } catch (...) {
+        frame_lock.unlock();
+        throw;
+    }
+    frame_lock.unlock();
+
     // 构造multipart/form-data请求体
     std::string boundary = "----ESP32_CAMERA_BOUNDARY";
 
@@ -1084,19 +1351,16 @@ std::string StackChanCamera::Explain(const std::string& question)
     http->SetHeader("Transfer-Encoding", "chunked");
     if (!http->Open("POST", explain_url_)) {
         ESP_LOGE(TAG, "Failed to connect to explain URL");
-        // Clear the queue
-        encoder_thread_.join();
-        JpegChunk chunk;
-        while (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) == pdPASS) {
-            if (chunk.data != nullptr) {
-                heap_caps_free(chunk.data);
-            } else {
-                break;
-            }
-        }
-        vQueueDelete(jpeg_queue);
         throw std::runtime_error("Failed to connect to explain URL");
     }
+
+    auto checked_write = [&http](const char* data, size_t size, const char* description) {
+        int written = http->Write(data, size);
+        if (written < 0 || static_cast<size_t>(written) < size) {
+            ESP_LOGE(TAG, "HTTP write failed while sending %s: wrote %d of %zu bytes", description, written, size);
+            throw std::runtime_error("Failed to upload photo");
+        }
+    };
 
     {
         // 第一块：question字段
@@ -1105,7 +1369,7 @@ std::string StackChanCamera::Explain(const std::string& question)
         question_field += "Content-Disposition: form-data; name=\"question\"\r\n";
         question_field += "\r\n";
         question_field += question + "\r\n";
-        http->Write(question_field.c_str(), question_field.size());
+        checked_write(question_field.c_str(), question_field.size(), "question");
     }
     {
         // 第二块：文件字段头部
@@ -1114,30 +1378,32 @@ std::string StackChanCamera::Explain(const std::string& question)
         file_header += "Content-Disposition: form-data; name=\"file\"; filename=\"camera.jpg\"\r\n";
         file_header += "Content-Type: image/jpeg\r\n";
         file_header += "\r\n";
-        http->Write(file_header.c_str(), file_header.size());
+        checked_write(file_header.c_str(), file_header.size(), "file header");
     }
 
     // 第三块：JPEG数据
     size_t total_sent   = 0;
     bool saw_terminator = false;
     while (true) {
-        JpegChunk chunk;
-        if (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to receive JPEG chunk");
-            break;
+        JpegChunk chunk = {};
+        if (xQueueReceive(jpeg_queue, &chunk, pdMS_TO_TICKS(kJpegQueueReceiveTimeoutMs)) != pdPASS) {
+            ESP_LOGE(TAG, "Timed out while waiting for a JPEG chunk");
+            throw std::runtime_error("Timed out while encoding image");
         }
         if (chunk.data == nullptr) {
             saw_terminator = true;
             break;  // The last chunk
         }
-        http->Write((const char*)chunk.data, chunk.len);
-        total_sent += chunk.len;
+        int written      = http->Write(reinterpret_cast<const char*>(chunk.data), chunk.len);
+        size_t chunk_len = chunk.len;
         heap_caps_free(chunk.data);
+        if (written < 0 || static_cast<size_t>(written) < chunk_len) {
+            ESP_LOGE(TAG, "HTTP write failed while sending JPEG data: wrote %d of %zu bytes", written, chunk_len);
+            throw std::runtime_error("Failed to upload photo");
+        }
+        total_sent += chunk_len;
     }
-    // Wait for the encoder thread to finish
-    encoder_thread_.join();
-    // 清理队列
-    vQueueDelete(jpeg_queue);
+    jpeg_cleanup.Cleanup();
 
     if (!saw_terminator || total_sent == 0) {
         ESP_LOGE(TAG, "JPEG encoder failed or produced empty output");
@@ -1148,22 +1414,27 @@ std::string StackChanCamera::Explain(const std::string& question)
         // 第四块：multipart尾部
         std::string multipart_footer;
         multipart_footer += "\r\n--" + boundary + "--\r\n";
-        http->Write(multipart_footer.c_str(), multipart_footer.size());
+        checked_write(multipart_footer.c_str(), multipart_footer.size(), "multipart footer");
     }
     // 结束块
-    http->Write("", 0);
+    checked_write("", 0, "request terminator");
 
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Failed to upload photo, status code: %d", status_code);
         throw std::runtime_error("Failed to upload photo");
     }
 
     std::string result = http->ReadAll();
-    http->Close();
+    if (result.empty()) {
+        ESP_LOGE(TAG, "Image explain response was empty or timed out");
+        throw std::runtime_error("Image explain response was empty");
+    }
+    http_cleanup.Close();
 
     // Get remain task stack size
     size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
     ESP_LOGI(TAG, "Explain image size=%d bytes, compressed size=%d, remain stack size=%d, question=%s\n%s",
-             (int)frame_.len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+             (int)frame_len, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
     return result;
 }

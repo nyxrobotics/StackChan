@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <cJSON.h>
 
@@ -59,5 +60,6 @@ private:
     std::string                      thinkTagCarry_;
     std::string                      currentLlmRequestId_;
     std::string                      currentTtsRequestId_;
-    TaskHandle_t                     pollTask_    = nullptr;
+    TaskHandle_t                     pollTask_     = nullptr;
+    SemaphoreHandle_t                pollTaskDone_ = nullptr;
 };

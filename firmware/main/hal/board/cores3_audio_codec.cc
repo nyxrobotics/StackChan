@@ -6,6 +6,8 @@
 #include <esp_timer.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "CoreS3AudioCodec"
 
@@ -59,7 +61,7 @@ CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rat
         out_codec_if_ = aw88298_codec_new(&aw88298_cfg);
         if (out_codec_if_ != NULL) break;
         ESP_LOGW(TAG, "AW88298 init failed (attempt %d/5), retrying...", retry + 1);
-        esp_rom_delay_us(20000);  // 20ms
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
     assert(out_codec_if_ != NULL);
 
@@ -91,10 +93,20 @@ CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rat
 }
 
 CoreS3AudioCodec::~CoreS3AudioCodec() {
-    ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
-    esp_codec_dev_delete(output_dev_);
-    ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
-    esp_codec_dev_delete(input_dev_);
+    if (output_dev_ != nullptr) {
+        esp_err_t ret = esp_codec_dev_close(output_dev_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to close audio output during cleanup: %s", esp_err_to_name(ret));
+        }
+        esp_codec_dev_delete(output_dev_);
+    }
+    if (input_dev_ != nullptr) {
+        esp_err_t ret = esp_codec_dev_close(input_dev_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to close audio input during cleanup: %s", esp_err_to_name(ret));
+        }
+        esp_codec_dev_delete(input_dev_);
+    }
 
     audio_codec_delete_codec_if(in_codec_if_);
     audio_codec_delete_ctrl_if(in_ctrl_if_);
@@ -197,7 +209,11 @@ void CoreS3AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
 }
 
 void CoreS3AudioCodec::SetOutputVolume(int volume) {
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
+    esp_err_t ret = esp_codec_dev_set_out_vol(output_dev_, volume);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to apply output volume %d: %s", volume, esp_err_to_name(ret));
+        return;
+    }
     AudioCodec::SetOutputVolume(volume);
 }
 
@@ -225,7 +241,7 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
             }
             ESP_LOGW(TAG, "Failed to open ES7210 input (attempt %d/3): %s",
                      attempt, esp_err_to_name(ret));
-            esp_rom_delay_us(20000);
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
         if (ret != ESP_OK) {
             int64_t now = esp_timer_get_time();
@@ -253,6 +269,7 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
         esp_err_t ret = esp_codec_dev_close(input_dev_);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to close ES7210 input: %s", esp_err_to_name(ret));
+            return;
         }
         input_open_failed_since_us_ = 0;
     }
@@ -272,10 +289,27 @@ void CoreS3AudioCodec::EnableOutput(bool enable) {
             .sample_rate = (uint32_t)output_sample_rate_,
             .mclk_multiple = 0,
         };
-        ESP_ERROR_CHECK(esp_codec_dev_open(output_dev_, &fs));
-        ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
+        esp_err_t ret = esp_codec_dev_open(output_dev_, &fs);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open audio output: %s", esp_err_to_name(ret));
+            return;
+        }
+
+        ret = esp_codec_dev_set_out_vol(output_dev_, output_volume_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set audio output volume: %s", esp_err_to_name(ret));
+            esp_err_t close_ret = esp_codec_dev_close(output_dev_);
+            if (close_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to close audio output after setup error: %s", esp_err_to_name(close_ret));
+            }
+            return;
+        }
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
+        esp_err_t ret = esp_codec_dev_close(output_dev_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to close audio output: %s", esp_err_to_name(ret));
+            return;
+        }
     }
     AudioCodec::EnableOutput(enable);
 }
@@ -287,7 +321,11 @@ int CoreS3AudioCodec::Read(int16_t* dest, int samples) {
 
     esp_err_t ret = esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ES7210 read failed: %s", esp_err_to_name(ret));
+        int64_t now = esp_timer_get_time();
+        if (last_input_error_log_us_ == 0 || now - last_input_error_log_us_ >= 1000000) {
+            ESP_LOGW(TAG, "ES7210 read failed: %s", esp_err_to_name(ret));
+            last_input_error_log_us_ = now;
+        }
         return 0;
     }
     return samples;
@@ -295,7 +333,15 @@ int CoreS3AudioCodec::Read(int16_t* dest, int samples) {
 
 int CoreS3AudioCodec::Write(const int16_t* data, int samples) {
     if (output_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(output_dev_, (void*)data, samples * sizeof(int16_t)));
+        esp_err_t ret = esp_codec_dev_write(output_dev_, (void*)data, samples * sizeof(int16_t));
+        if (ret != ESP_OK) {
+            int64_t now = esp_timer_get_time();
+            if (last_output_error_log_us_ == 0 || now - last_output_error_log_us_ >= 1000000) {
+                ESP_LOGW(TAG, "Audio output write failed: %s", esp_err_to_name(ret));
+                last_output_error_log_us_ = now;
+            }
+            return 0;
+        }
     }
     return samples;
 }

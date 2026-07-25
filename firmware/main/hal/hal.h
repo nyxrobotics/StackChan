@@ -235,9 +235,9 @@ public:
     uitk::Signal<const char*> onBleRgbData;
     uitk::Signal<AppConfigEvent> onAppConfigEvent;
 
-    void startBleServer();
+    bool startBleServer();
     bool isBleConnected();
-    void startAppConfigServer();
+    bool startAppConfigServer();
     bool isAppConfiged();
     void resetAppConfiged();
 
@@ -277,7 +277,7 @@ public:
 
     /* --------------------------------- EspNow --------------------------------- */
     uitk::Signal<const std::vector<uint8_t>&> onEspNowData;
-    void startEspNow(int channel);
+    bool startEspNow(int channel);
     bool espNowSend(const std::vector<uint8_t>& data, const uint8_t* destAddr = nullptr);
     void setLaserEnabled(bool enabled);
 
@@ -287,7 +287,7 @@ public:
     void clearWarmRebootRequest();
 
     /* --------------------------------- Network -------------------------------- */
-    void startNetwork(std::function<void(std::string_view)> onLog);
+    bool startNetwork(std::function<void(std::string_view)> onLog);
     WifiStatus getWifiStatus();
     void startSntp();
 
@@ -315,7 +315,7 @@ public:
     void clearupMicTest();
 
 private:
-    void ble_init(bool useAltUuid);
+    bool ble_init(bool useAltUuid);
     bool _xiaozhi_start_requested = false;
 
     // ── Device Capability Registry ──────────────────────────────────────────

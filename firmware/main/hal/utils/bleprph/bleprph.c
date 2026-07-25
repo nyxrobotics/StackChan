@@ -18,8 +18,9 @@
  */
 
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* BLE */
 #include "bleprph.h"
@@ -77,10 +78,26 @@ static uint16_t cids[MYNEWT_VAL(BLE_EATT_CHAN_NUM)];
 static uint16_t bearers;
 #endif
 
+typedef enum {
+    BLEPRPH_STATE_UNINITIALIZED,
+    BLEPRPH_STATE_INITIALIZING,
+    BLEPRPH_STATE_INITIALIZED,
+    BLEPRPH_STATE_FAILED,
+} bleprph_state_t;
+
 static bool s_use_alt_uuid = false;
 static uint16_t s_notify_payload_len = 20;
+static bleprph_state_t s_bleprph_state = BLEPRPH_STATE_UNINITIALIZED;
+static portMUX_TYPE s_bleprph_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 void ble_store_config_init(void);
+
+static void bleprph_set_notify_payload_len(uint16_t payload_len)
+{
+    taskENTER_CRITICAL(&s_bleprph_state_lock);
+    s_notify_payload_len = payload_len;
+    taskEXIT_CRITICAL(&s_bleprph_state_lock);
+}
 
 #if NIMBLE_BLE_CONNECT
 /**
@@ -110,7 +127,7 @@ static void bleprph_print_conn_desc(struct ble_gap_conn_desc *desc)
  *     o General discoverable mode.
  *     o Undirected connectable mode.
  */
-static void ext_bleprph_advertise(void)
+static int ext_bleprph_advertise(void)
 {
     struct ble_gap_ext_adv_params params;
     struct os_mbuf *data;
@@ -119,7 +136,7 @@ static void ext_bleprph_advertise(void)
 
     /* First check if any instance is already active */
     if (ble_gap_ext_adv_active(instance)) {
-        return;
+        return 0;
     }
 
     /* use defaults for non-set params */
@@ -141,24 +158,41 @@ static void ext_bleprph_advertise(void)
 
     /* configure instance 0 */
     rc = ble_gap_ext_adv_configure(instance, &params, NULL, bleprph_gap_event, NULL);
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "error configuring extended advertisement; rc=%d", rc);
+        return rc;
+    }
 
     /* in this case only scan response is allowed */
 
     /* get mbuf for scan rsp data */
     data = os_msys_get_pkthdr(sizeof(ext_adv_pattern_1), 0);
-    assert(data);
+    if (data == NULL) {
+        MODLOG_DFLT(ERROR, "cannot allocate extended advertisement data");
+        return BLE_HS_ENOMEM;
+    }
 
     /* fill mbuf with scan rsp data */
     rc = os_mbuf_append(data, ext_adv_pattern_1, sizeof(ext_adv_pattern_1));
-    assert(rc == 0);
+    if (rc != 0) {
+        os_mbuf_free_chain(data);
+        MODLOG_DFLT(ERROR, "cannot append extended advertisement data; rc=%d", rc);
+        return rc;
+    }
 
     rc = ble_gap_ext_adv_set_data(instance, data);
-    assert(rc == 0);
+    if (rc != 0) {
+        os_mbuf_free_chain(data);
+        MODLOG_DFLT(ERROR, "cannot set extended advertisement data; rc=%d", rc);
+        return rc;
+    }
 
     /* start advertising */
     rc = ble_gap_ext_adv_start(instance, 0, 0);
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "cannot start extended advertisement; rc=%d", rc);
+    }
+    return rc;
 }
 #else
 
@@ -227,7 +261,7 @@ static void ext_bleprph_advertise(void)
 //     }
 // }
 
-static void bleprph_advertise(void)
+static int bleprph_advertise(void)
 {
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
@@ -235,8 +269,12 @@ static void bleprph_advertise(void)
     int rc;
 
     // 获取MAC地址
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+    uint8_t mac[6] = {0};
+    rc = esp_read_mac(mac, ESP_MAC_EFUSE_FACTORY);
+    if (rc != ESP_OK) {
+        MODLOG_DFLT(ERROR, "error reading factory MAC; rc=%d", rc);
+        return rc;
+    }
 
     // 厂商数据
     // uint8_t mfg_data[10];
@@ -274,7 +312,7 @@ static void bleprph_advertise(void)
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error setting advertisement data; rc=%d\n", rc);
-        return;
+        return rc;
     }
 
     // ========== 扫描响应包：放详细信息 ==========
@@ -282,9 +320,11 @@ static void bleprph_advertise(void)
 
 #if CONFIG_BT_NIMBLE_GAP_SERVICE
     const char *name            = ble_svc_gap_device_name();
-    rsp_fields.name             = (uint8_t *)name;
-    rsp_fields.name_len         = strlen(name);
-    rsp_fields.name_is_complete = 1;
+    if (name != NULL) {
+        rsp_fields.name             = (uint8_t *)name;
+        rsp_fields.name_len         = strlen(name);
+        rsp_fields.name_is_complete = 1;
+    }
 #endif
 
     // TX Power放在扫描响应
@@ -298,7 +338,7 @@ static void bleprph_advertise(void)
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error setting scan response data; rc=%d\n", rc);
-        return;
+        return rc;
     }
 
     // 启动广播
@@ -309,22 +349,28 @@ static void bleprph_advertise(void)
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, bleprph_gap_event, NULL);
     if (rc != 0) {
         MODLOG_DFLT(ERROR, "error enabling advertisement; rc=%d\n", rc);
-        return;
     }
+    return rc;
 }
 
 #endif
 
 #if MYNEWT_VAL(BLE_POWER_CONTROL)
-static void bleprph_power_control(uint16_t conn_handle)
+static int bleprph_power_control(uint16_t conn_handle)
 {
     int rc;
 
     rc = ble_gap_read_remote_transmit_power_level(conn_handle, 0x01);  // Attempting on LE 1M phy
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(WARN, "cannot read remote transmit power; rc=%d", rc);
+        return rc;
+    }
 
     rc = ble_gap_set_transmit_power_reporting_enable(conn_handle, 0x1, 0x1);
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(WARN, "cannot enable transmit power reporting; rc=%d", rc);
+    }
+    return rc;
 }
 #endif
 
@@ -350,6 +396,11 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
     int rc;
 #endif
 
+    (void)arg;
+    if (event == NULL) {
+        return BLE_HS_EINVAL;
+    }
+
     switch (event->type) {
 #if NIMBLE_BLE_CONNECT
         case BLE_GAP_EVENT_CONNECT:
@@ -358,10 +409,16 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
                         event->connect.status);
             if (event->connect.status == 0) {
                 rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
-                assert(rc == 0);
-                bleprph_print_conn_desc(&desc);
+                if (rc == 0) {
+                    bleprph_print_conn_desc(&desc);
+                } else {
+                    MODLOG_DFLT(WARN, "cannot inspect new connection; rc=%d", rc);
+                }
                 stackchan_ble_set_conn_handle(event->connect.conn_handle);
-                s_notify_payload_len = 20;
+                bleprph_set_notify_payload_len(20);
+#if MYNEWT_VAL(BLE_POWER_CONTROL)
+                bleprph_power_control(event->connect.conn_handle);
+#endif
             }
             MODLOG_DFLT(INFO, "\n");
 
@@ -374,16 +431,13 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
 #endif
             }
 
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-            bleprph_power_control(event->connect.conn_handle);
-#endif
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
             MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
             bleprph_print_conn_desc(&event->disconnect.conn);
             stackchan_ble_set_conn_handle(BLE_HS_CONN_HANDLE_NONE);
-            s_notify_payload_len = 20;
+            bleprph_set_notify_payload_len(20);
             MODLOG_DFLT(INFO, "\n");
 
             /* Connection terminated; resume advertising. */
@@ -398,8 +452,11 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
             /* The central has updated the connection parameters. */
             MODLOG_DFLT(INFO, "connection updated; status=%d ", event->conn_update.status);
             rc = ble_gap_conn_find(event->conn_update.conn_handle, &desc);
-            assert(rc == 0);
-            bleprph_print_conn_desc(&desc);
+            if (rc == 0) {
+                bleprph_print_conn_desc(&desc);
+            } else {
+                MODLOG_DFLT(WARN, "cannot inspect updated connection; rc=%d", rc);
+            }
             MODLOG_DFLT(INFO, "\n");
             return 0;
 
@@ -416,17 +473,23 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
             /* Encryption has been enabled or disabled for this connection. */
             MODLOG_DFLT(INFO, "encryption change event; status=%d ", event->enc_change.status);
             rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
-            assert(rc == 0);
-            bleprph_print_conn_desc(&desc);
+            if (rc == 0) {
+                bleprph_print_conn_desc(&desc);
+            } else {
+                MODLOG_DFLT(WARN, "cannot inspect encrypted connection; rc=%d", rc);
+            }
             MODLOG_DFLT(INFO, "\n");
             return 0;
 
         case BLE_GAP_EVENT_NOTIFY_TX:
-            MODLOG_DFLT(INFO,
-                        "notify_tx event; conn_handle=%d attr_handle=%d "
-                        "status=%d is_indication=%d",
-                        event->notify_tx.conn_handle, event->notify_tx.attr_handle, event->notify_tx.status,
-                        event->notify_tx.indication);
+            if (event->notify_tx.status != 0) {
+                MODLOG_DFLT(WARN, "notify failed; conn_handle=%d attr_handle=%d status=%d indication=%d",
+                            event->notify_tx.conn_handle, event->notify_tx.attr_handle, event->notify_tx.status,
+                            event->notify_tx.indication);
+            } else {
+                MODLOG_DFLT(DEBUG, "notify complete; conn_handle=%d attr_handle=%d",
+                            event->notify_tx.conn_handle, event->notify_tx.attr_handle);
+            }
             return 0;
 
         case BLE_GAP_EVENT_SUBSCRIBE:
@@ -442,7 +505,7 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
             MODLOG_DFLT(INFO, "mtu update event; conn_handle=%d cid=%d mtu=%d\n", event->mtu.conn_handle,
                         event->mtu.channel_id, event->mtu.value);
             if (event->mtu.value > 3) {
-                s_notify_payload_len = event->mtu.value - 3;
+                bleprph_set_notify_payload_len(event->mtu.value - 3);
             }
             return 0;
 
@@ -454,8 +517,15 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
 
             /* Delete the old bond. */
             rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
-            assert(rc == 0);
-            ble_store_util_delete_peer(&desc.peer_id_addr);
+            if (rc != 0) {
+                MODLOG_DFLT(WARN, "cannot inspect repeat-pairing connection; rc=%d", rc);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
+            rc = ble_store_util_delete_peer(&desc.peer_id_addr);
+            if (rc != 0) {
+                MODLOG_DFLT(WARN, "cannot delete previous peer bond; rc=%d", rc);
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
 
             /* Return BLE_GAP_REPEAT_PAIRING_RETRY to indicate that the host should
              * continue with the pairing operation.
@@ -544,6 +614,10 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
                 /* Abort if disconnected */
                 return 0;
             }
+            if (bearers >= MYNEWT_VAL(BLE_EATT_CHAN_NUM)) {
+                MODLOG_DFLT(WARN, "ignoring excess EATT bearer cid=%d", event->eatt.cid);
+                return 0;
+            }
             cids[bearers] = event->eatt.cid;
             bearers += 1;
             if (bearers != MYNEWT_VAL(BLE_EATT_CHAN_NUM)) {
@@ -575,22 +649,29 @@ static int bleprph_gap_event(struct ble_gap_event *event, void *arg)
 static void bleprph_on_reset(int reason)
 {
     MODLOG_DFLT(ERROR, "Resetting state; reason=%d\n", reason);
+    stackchan_ble_set_conn_handle(BLE_HS_CONN_HANDLE_NONE);
+    bleprph_set_notify_payload_len(20);
 }
 
 #if CONFIG_EXAMPLE_RANDOM_ADDR
-static void ble_app_set_addr(void)
+static int ble_app_set_addr(void)
 {
     ble_addr_t addr;
     int rc;
 
     /* generate new non-resolvable private address */
     rc = ble_hs_id_gen_rnd(0, &addr);
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "cannot generate a random BLE address; rc=%d", rc);
+        return rc;
+    }
 
     /* set generated address */
     rc = ble_hs_id_set_rnd(addr.val);
-
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "cannot set the random BLE address; rc=%d", rc);
+    }
+    return rc;
 }
 #endif
 
@@ -600,7 +681,10 @@ static void bleprph_on_sync(void)
 
 #if CONFIG_EXAMPLE_RANDOM_ADDR
     /* Generate a non-resolvable private address. */
-    ble_app_set_addr();
+    rc = ble_app_set_addr();
+    if (rc != 0) {
+        return;
+    }
 #endif
 
     /* Make sure we have proper identity address set (public preferred) */
@@ -609,7 +693,10 @@ static void bleprph_on_sync(void)
 #else
     rc = ble_hs_util_ensure_addr(0);
 #endif
-    assert(rc == 0);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "cannot ensure a BLE identity address; rc=%d", rc);
+        return;
+    }
 
     /* Figure out address to use while advertising (no privacy for now) */
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
@@ -621,6 +708,10 @@ static void bleprph_on_sync(void)
     /* Printing ADDR */
     uint8_t addr_val[6] = {0};
     rc                  = ble_hs_id_copy_addr(own_addr_type, addr_val, NULL);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "cannot copy the BLE identity address; rc=%d", rc);
+        return;
+    }
 
     MODLOG_DFLT(INFO, "Device Address: ");
     print_addr(addr_val);
@@ -635,6 +726,7 @@ static void bleprph_on_sync(void)
 
 void bleprph_host_task(void *param)
 {
+    (void)param;
     ESP_LOGI(tag, "BLE Host Task Started");
     /* This function will return only when nimble_port_stop() is executed */
     nimble_port_run();
@@ -642,25 +734,41 @@ void bleprph_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-void ble_prph_init(bool use_alt_uuid)
+int ble_prph_init(bool use_alt_uuid)
 {
-    s_use_alt_uuid = use_alt_uuid;
-    int rc;
+    bool nimble_initialized = false;
+    bool scli_initialized = false;
+    bool cleanup_failed = false;
+    int rc = 0;
     esp_err_t ret;
 
-    // /* Initialize NVS — it is used to store PHY calibration data */
-    // ret = nvs_flash_init();
-    // if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    //     ESP_ERROR_CHECK(nvs_flash_erase());
-    //     ret = nvs_flash_init();
-    // }
-    // ESP_ERROR_CHECK(ret);
+    taskENTER_CRITICAL(&s_bleprph_state_lock);
+    if (s_bleprph_state == BLEPRPH_STATE_INITIALIZED) {
+        const bool same_mode = s_use_alt_uuid == use_alt_uuid;
+        taskEXIT_CRITICAL(&s_bleprph_state_lock);
+        if (!same_mode) {
+            ESP_LOGE(tag, "BLE already uses the %s UUID; refusing an unsafe live switch to %s",
+                     s_use_alt_uuid ? "alternate" : "normal", use_alt_uuid ? "alternate" : "normal");
+            return ESP_ERR_INVALID_STATE;
+        }
+        return 0;
+    }
+    if (s_bleprph_state != BLEPRPH_STATE_UNINITIALIZED) {
+        taskEXIT_CRITICAL(&s_bleprph_state_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_bleprph_state = BLEPRPH_STATE_INITIALIZING;
+    s_use_alt_uuid = use_alt_uuid;
+    s_notify_payload_len = 20;
+    taskEXIT_CRITICAL(&s_bleprph_state_lock);
 
     ret = nimble_port_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(tag, "Failed to init nimble %d ", ret);
-        return;
+        ESP_LOGE(tag, "Failed to initialize NimBLE: %s", esp_err_to_name(ret));
+        rc = ret;
+        goto init_failed;
     }
+    nimble_initialized = true;
     /* Initialize the NimBLE host configuration. */
     ble_hs_cfg.reset_cb          = bleprph_on_reset;
     ble_hs_cfg.sync_cb           = bleprph_on_sync;
@@ -668,6 +776,10 @@ void ble_prph_init(bool use_alt_uuid)
     ble_hs_cfg.store_status_cb   = ble_store_util_status_rr;
 
     ble_hs_cfg.sm_io_cap = CONFIG_EXAMPLE_IO_TYPE;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_our_key_dist = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
 #ifdef CONFIG_EXAMPLE_BONDING
     ble_hs_cfg.sm_bonding = 1;
     /* Enable the appropriate bit masks to make sure the keys
@@ -691,29 +803,49 @@ void ble_prph_init(bool use_alt_uuid)
 #endif
 
 #if MYNEWT_VAL(STATIC_PASSKEY) && NIMBLE_BLE_CONNECT
-    ble_sm_configure_static_passkey(456789, true);
+    rc = ble_sm_configure_static_passkey(456789, true);
+    if (rc != 0) {
+        ESP_LOGE(tag, "Failed to configure the static passkey: %d", rc);
+        goto init_failed;
+    }
 #endif
 
 #if MYNEWT_VAL(BLE_GATTS)
     rc = gatt_svr_init(use_alt_uuid);
-    assert(rc == 0);
+    if (rc != 0) {
+        ESP_LOGE(tag, "Failed to initialize the GATT server: %d", rc);
+        goto init_failed;
+    }
 #endif
 
 #if CONFIG_BT_NIMBLE_GAP_SERVICE
     /* Set the default device name. */
     rc = ble_svc_gap_device_name_set("StackChan");
-    assert(rc == 0);
+    if (rc != 0) {
+        ESP_LOGE(tag, "Failed to set the BLE device name: %d", rc);
+        goto init_failed;
+    }
 #endif
 
     /* XXX Need to have template for store */
     ble_store_config_init();
 
-    nimble_port_freertos_init(bleprph_host_task);
-
-    /* Initialize command line interface to accept input from user */
+#if CONFIG_EXAMPLE_IO_TYPE == BLE_HS_IO_DISPLAY_YESNO || CONFIG_EXAMPLE_IO_TYPE == BLE_HS_IO_KEYBOARD_ONLY || \
+    CONFIG_EXAMPLE_IO_TYPE == BLE_HS_IO_KEYBOARD_DISPLAY
+    /* Start UART input only when the configured security mode can request it. */
     rc = scli_init();
     if (rc != ESP_OK) {
-        ESP_LOGE(tag, "scli_init() failed");
+        ESP_LOGE(tag, "Failed to initialize the pairing CLI: %s", esp_err_to_name(rc));
+        goto init_failed;
+    }
+    scli_initialized = true;
+#endif
+
+    ret = esp_nimble_enable(bleprph_host_task);
+    if (ret != ESP_OK) {
+        ESP_LOGE(tag, "Failed to start the NimBLE host task: %s", esp_err_to_name(ret));
+        rc = ret;
+        goto init_failed;
     }
 
 #if MYNEWT_VAL(BLE_EATT_CHAN_NUM) > 0
@@ -722,9 +854,40 @@ void ble_prph_init(bool use_alt_uuid)
         cids[i] = 0;
     }
 #endif
+
+    taskENTER_CRITICAL(&s_bleprph_state_lock);
+    s_bleprph_state = BLEPRPH_STATE_INITIALIZED;
+    taskEXIT_CRITICAL(&s_bleprph_state_lock);
+    return 0;
+
+init_failed:
+    if (scli_initialized) {
+        const int cleanup_rc = scli_deinit();
+        if (cleanup_rc != ESP_OK) {
+            ESP_LOGW(tag, "Pairing CLI cleanup failed: %s", esp_err_to_name(cleanup_rc));
+            cleanup_failed = true;
+        }
+    }
+    gatt_svr_cleanup_init_failure();
+    if (nimble_initialized) {
+        const esp_err_t cleanup_rc = nimble_port_deinit();
+        if (cleanup_rc != ESP_OK) {
+            ESP_LOGW(tag, "NimBLE cleanup failed: %s", esp_err_to_name(cleanup_rc));
+            cleanup_failed = true;
+        }
+    }
+
+    taskENTER_CRITICAL(&s_bleprph_state_lock);
+    s_bleprph_state = cleanup_failed ? BLEPRPH_STATE_FAILED : BLEPRPH_STATE_UNINITIALIZED;
+    taskEXIT_CRITICAL(&s_bleprph_state_lock);
+    return rc != 0 ? rc : ESP_FAIL;
 }
 
 uint16_t stackchan_ble_get_notify_payload_len(void)
 {
-    return s_notify_payload_len;
+    uint16_t payload_len;
+    taskENTER_CRITICAL(&s_bleprph_state_lock);
+    payload_len = s_notify_payload_len;
+    taskEXIT_CRITICAL(&s_bleprph_state_lock);
+    return payload_len;
 }

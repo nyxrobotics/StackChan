@@ -13,6 +13,8 @@ static const char* TAG = "PY32IOExpander";
 
 namespace m5 {
 
+static constexpr int kI2cTimeoutMs = 50;
+
 // Register definitions
 static constexpr uint8_t REG_UID_L      = 0x00;
 static constexpr uint8_t REG_UID_H      = 0x01;
@@ -57,14 +59,17 @@ static constexpr uint8_t REG_PWM4_DUTY_L = 0x21;
 static constexpr uint8_t REG_PWM4_DUTY_H = 0x22;
 
 PY32IOExpander_Class::PY32IOExpander_Class(i2c_master_bus_handle_t i2c_bus_handle, uint8_t addr)
-    : _addr(addr), _initialized(false)
+    : _i2c_dev(nullptr), _addr(addr), _initialized(false)
 {
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = _addr,
         .scl_speed_hz    = 100000,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev));
+    esp_err_t err = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register I2C device: %s", esp_err_to_name(err));
+    }
 }
 
 PY32IOExpander_Class::~PY32IOExpander_Class()
@@ -76,14 +81,16 @@ PY32IOExpander_Class::~PY32IOExpander_Class()
 
 esp_err_t PY32IOExpander_Class::writeRegister8(uint8_t reg, uint8_t value)
 {
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
     uint8_t buf[2] = {reg, value};
-    return i2c_master_transmit(_i2c_dev, buf, sizeof(buf), 1000);
+    return i2c_master_transmit(_i2c_dev, buf, sizeof(buf), kI2cTimeoutMs);
 }
 
 uint8_t PY32IOExpander_Class::readRegister8(uint8_t reg)
 {
+    if (_i2c_dev == nullptr) return 0;
     uint8_t val   = 0;
-    esp_err_t err = i2c_master_transmit_receive(_i2c_dev, &reg, 1, &val, 1, 1000);
+    esp_err_t err = i2c_master_transmit_receive(_i2c_dev, &reg, 1, &val, 1, kI2cTimeoutMs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "readRegister8 failed: %s", esp_err_to_name(err));
         return 0;
@@ -93,23 +100,22 @@ uint8_t PY32IOExpander_Class::readRegister8(uint8_t reg)
 
 esp_err_t PY32IOExpander_Class::writeRegister(uint8_t reg, const uint8_t* data, size_t len)
 {
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
     if (len == 0) return ESP_OK;
+    if (len > 64) return ESP_ERR_INVALID_SIZE;
 
-    // Allocate buffer for reg + data
-    uint8_t* buf = (uint8_t*)malloc(len + 1);
-    if (!buf) return ESP_ERR_NO_MEM;
-
+    uint8_t buf[65];
     buf[0] = reg;
     memcpy(buf + 1, data, len);
 
-    esp_err_t err = i2c_master_transmit(_i2c_dev, buf, len + 1, 1000);
-    free(buf);
+    esp_err_t err = i2c_master_transmit(_i2c_dev, buf, len + 1, kI2cTimeoutMs);
     return err;
 }
 
 esp_err_t PY32IOExpander_Class::readRegister(uint8_t reg, uint8_t* data, size_t len)
 {
-    return i2c_master_transmit_receive(_i2c_dev, &reg, 1, data, len, 1000);
+    if (_i2c_dev == nullptr) return ESP_ERR_INVALID_STATE;
+    return i2c_master_transmit_receive(_i2c_dev, &reg, 1, data, len, kI2cTimeoutMs);
 }
 
 esp_err_t PY32IOExpander_Class::bitOn(uint8_t reg, uint8_t mask)
@@ -152,6 +158,8 @@ bool PY32IOExpander_Class::_readBit(uint8_t reg_l, uint8_t reg_h, uint8_t pin)
 
 bool PY32IOExpander_Class::begin()
 {
+    if (_i2c_dev == nullptr) return false;
+
     uint8_t version = readRegister8(REG_VERSION);
     if (version == 0 || version == 0xFF) {
         ESP_LOGE(TAG, "Invalid version: 0x%02X", version);
@@ -347,17 +355,19 @@ void PY32IOExpander_Class::setLedColor(uint8_t index, uint32_t color)
     setLedColor(index, (uint8_t)((color >> 16) & 0xFF), (uint8_t)((color >> 8) & 0xFF), (uint8_t)(color & 0xFF));
 }
 
-void PY32IOExpander_Class::setLedData(const uint8_t* data, size_t len)
+esp_err_t PY32IOExpander_Class::setLedData(const uint8_t* data, size_t len)
 {
-    if (!data || len == 0) return;
+    if (!data || len == 0) return ESP_ERR_INVALID_ARG;
     if (len > 64) len = 64;  // Max 32 LEDs * 2 bytes
-    writeRegister(REG_LED_RAM_START, data, len);
+    return writeRegister(REG_LED_RAM_START, data, len);
 }
 
-void PY32IOExpander_Class::refreshLeds()
+esp_err_t PY32IOExpander_Class::refreshLeds()
 {
-    uint8_t val = readRegister8(REG_LED_CFG);
-    writeRegister8(REG_LED_CFG, val | (1 << 6));
+    uint8_t val = 0;
+    esp_err_t err = readRegister(REG_LED_CFG, &val, 1);
+    if (err != ESP_OK) return err;
+    return writeRegister8(REG_LED_CFG, val | (1 << 6));
 }
 
 }  // namespace m5

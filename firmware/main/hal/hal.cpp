@@ -250,13 +250,10 @@ static void _stackchan_update_task(void* param)
     bool is_setup_done = false;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+        const uint32_t update_interval_ms = hal_bridge::is_xiaozhi_idle() ? 20 : 100;
+        vTaskDelay(pdMS_TO_TICKS(update_interval_ms));
 
         tools::update_reminders();
-
-        if (!hal_bridge::is_xiaozhi_idle()) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
 
         LvglLockGuard lock;
 
@@ -300,7 +297,10 @@ void Hal::startXiaozhi()
     });
 
     // Start stackchan update task
-    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
+    BaseType_t task_created = xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
+    if (task_created != pdPASS) {
+        mclog::tagError(_tag, "failed to create StackChan update task");
+    }
 
     conversation_runtime::prepare();
 
@@ -439,7 +439,6 @@ void Hal::requestWarmReboot(int appIndex)
         settings.SetInt(_warm_boot_nvs_key.data(), appIndex);
     }
 
-    delay(100);
     esp_restart();
 }
 

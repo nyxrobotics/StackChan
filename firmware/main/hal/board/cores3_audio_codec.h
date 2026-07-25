@@ -19,6 +19,8 @@ private:
     esp_codec_dev_handle_t output_dev_ = nullptr;
     esp_codec_dev_handle_t input_dev_ = nullptr;
     int64_t input_open_failed_since_us_ = 0;
+    int64_t last_input_error_log_us_ = 0;
+    int64_t last_output_error_log_us_ = 0;
 
     void CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din);
 

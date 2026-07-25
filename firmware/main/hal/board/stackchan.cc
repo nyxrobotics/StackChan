@@ -18,6 +18,9 @@
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <algorithm>
+#include <exception>
+#include <mutex>
+#include <utility>
 #include "stackchan_camera.h"
 #include "hal_bridge.h"
 #include "hal_bridge_conv.h"  // [ADD] ConversationManager イベントブリッジ
@@ -356,8 +359,54 @@ private:
     esp_timer_handle_t touchpad_timer_;
     PowerSaveTimer* power_save_timer_;
     hal_bridge::XiaozhiConfig_t xiaozhi_config_;
+    std::mutex network_callback_mutex_;
+    NetworkEventCallback primary_network_callback_;
+    NetworkEventCallback network_wait_callback_;
+    bool network_dispatch_installed_    = false;
     bool last_power_save_enabled_      = false;
     int64_t last_power_state_check_ms_ = 0;
+
+    void DispatchNetworkEvent(NetworkEvent event, const std::string& data)
+    {
+        NetworkEventCallback primary_callback;
+        NetworkEventCallback wait_callback;
+        {
+            std::lock_guard<std::mutex> lock(network_callback_mutex_);
+            primary_callback = primary_network_callback_;
+            wait_callback    = network_wait_callback_;
+        }
+
+        if (wait_callback) {
+            try {
+                wait_callback(event, data);
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Network wait callback failed: %s", e.what());
+            } catch (...) {
+                ESP_LOGE(TAG, "Network wait callback failed with an unknown exception");
+            }
+        }
+        if (primary_callback) {
+            try {
+                primary_callback(event, data);
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Primary network callback failed: %s", e.what());
+            } catch (...) {
+                ESP_LOGE(TAG, "Primary network callback failed with an unknown exception");
+            }
+        }
+
+        if (event == NetworkEvent::Connected) {
+            hal_bridge::notify_xiaozhi_connected();
+        } else if (event == NetworkEvent::Disconnected) {
+            hal_bridge::notify_xiaozhi_disconnected();
+        }
+    }
+
+    void InstallNetworkDispatcher()
+    {
+        WifiBoard::SetNetworkEventCallback(
+            [this](NetworkEvent event, const std::string& data) { DispatchNetworkEvent(event, data); });
+    }
 
     bool ShouldEnablePowerSave(bool has_external_power, bool is_discharging) const
     {
@@ -517,8 +566,18 @@ private:
             .skip_unhandled_events = true,
         };
 
-        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &touchpad_timer_));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(touchpad_timer_, 20 * 1000));
+        esp_err_t err = esp_timer_create(&timer_args, &touchpad_timer_);
+        if (err != ESP_OK) {
+            touchpad_timer_ = nullptr;
+            ESP_LOGE(TAG, "Failed to create touch/power timer: %s", esp_err_to_name(err));
+            return;
+        }
+        err = esp_timer_start_periodic(touchpad_timer_, 20 * 1000);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start touch/power timer: %s", esp_err_to_name(err));
+            esp_timer_delete(touchpad_timer_);
+            touchpad_timer_ = nullptr;
+        }
     }
 
     void InitializeSpi()
@@ -624,12 +683,19 @@ public:
         InitializeAxp2101();
         InitializePowerSaveTimer();
         InitializeAw9523();
-        I2cDetect();
+        if (esp_log_level_get(TAG) >= ESP_LOG_DEBUG) {
+            I2cDetect();
+        }
         InitializeSpi();
         InitializeIli9342Display();
         InitializeCamera();
         InitializeFt6336TouchPad();
         GetBacklight()->RestoreBrightness();
+
+        // Install the process-wide dispatcher before WiFi can emit events.
+        // Later callback updates only touch the mutex-protected slots below.
+        InstallNetworkDispatcher();
+        network_dispatch_installed_ = true;
     }
 
     virtual AudioCodec* GetAudioCodec() override
@@ -689,17 +755,37 @@ public:
     // それをラップして hal_bridge_conv の notify_* も併せて呼ぶ。
     void SetNetworkEventCallback(std::function<void(NetworkEvent, const std::string&)> cb) override
     {
-        WifiBoard::SetNetworkEventCallback([cb](NetworkEvent event, const std::string& data) {
-            // 元の Application コールバックを先に呼ぶ（既存動作を維持）
-            cb(event, data);
-
-            // ConversationManager へ転送
-            if (event == NetworkEvent::Connected) {
-                hal_bridge::notify_xiaozhi_connected();   // Wi-Fi 接続 = Xiaozhi 接続可能とみなす
-            } else if (event == NetworkEvent::Disconnected) {
-                hal_bridge::notify_xiaozhi_disconnected(); // Wi-Fi 断 = Xiaozhi 断
+        bool install_dispatch = false;
+        {
+            std::lock_guard<std::mutex> lock(network_callback_mutex_);
+            primary_network_callback_ = std::move(cb);
+            if (!network_dispatch_installed_) {
+                network_dispatch_installed_ = true;
+                install_dispatch            = true;
             }
-        });
+        }
+
+        if (!install_dispatch) {
+            return;
+        }
+
+        InstallNetworkDispatcher();
+    }
+
+    void SetNetworkWaitCallback(NetworkEventCallback callback)
+    {
+        bool install_dispatch = false;
+        {
+            std::lock_guard<std::mutex> lock(network_callback_mutex_);
+            network_wait_callback_ = std::move(callback);
+            if (!network_dispatch_installed_) {
+                network_dispatch_installed_ = true;
+                install_dispatch            = true;
+            }
+        }
+        if (install_dispatch) {
+            InstallNetworkDispatcher();
+        }
     }
 };
 
@@ -709,6 +795,12 @@ i2c_master_bus_handle_t hal_bridge::board_get_i2c_bus()
 {
     auto& board = (M5StackCoreS3Board&)Board::GetInstance();
     return board.GetI2cBus();
+}
+
+void hal_bridge::board_set_network_wait_callback(NetworkEventCallback callback)
+{
+    auto& board = static_cast<M5StackCoreS3Board&>(Board::GetInstance());
+    board.SetNetworkWaitCallback(std::move(callback));
 }
 
 StackChanCamera* hal_bridge::board_get_camera()

@@ -8,6 +8,7 @@
 #include <smooth_lvgl.hpp>
 #include <uitk/short_namespace.hpp>
 #include <hal/hal.h>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -91,7 +92,7 @@ private:
     uint32_t _last_tick = 0;
     bool _is_first_in   = false;
 
-    AppConfigEvent _last_app_config_event = AppConfigEvent::None;
+    std::atomic<AppConfigEvent> _last_app_config_event{AppConfigEvent::None};
     int _app_config_signal_id             = -1;
 
     struct StateAppDownloadData {
@@ -128,12 +129,16 @@ private:
         std::unique_ptr<uitk::lvgl_cpp::Container> panel;
         std::unique_ptr<uitk::lvgl_cpp::Button> btn_id;
         std::unique_ptr<uitk::lvgl_cpp::Label> info;
+        bool server_started = false;
+        bool back_clicked   = false;
 
         void reset()
         {
             panel.reset();
             btn_id.reset();
             info.reset();
+            server_started = false;
+            back_clicked   = false;
         }
     };
     StateWaitAppConnectionData _state_wait_app_connection_data;

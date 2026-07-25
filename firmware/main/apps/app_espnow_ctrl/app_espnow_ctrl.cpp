@@ -61,7 +61,9 @@ void AppEspnowControl::onOpen()
                    _receiver_id, _wifi_channel);
 
     // Start espnow
-    GetHAL().startEspNow(_wifi_channel);
+    if (!GetHAL().startEspNow(_wifi_channel)) {
+        mclog::tagError(getAppInfo().name, "failed to start ESP-NOW");
+    }
     GetHAL().onEspNowData.connect([](const std::vector<uint8_t>& data) {
         std::lock_guard<std::mutex> lock(_mutex);
         _received_data = data;
@@ -156,7 +158,11 @@ void AppEspnowControl::start_advanced_page()
 
 void handle_received_data()
 {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<uint8_t> received_data;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        received_data.swap(_received_data);
+    }
 
     // [target-id (uint8)] [yaw-angle (int16)] [pitch-angle (int16)] [speed (int16)] [laser-enabled (uint8)]
     // id: 0 for broadcast
@@ -164,20 +170,16 @@ void handle_received_data()
     // pitch: 0 ~ 900
     // speed: 0 ~ 1000, suggest 600
     // laser-enabled: 0 = off, 1 = on
-    if (_received_data.size() >= 8) {
-        uint8_t target_id = _received_data[0];
+    if (received_data.size() >= 8) {
+        uint8_t target_id = received_data[0];
         if (target_id != 0 && target_id != _receiver_id) {
-            mclog::info("not me, target id: {}", target_id);
-            _received_data.clear();
             return;
         }
 
-        int16_t yaw_angle   = static_cast<int16_t>(_received_data[1] | (_received_data[2] << 8));
-        int16_t pitch_angle = static_cast<int16_t>(_received_data[3] | (_received_data[4] << 8));
-        int16_t speed       = static_cast<int16_t>(_received_data[5] | (_received_data[6] << 8));
-        bool laser_enabled  = (_received_data[7] != 0);
-
-        mclog::info("yaw: {}, pitch: {}, speed: {}, laser: {}", yaw_angle, pitch_angle, speed, laser_enabled);
+        int16_t yaw_angle   = static_cast<int16_t>(received_data[1] | (received_data[2] << 8));
+        int16_t pitch_angle = static_cast<int16_t>(received_data[3] | (received_data[4] << 8));
+        int16_t speed       = static_cast<int16_t>(received_data[5] | (received_data[6] << 8));
+        bool laser_enabled  = (received_data[7] != 0);
 
         auto& motion = GetStackChan().motion();
         motion.moveWithSpeed(yaw_angle, pitch_angle, speed);
@@ -185,7 +187,6 @@ void handle_received_data()
         GetHAL().setLaserEnabled(laser_enabled);
     }
 
-    _received_data.clear();
 }
 
 void handle_send_pose()
@@ -232,14 +233,13 @@ void handle_send_pose()
 
 void AppEspnowControl::onRunning()
 {
-    LvglLockGuard lock;
-
     if (_is_receiver) {
         handle_received_data();
     } else {
         handle_send_pose();
     }
 
+    LvglLockGuard lock;
     GetStackChan().update();
 
     view::update_home_indicator();

@@ -458,8 +458,15 @@ void Hal::startEzDataService(std::function<void(std::string_view)> onStartLog)
 {
     mclog::tagInfo(_tag, "start ezdata service");
 
-    startNetwork(onStartLog);
+    if (!startNetwork(onStartLog)) {
+        if (onStartLog) {
+            onStartLog("Network unavailable.");
+        }
+        return;
+    }
 
-    onStartLog("Connecting to\nserver...");
+    if (onStartLog) {
+        onStartLog("Connecting to\nserver...");
+    }
     mooncake::GetMooncake().extensionManager()->createAbility(std::make_unique<EzdataWorker>());
 }

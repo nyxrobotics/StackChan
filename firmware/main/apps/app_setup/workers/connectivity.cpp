@@ -129,11 +129,11 @@ void WifiSetupWorker::update_state()
             }
 
             // Check events
-            if (_last_app_config_event != AppConfigEvent::None) {
-                if (_last_app_config_event == AppConfigEvent::AppConnected) {
+            const auto app_config_event = _last_app_config_event.exchange(AppConfigEvent::None);
+            if (app_config_event != AppConfigEvent::None) {
+                if (app_config_event == AppConfigEvent::AppConnected) {
                     switch_state(State::AppConnected);
                 }
-                _last_app_config_event = AppConfigEvent::None;
             }
 
             break;
@@ -143,12 +143,13 @@ void WifiSetupWorker::update_state()
                 _is_first_in = false;
 
                 // Start app config server
-                _app_config_signal_id =
-                    GetHAL().onAppConfigEvent.connect([this](AppConfigEvent event) { _last_app_config_event = event; });
-
-                GetHAL().startAppConfigServer();
+                if (_app_config_signal_id < 0) {
+                    _app_config_signal_id = GetHAL().onAppConfigEvent.connect(
+                        [this](AppConfigEvent event) { _last_app_config_event.store(event); });
+                }
 
                 auto& data = _state_wait_app_connection_data;
+                data.server_started = GetHAL().startAppConfigServer();
 
                 data.panel = std::make_unique<Container>(lv_screen_active());
                 data.panel->setBgColor(lv_color_hex(0xEDF4FF));
@@ -161,31 +162,47 @@ void WifiSetupWorker::update_state()
                 apply_button_common_style(*data.btn_id);
                 data.btn_id->align(LV_ALIGN_CENTER, 0, -20);
                 data.btn_id->setSize(262, 52);
-                data.btn_id->onClick().connect([]() {
-                    auto& avatar = GetStackChan().avatar();
-                    avatar.clearDecorators();
-                    avatar.addDecorator(std::make_unique<avatar::HeartDecorator>(lv_screen_active(), 3000));
-                });
-                data.btn_id->label().setText(fmt::format("ID: {}", GetHAL().getFactoryMacString()));
+                if (data.server_started) {
+                    data.btn_id->onClick().connect([]() {
+                        auto& avatar = GetStackChan().avatar();
+                        avatar.clearDecorators();
+                        avatar.addDecorator(std::make_unique<avatar::HeartDecorator>(lv_screen_active(), 3000));
+                    });
+                    data.btn_id->label().setText(fmt::format("ID: {}", GetHAL().getFactoryMacString()));
+                } else {
+                    data.btn_id->onClick().connect([this]() {
+                        _state_wait_app_connection_data.back_clicked = true;
+                    });
+                    data.btn_id->label().setText("Back");
+                }
 
                 data.info = std::make_unique<Label>(lv_screen_active());
                 data.info->setTextFont(&lv_font_montserrat_24);
                 data.info->setTextColor(lv_color_hex(0x26206A));
                 data.info->align(LV_ALIGN_BOTTOM_MID, 0, -26);
                 data.info->setTextAlign(LV_TEXT_ALIGN_CENTER);
-                data.info->setText("Look for me in the app\nto start setup.");
+                data.info->setText(data.server_started
+                                       ? "Look for me in the app\nto start setup."
+                                       : "Bluetooth is already in use.\nRestart Stack-chan to switch modes.");
 
                 auto& avatar = GetStackChan().avatar();
                 avatar.clearDecorators();
-                avatar.addDecorator(std::make_unique<avatar::HeartDecorator>(lv_screen_active(), 3000));
+                if (data.server_started) {
+                    avatar.addDecorator(std::make_unique<avatar::HeartDecorator>(lv_screen_active(), 3000));
+                }
+            }
+
+            if (_state_wait_app_connection_data.back_clicked) {
+                switch_state(State::AppDownload);
+                break;
             }
 
             // Check events
-            if (_last_app_config_event != AppConfigEvent::None) {
-                if (_last_app_config_event == AppConfigEvent::AppConnected) {
+            const auto app_config_event = _last_app_config_event.exchange(AppConfigEvent::None);
+            if (app_config_event != AppConfigEvent::None) {
+                if (app_config_event == AppConfigEvent::AppConnected) {
                     switch_state(State::AppConnected);
                 }
-                _last_app_config_event = AppConfigEvent::None;
             }
 
             break;
@@ -207,22 +224,22 @@ void WifiSetupWorker::update_state()
             }
 
             // Check events
-            if (_last_app_config_event != AppConfigEvent::None) {
-                if (_last_app_config_event == AppConfigEvent::AppDisconnected) {
+            const auto app_config_event = _last_app_config_event.exchange(AppConfigEvent::None);
+            if (app_config_event != AppConfigEvent::None) {
+                if (app_config_event == AppConfigEvent::AppDisconnected) {
                     switch_state(State::WaitAppConnection);
-                } else if (_last_app_config_event == AppConfigEvent::TryWifiConnect) {
+                } else if (app_config_event == AppConfigEvent::TryWifiConnect) {
                     auto& avatar = GetStackChan().avatar();
                     avatar.setSpeech("Verifying...");
                     GetStackChan().addModifier(std::make_unique<SpeakingModifier>(2000, 180, false));
-                } else if (_last_app_config_event == AppConfigEvent::WifiConnectFailed) {
+                } else if (app_config_event == AppConfigEvent::WifiConnectFailed) {
                     GetStackChan().addModifier(std::make_unique<TimedEmotionModifier>(avatar::Emotion::Sad, 4000));
                     GetStackChan().addModifier(
                         std::make_unique<TimedSpeechModifier>("Connect Failed. Try again?", 6000));
                     GetStackChan().addModifier(std::make_unique<SpeakingModifier>(3000, 180, false));
-                } else if (_last_app_config_event == AppConfigEvent::WifiConnected) {
+                } else if (app_config_event == AppConfigEvent::WifiConnected) {
                     switch_state(State::Done);
                 }
-                _last_app_config_event = AppConfigEvent::None;
             }
 
             break;

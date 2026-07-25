@@ -18,9 +18,11 @@ static void _imu_task(void* param)
 {
     auto motion_detector = std::make_unique<MotionDetector>();
     motion_detector->setShakeThreshold(16.0f);
+    uint32_t consecutive_failures = 0;
 
     while (1) {
         if (_bmi270 && _bmi270->update()) {
+            consecutive_failures = 0;
             auto& data = _bmi270->getData();
 
             motion_detector->update(data.accel_x, data.accel_y, data.accel_z);
@@ -29,8 +31,16 @@ static void _imu_task(void* param)
                 mclog::tagInfo(_tag, "Shake Detected!");
                 GetHAL().onImuMotionEvent.emit(ImuMotionEvent::Shake);
             }
+        } else {
+            ++consecutive_failures;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        uint32_t delay_ms = 100;
+        if (consecutive_failures > 0) {
+            uint32_t shift = consecutive_failures > 3 ? 3 : consecutive_failures;
+            delay_ms       = 100U << shift;
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 
@@ -49,7 +59,13 @@ bool Hal::imu_init_impl()
     }
 
     mclog::tagInfo(_tag, "BMI270 init ok");
-    xTaskCreatePinnedToCoreWithCaps(_imu_task, "imu", 4096, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM);
+    BaseType_t task_created =
+        xTaskCreatePinnedToCoreWithCaps(_imu_task, "imu", 4096, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM);
+    if (task_created != pdPASS) {
+        mclog::tagWarn(_tag, "failed to create BMI270 update task");
+        _bmi270.reset();
+        return false;
+    }
     return true;
 }
 

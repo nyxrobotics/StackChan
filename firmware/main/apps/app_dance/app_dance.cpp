@@ -44,8 +44,10 @@ void AppDance::onOpen()
         loading_page->setMessage("Starting\n BLE server...");
     }
 
-    // Start BLE service
-    GetHAL().startBleServer();
+    // Start BLE service. A different BLE profile may already own the NimBLE
+    // host; live profile switching is deliberately rejected because the ESP-IDF
+    // stop path can wait forever.
+    const bool ble_server_started = GetHAL().startBleServer();
 
     LvglLockGuard lock;
 
@@ -57,36 +59,44 @@ void AppDance::onOpen()
     GetStackChan().attachAvatar(std::move(selected_avatar));
 
     /* ------------------------------- BLE events ------------------------------- */
-    GetHAL().onBleAvatarData.connect([&](const char* data) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_ble_avatar_data.update_flag) {
-            return;
-        }
-        _ble_avatar_data.data        = data;
-        _ble_avatar_data.update_flag = true;
-    });
+    if (ble_server_started) {
+        GetHAL().onBleAvatarData.connect([&](const char* data) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_ble_avatar_data.update_flag) {
+                return;
+            }
+            _ble_avatar_data.data        = data;
+            _ble_avatar_data.update_flag = true;
+        });
 
-    GetHAL().onBleMotionData.connect([&](const char* data) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_ble_motion_data.update_flag) {
-            return;
-        }
-        _ble_motion_data.data        = data;
-        _ble_motion_data.update_flag = true;
-    });
+        GetHAL().onBleMotionData.connect([&](const char* data) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_ble_motion_data.update_flag) {
+                return;
+            }
+            _ble_motion_data.data        = data;
+            _ble_motion_data.update_flag = true;
+        });
 
-    GetHAL().onBleRgbData.connect([&](const char* data) {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_ble_rgb_data.update_flag) {
-            return;
-        }
-        _ble_rgb_data.data        = data;
-        _ble_rgb_data.update_flag = true;
-    });
+        GetHAL().onBleRgbData.connect([&](const char* data) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_ble_rgb_data.update_flag) {
+                return;
+            }
+            _ble_rgb_data.data        = data;
+            _ble_rgb_data.update_flag = true;
+        });
+    } else {
+        mclog::tagError(getAppInfo().name, "BLE server unavailable: another BLE profile is active");
+    }
 
     /* ----------------------------- Common widgets ----------------------------- */
     view::create_home_indicator([&]() { close(); }, 0xB77BFF, 0x422268);
     view::create_status_bar(0xB77BFF, 0x422268);
+    if (!ble_server_started) {
+        view::pop_a_toast("Bluetooth is already in use.\nRestart Stack-chan to switch modes.", view::ToastType::Error,
+                          12000);
+    }
 }
 
 void AppDance::onRunning()

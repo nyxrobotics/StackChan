@@ -302,19 +302,19 @@ SystemUpdateWorker::SystemUpdateWorker()
     GetHAL().lvglUnlock();
 
     // Start network
-    GetHAL().startNetwork([&](std::string_view msg) {
+    bool network_ready = GetHAL().startNetwork([&](std::string_view msg) {
         LvglLockGuard lock;
         loading_page->setMessage(msg);
     });
 
-    // Update Firmware
-    bool result = GetHAL().updateFirmware([&](std::string_view msg) {
-        LvglLockGuard lock;
-        loading_page->setMessage(msg);
-    });
-
-    // Hold the result for a while
-    GetHAL().delay(3000);
+    if (network_ready) {
+        GetHAL().updateFirmware([&](std::string_view msg) {
+            LvglLockGuard lock;
+            loading_page->setMessage(msg);
+        });
+    } else {
+        mclog::tagWarn(_tag, "skipping firmware update because network is unavailable");
+    }
 
     GetHAL().lvglLock();
     _is_done = true;

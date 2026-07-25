@@ -25,8 +25,22 @@ ModuleLLMBackend::ModuleLLMBackend(std::shared_ptr<ModuleLLMClient> client)
 ModuleLLMBackend::~ModuleLLMBackend() {
     stop();
     taskRunning_.store(false);
-    for (int i = 0; pollTask_ != nullptr && i < 10; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (pollTask_ != nullptr) {
+        xTaskNotifyGive(pollTask_);
+        const bool exited =
+            pollTaskDone_ != nullptr &&
+            xSemaphoreTake(pollTaskDone_, pdMS_TO_TICKS(3000)) == pdTRUE;
+        if (!exited) {
+            ESP_LOGE(TAG, "pollLoop did not stop within 3 seconds; forcing final task cleanup");
+        }
+        // Normally the task has left all client/UART calls and suspended
+        // immediately after signalling pollTaskDone_.
+        vTaskDelete(pollTask_);
+        pollTask_ = nullptr;
+    }
+    if (pollTaskDone_ != nullptr) {
+        vSemaphoreDelete(pollTaskDone_);
+        pollTaskDone_ = nullptr;
     }
 }
 
@@ -42,20 +56,40 @@ void ModuleLLMBackend::start() {
 
     if (pollTask_ != nullptr) {
         ESP_LOGI(TAG, "start: reusing existing pollLoop task");
+        xTaskNotifyGive(pollTask_);
         return;
     }
 
     // Launch UART polling task — reads Whisper ASR results and drives LLM
+    pollTaskDone_ = xSemaphoreCreateBinary();
+    if (pollTaskDone_ == nullptr) {
+        active_.store(false);
+        taskRunning_.store(false);
+        ESP_LOGE(TAG, "pollLoop completion semaphore allocation failed");
+        if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+        return;
+    }
     taskRunning_.store(true);
     BaseType_t created = xTaskCreate([](void* arg) {
-        static_cast<ModuleLLMBackend*>(arg)->pollLoop();
-        vTaskDelete(nullptr);
+        auto* backend = static_cast<ModuleLLMBackend*>(arg);
+        backend->pollLoop();
+        SemaphoreHandle_t done = backend->pollTaskDone_;
+        // Signal only after pollLoop has left every client/UART operation.
+        // The owner then deletes this deliberately suspended task.
+        if (done != nullptr) {
+            xSemaphoreGive(done);
+        }
+        while (true) {
+            vTaskSuspend(nullptr);
+        }
     }, "modllm_poll", 8192, this, 5, &pollTask_);
 
     if (created != pdPASS) {
         active_.store(false);
         taskRunning_.store(false);
         pollTask_ = nullptr;
+        vSemaphoreDelete(pollTaskDone_);
+        pollTaskDone_ = nullptr;
         ESP_LOGE(TAG, "pollLoop task creation failed");
         if (onFailure_) onFailure_(BackendKind::ModuleLLM);
         return;
@@ -464,7 +498,7 @@ void ModuleLLMBackend::pollLoop() {
 
     while (taskRunning_.load()) {
         if (!active_.load()) {
-            vTaskDelay(pdMS_TO_TICKS(200));
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
 
@@ -763,7 +797,6 @@ void ModuleLLMBackend::pollLoop() {
     }
 
     active_.store(false);
-    pollTask_ = nullptr;
     ESP_LOGI(TAG, "pollLoop exit");
 }
 

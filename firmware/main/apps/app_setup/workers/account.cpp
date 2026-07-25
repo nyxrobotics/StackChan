@@ -89,19 +89,18 @@ AccountWorker::AccountWorker()
         GetHAL().lvglUnlock();
 
         // Start network
-        GetHAL().startNetwork([&](std::string_view msg) {
+        bool network_ready = GetHAL().startNetwork([&](std::string_view msg) {
             LvglLockGuard lock;
             loading_page->setMessage(msg);
         });
 
-        // Update info
-        bool result = GetHAL().updateAccountInfo([&](std::string_view msg) {
-            LvglLockGuard lock;
-            loading_page->setMessage(msg);
-        });
-
-        if (!result) {
-            GetHAL().delay(5000);
+        if (network_ready) {
+            GetHAL().updateAccountInfo([&](std::string_view msg) {
+                LvglLockGuard lock;
+                loading_page->setMessage(msg);
+            });
+        } else {
+            mclog::tagWarn(_tag, "skipping account request because network is unavailable");
         }
 
         GetHAL().lvglLock();
@@ -126,14 +125,10 @@ void AccountWorker::update()
                 auto loading_page = std::make_unique<view::LoadingPage>(0xF6F6F6, 0x26206A);
                 GetHAL().lvglUnlock();
 
-                bool result = GetHAL().unbindAccount([&](std::string_view msg) {
+                GetHAL().unbindAccount([&](std::string_view msg) {
                     LvglLockGuard lock;
                     loading_page->setMessage(msg);
                 });
-
-                if (!result) {
-                    GetHAL().delay(5000);
-                }
 
                 GetHAL().lvglLock();
             });

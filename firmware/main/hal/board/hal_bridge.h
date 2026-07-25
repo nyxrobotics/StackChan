@@ -8,7 +8,11 @@
 #include <cstdint>
 #include <lvgl.h>
 #include <driver/i2c_master.h>
+#include <functional>
+#include <string>
 #include <string_view>
+
+enum class NetworkEvent;
 
 namespace hal_bridge {
 
@@ -61,6 +65,7 @@ void board_set_backlight_brightness(uint8_t brightness, bool permanent = false);
 uint8_t board_get_backlight_brightness();
 void board_set_speaker_volume(uint8_t volume, bool permanent = false);
 uint8_t board_get_speaker_volume();
+void board_set_network_wait_callback(std::function<void(NetworkEvent, const std::string&)> callback);
 
 void app_play_sound(const std::string_view& sound);
 

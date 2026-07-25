@@ -131,7 +131,7 @@ void start_ota_update(const char *url, void (*on_progress)(int progress))
     esp_netif_t *netif = get_example_netif_from_desc(bind_interface_name);
     if (netif == NULL) {
         ESP_LOGE(TAG, "Can't find netif from interface description");
-        abort();
+        return;
     }
     struct ifreq ifr;
     esp_netif_get_netif_impl_name(netif, ifr.ifr_name);
@@ -167,7 +167,7 @@ void start_ota_update(const char *url, void (*on_progress)(int progress))
         config.url       = url_buf;
     } else {
         ESP_LOGE(TAG, "Configuration mismatch: wrong firmware upgrade image url");
-        abort();
+        return;
     }
 #endif
 

@@ -5,6 +5,8 @@
  */
 #include "bmi270.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cmath>
@@ -12,14 +14,23 @@
 
 static const char* TAG = "BMI270";
 
-BMI270::BMI270(i2c_master_bus_handle_t i2c_bus_handle, uint8_t addr) : _addr(addr), _initialized(false)
+namespace {
+constexpr int kI2cTimeoutMs = 50;
+}
+
+BMI270::BMI270(i2c_master_bus_handle_t i2c_bus_handle, uint8_t addr)
+    : _i2c_dev(nullptr), _bmi{}, _addr(addr), _initialized(false), _data{}
 {
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = _addr,
         .scl_speed_hz    = 400000,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev));
+    esp_err_t err = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &_i2c_dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register I2C device: %s", esp_err_to_name(err));
+        return;
+    }
 
     _bmi.intf            = BMI2_I2C_INTF;
     _bmi.read            = bmi2_i2c_read;
@@ -40,13 +51,15 @@ BMI270::~BMI270()
 BMI2_INTF_RETURN_TYPE BMI270::bmi2_i2c_read(uint8_t reg_addr, uint8_t* reg_data, uint32_t len, void* intf_ptr)
 {
     i2c_master_dev_handle_t dev = *(i2c_master_dev_handle_t*)intf_ptr;
-    esp_err_t err               = i2c_master_transmit_receive(dev, &reg_addr, 1, reg_data, len, 1000);
+    if (dev == nullptr) return BMI2_E_COM_FAIL;
+    esp_err_t err = i2c_master_transmit_receive(dev, &reg_addr, 1, reg_data, len, kI2cTimeoutMs);
     return (err == ESP_OK) ? BMI2_OK : BMI2_E_COM_FAIL;
 }
 
 BMI2_INTF_RETURN_TYPE BMI270::bmi2_i2c_write(uint8_t reg_addr, const uint8_t* reg_data, uint32_t len, void* intf_ptr)
 {
     i2c_master_dev_handle_t dev = *(i2c_master_dev_handle_t*)intf_ptr;
+    if (dev == nullptr) return BMI2_E_COM_FAIL;
 
     uint8_t* buf = (uint8_t*)malloc(len + 1);
     if (!buf) return BMI2_E_COM_FAIL;
@@ -54,32 +67,37 @@ BMI2_INTF_RETURN_TYPE BMI270::bmi2_i2c_write(uint8_t reg_addr, const uint8_t* re
     buf[0] = reg_addr;
     memcpy(buf + 1, reg_data, len);
 
-    esp_err_t err = i2c_master_transmit(dev, buf, len + 1, 1000);
+    esp_err_t err = i2c_master_transmit(dev, buf, len + 1, kI2cTimeoutMs);
     free(buf);
 
     return (err == ESP_OK) ? BMI2_OK : BMI2_E_COM_FAIL;
 }
 
-#define NOP() asm volatile("nop")
-
 void BMI270::bmi2_delay_us(uint32_t period, void* intf_ptr)
 {
-    uint64_t m = (uint64_t)esp_timer_get_time();
-    if (period) {
-        uint64_t e = (m + period);
-        if (m > e) {  // overflow
-            while ((uint64_t)esp_timer_get_time() > e) {
-                NOP();
-            }
-        }
-        while ((uint64_t)esp_timer_get_time() < e) {
-            NOP();
-        }
+    (void)intf_ptr;
+    if (period == 0) {
+        return;
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    constexpr uint32_t kTickPeriodUs = portTICK_PERIOD_MS * 1000U;
+    if (period >= kTickPeriodUs) {
+        vTaskDelay(static_cast<TickType_t>(period / kTickPeriodUs));
+    }
+
+    int64_t elapsed_us = esp_timer_get_time() - start_us;
+    if (elapsed_us < period) {
+        esp_rom_delay_us(static_cast<uint32_t>(period - elapsed_us));
     }
 }
 
 bool BMI270::begin()
 {
+    if (_i2c_dev == nullptr) {
+        return false;
+    }
+
     int8_t rslt;
 
     // Initialize bmi270

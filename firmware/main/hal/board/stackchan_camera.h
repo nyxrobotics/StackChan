@@ -4,12 +4,15 @@
 #ifndef CONFIG_IDF_TARGET_ESP32
 #include <lvgl.h>
 #include <atomic>
-#include <thread>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "camera.h"
 #include "jpg/image_to_jpeg.h"
@@ -22,6 +25,13 @@ struct JpegChunk {
 
 class StackChanCamera : public Camera {
 private:
+    enum class InitTaskState : uint8_t {
+        kIdle,
+        kRunning,
+        kStopping,
+        kCompleted,
+    };
+
     struct FrameBuffer {
         uint8_t* data         = nullptr;
         size_t len            = 0;
@@ -36,6 +46,13 @@ private:
 #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
     int video_fd_ = -1;
     std::atomic_bool streaming_on_{false};
+    std::atomic_bool shutting_down_{false};
+    bool video_initialized_ = false;
+    bool stream_started_    = false;
+    TaskHandle_t init_task_handle_     = nullptr;
+    SemaphoreHandle_t init_task_done_  = nullptr;
+    InitTaskState init_task_state_     = InitTaskState::kIdle;
+    portMUX_TYPE init_task_state_lock_ = portMUX_INITIALIZER_UNLOCKED;
     struct MmapBuffer {
         void* start   = nullptr;
         size_t length = 0;
@@ -43,7 +60,11 @@ private:
     std::vector<MmapBuffer> mmap_buffers_;
     std::string explain_url_;
     std::string explain_token_;
+    std::mutex encoder_mutex_;
     std::thread encoder_thread_;
+
+    void StopInitTask();
+    void CleanupVideoResources();
 
 public:
     StackChanCamera(const esp_video_init_config_t& config);

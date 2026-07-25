@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal.h"
-#include <algorithm>
+#include <atomic>
 #include <mooncake_log.h>
 #include <esp_wifi.h>
 #include <esp_netif.h>
@@ -22,71 +22,100 @@
 #include <espnow_storage.h>
 #include <espnow_utils.h>
 #include <esp_check.h>
+#include <wifi_manager.h>
 
 static const std::string_view _tag = "HAL-EspNow";
+static std::atomic<bool> _espnow_ready{false};
 
-static EventGroupHandle_t s_wifi_event_group = NULL;
-static const int WIFI_CONNECTED_BIT          = BIT0;
-static const int WIFI_DISCONNECTED_BIT       = BIT1;
-static const int WIFI_FAIL_BIT               = BIT2;
-static const int WIFI_STARTED_BIT            = BIT3;
-
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-    const char* TAG = "WiFi";
-
-    // Wifi started
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_STARTED_BIT);
-    }
-
-    // Disconnected
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
-        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-    }
-
-    // Connected
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void _wifi_init(int channel = 1)
+static bool _wifi_init(int channel = 1)
 {
     mclog::tagInfo(_tag, "wifi init");
-
-    // ESP_ERROR_CHECK(nvs_flash_init());
-    // ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t* sta_netif = esp_netif_create_default_wifi_sta();
-    assert(sta_netif);
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-
-    if (!s_wifi_event_group) {
-        s_wifi_event_group = xEventGroupCreate();
+    if (channel < 1 || channel > 13) {
+        mclog::tagError(_tag, "invalid WiFi channel: {}", channel);
+        return false;
     }
 
-    ESP_ERROR_CHECK(
-        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr, nullptr));
-    ESP_ERROR_CHECK(
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr, nullptr));
+    auto& wifi_manager = WifiManager::GetInstance();
+    if (wifi_manager.IsInitialized() && wifi_manager.IsConfigMode()) {
+        mclog::tagError(_tag, "cannot start ESP-NOW while WiFi configuration mode is active");
+        return false;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        mclog::tagError(_tag, "esp_netif_init failed: {}", esp_err_to_name(ret));
+        return false;
+    }
 
-    channel = std::clamp(channel, 1, 13);
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        mclog::tagError(_tag, "event loop init failed: {}", esp_err_to_name(ret));
+        return false;
+    }
 
-    mclog::tagInfo(_tag, "wifi channel set to {}", channel);
+    esp_netif_t* sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif == nullptr) {
+        sta_netif = esp_netif_create_default_wifi_sta();
+    }
+    if (sta_netif == nullptr) {
+        mclog::tagError(_tag, "failed to create WiFi station interface");
+        return false;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_INIT_STATE) {
+        mclog::tagError(_tag, "WiFi init failed: {}", esp_err_to_name(ret));
+        return false;
+    }
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    ret = esp_wifi_get_mode(&mode);
+    if (ret != ESP_OK) {
+        mclog::tagError(_tag, "failed to read WiFi mode: {}", esp_err_to_name(ret));
+        return false;
+    }
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+        ret = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (ret != ESP_OK) {
+            mclog::tagError(_tag, "WiFi mode setup failed: {}", esp_err_to_name(ret));
+            return false;
+        }
+    }
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        mclog::tagError(_tag, "WiFi start failed: {}", esp_err_to_name(ret));
+        return false;
+    }
+
+    wifi_ap_record_t ap_info = {};
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        if (channel != ap_info.primary) {
+            mclog::tagError(_tag, "ESP-NOW channel {} does not match connected WiFi channel {}", channel,
+                            ap_info.primary);
+            return false;
+        }
+        return true;
+    }
 
     // 建议先开启混杂模式再设信道，确保射频频率被强制锁定
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
+    ret = esp_wifi_set_promiscuous(true);
+    if (ret != ESP_OK) {
+        mclog::tagError(_tag, "failed to enter WiFi channel configuration mode: {}", esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t restore_ret = esp_wifi_set_promiscuous(false);
+    if (ret != ESP_OK || restore_ret != ESP_OK) {
+        mclog::tagError(_tag, "WiFi channel setup failed: set={}, restore={}", esp_err_to_name(ret),
+                        esp_err_to_name(restore_ret));
+        return false;
+    }
+
+    mclog::tagInfo(_tag, "wifi channel set to {}", channel);
+    return true;
 }
 
 static esp_err_t _handle_espnow_received(uint8_t* src_addr, void* data, size_t size, wifi_pkt_rx_ctrl_t* rx_ctrl)
@@ -97,10 +126,13 @@ static esp_err_t _handle_espnow_received(uint8_t* src_addr, void* data, size_t s
     ESP_PARAM_CHECK(data);
     ESP_PARAM_CHECK(size);
     ESP_PARAM_CHECK(rx_ctrl);
+    if (!_espnow_ready.load(std::memory_order_acquire)) {
+        return ESP_OK;
+    }
 
     static uint32_t count = 0;
 
-    ESP_LOGI(TAG, "espnow_recv, <%" PRIu32 "> [" MACSTR "][%d][%d][%u]: %.*s", count++, MAC2STR(src_addr),
+    ESP_LOGD(TAG, "espnow_recv, <%" PRIu32 "> [" MACSTR "][%d][%d][%u]: %.*s", count++, MAC2STR(src_addr),
              rx_ctrl->channel, rx_ctrl->rssi, size, size, "~");
 
     std::vector<uint8_t> received_data((uint8_t*)data, (uint8_t*)data + size);
@@ -109,11 +141,14 @@ static esp_err_t _handle_espnow_received(uint8_t* src_addr, void* data, size_t s
     return ESP_OK;
 }
 
-void Hal::startEspNow(int channel)
+bool Hal::startEspNow(int channel)
 {
     mclog::tagInfo(_tag, "start EspNow on channel {}", channel);
+    _espnow_ready.store(false, std::memory_order_release);
 
-    _wifi_init(channel);
+    if (!_wifi_init(channel)) {
+        return false;
+    }
 
     espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
 
@@ -126,28 +161,50 @@ void Hal::startEspNow(int channel)
     espnow_config.receive_enable.forward = false;  // 关闭转发包接收
     espnow_config.receive_enable.data    = true;   // 必须开启这个，才能接收 Arduino 发来的普通数据包
 
-    espnow_init(&espnow_config);
-    espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, _handle_espnow_received);
+    esp_err_t ret = espnow_init(&espnow_config);
+    if (ret != ESP_OK) {
+        mclog::tagError(_tag, "ESP-NOW init failed: {}", esp_err_to_name(ret));
+        return false;
+    }
+    ret = espnow_set_config_for_data_type(ESPNOW_DATA_TYPE_DATA, true, _handle_espnow_received);
+    if (ret != ESP_OK) {
+        mclog::tagError(_tag, "ESP-NOW receive handler setup failed: {}", esp_err_to_name(ret));
+        esp_err_t cleanup_ret = espnow_deinit();
+        if (cleanup_ret != ESP_OK) {
+            mclog::tagWarn(_tag, "ESP-NOW cleanup after setup failure failed: {}", esp_err_to_name(cleanup_ret));
+        }
+        return false;
+    }
 
     mclog::tagInfo(_tag, "factory mac: {}", getFactoryMacString());
+    _espnow_ready.store(true, std::memory_order_release);
+    return true;
 }
 
 bool Hal::espNowSend(const std::vector<uint8_t>& data, const uint8_t* destAddr)
 {
-    mclog::tagInfo(_tag, "send data with size: {}", data.size());
+    if (!_espnow_ready.load(std::memory_order_acquire) || data.empty()) {
+        return false;
+    }
 
     espnow_frame_head_t frame_head = ESPNOW_FRAME_CONFIG_DEFAULT();
     esp_err_t ret                  = ESP_FAIL;
+    constexpr TickType_t kSendTimeout = pdMS_TO_TICKS(100);
 
     if (destAddr == nullptr) {
         ret = espnow_send(ESPNOW_DATA_TYPE_DATA, ESPNOW_ADDR_BROADCAST, data.data(), data.size(), &frame_head,
-                          portMAX_DELAY);
+                          kSendTimeout);
     } else {
-        ret = espnow_send(ESPNOW_DATA_TYPE_DATA, destAddr, data.data(), data.size(), &frame_head, portMAX_DELAY);
+        ret = espnow_send(ESPNOW_DATA_TYPE_DATA, destAddr, data.data(), data.size(), &frame_head, kSendTimeout);
     }
 
     if (ret != ESP_OK) {
-        mclog::tagError(_tag, "send failed: {}", esp_err_to_name(ret));
+        static uint32_t last_error_log_ms = 0;
+        uint32_t now = millis();
+        if (last_error_log_ms == 0 || now - last_error_log_ms >= 1000) {
+            mclog::tagError(_tag, "send failed: {}", esp_err_to_name(ret));
+            last_error_log_ms = now;
+        }
         return false;
     }
     return true;
