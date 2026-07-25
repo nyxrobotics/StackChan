@@ -9,6 +9,17 @@ DICT_PATH="${STACKCHAN_OPENJTALK_DIC:-}"
 SPEED="${STACKCHAN_OPENJTALK_SPEED:-1.05}"
 PITCH_SHIFT="${STACKCHAN_OPENJTALK_PITCH_SHIFT:-0}"
 ALPHA="${STACKCHAN_OPENJTALK_ALPHA:-0.55}"
+TMP_FILES=()
+
+cleanup_tmp_files() {
+    if [ "${#TMP_FILES[@]}" -gt 0 ]; then
+        rm -f -- "${TMP_FILES[@]}"
+    fi
+}
+
+trap cleanup_tmp_files EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 usage() {
     echo "Usage: $0 --check | --text TEXT"
@@ -90,10 +101,11 @@ speak_text() {
     stop_previous
     mkdir -p "$TMP_ROOT"
 
-    local stamp txt wav
-    stamp="$(date +%s%N)"
-    txt="${TMP_ROOT}/${stamp}.txt"
-    wav="${TMP_ROOT}/${stamp}.wav"
+    local txt wav play_status
+    txt="$(mktemp "${TMP_ROOT}/text.XXXXXX")"
+    TMP_FILES+=("$txt")
+    wav="$(mktemp "${TMP_ROOT}/audio.XXXXXX")"
+    TMP_FILES+=("$wav")
 
     printf '%s\n' "$text" > "$txt"
 
@@ -107,11 +119,18 @@ speak_text() {
         -a "$ALPHA" \
         "$txt"
 
-    if ! aplay -q -D "$AUDIO_DEVICE" "$wav"; then
+    set +e
+    aplay -q -D "$AUDIO_DEVICE" "$wav"
+    play_status=$?
+    set -e
+
+    if [ "$play_status" -ge 128 ]; then
+        return "$play_status"
+    fi
+    if [ "$play_status" -ne 0 ]; then
         aplay -q "$wav"
     fi
 
-    rm -f "$txt" "$wav"
     echo "STACKCHAN_OPENJTALK_DONE"
 }
 
