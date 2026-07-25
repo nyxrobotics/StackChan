@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 static const char* TAG = "ModLLMClient";
+static constexpr size_t kMaxStackflowFrameBytes = 16 * 1024;
 
 // ---------------------------------------------------------------------------
 // UART helpers
@@ -225,21 +226,58 @@ bool ModuleLLMClient::checkOpenJTalkTts()
 std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
 {
     std::string result;
-    TickType_t  deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeoutMs);
+    if (timeoutMs <= 0) return result;
+
+    const TickType_t startTick = xTaskGetTickCount();
+    TickType_t timeoutTicks = pdMS_TO_TICKS(timeoutMs);
+    if (timeoutTicks == 0) timeoutTicks = 1;
+
+    TickType_t readWaitTicks = pdMS_TO_TICKS(10);
+    if (readWaitTicks == 0) readWaitTicks = 1;
+
     int depth = 0;
     bool started = false;
     bool inString = false;
     bool escape = false;
 
     while (true) {
-        if (!started && xTaskGetTickCount() >= deadline) break;
+        // Unsigned subtraction keeps this comparison safe across tick wrap.
+        const TickType_t elapsed = xTaskGetTickCount() - startTick;
+        if (elapsed >= timeoutTicks) break;
+
+        const TickType_t remaining = timeoutTicks - elapsed;
+        const TickType_t waitTicks =
+            remaining < readWaitTicks ? remaining : readWaitTicks;
 
         uint8_t ch;
         int n = uart_read_bytes(static_cast<uart_port_t>(kUartNum),
-                                &ch, 1, pdMS_TO_TICKS(10));
+                                &ch, 1, waitTicks);
         if (n <= 0) continue;
 
+        // Ignore boot logs and other UART noise before the JSON object.
+        if (!started) {
+            if (ch != '{') continue;
+
+            started = true;
+            depth = 1;
+            inString = false;
+            escape = false;
+            result.clear();
+            result += '{';
+            continue;
+        }
+
         result += static_cast<char>(ch);
+        if (result.size() > kMaxStackflowFrameBytes) {
+            ESP_LOGW(TAG, "discarding oversized StackFlow frame (> %u bytes)",
+                     static_cast<unsigned>(kMaxStackflowFrameBytes));
+            result.clear();
+            depth = 0;
+            started = false;
+            inString = false;
+            escape = false;
+            continue;
+        }
 
         // 文字列リテラル内のエスケープ処理
         if (escape) { escape = false; continue; }
@@ -247,13 +285,18 @@ std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
         if (ch == '"') { inString = !inString; }
         if (inString) continue;
 
-        if (ch == '{') { depth++; started = true; }
+        if (ch == '{') { depth++; }
         else if (ch == '}') {
             depth--;
-            if (started && depth == 0) break;  // JSON オブジェクト完了
+            if (depth == 0) return result;  // JSON オブジェクト完了
         }
     }
-    return result;
+
+    if (started) {
+        ESP_LOGW(TAG, "discarding incomplete StackFlow frame after %d ms",
+                 timeoutMs);
+    }
+    return {};
 }
 
 // Send a StackFlow command and return the work_id from the response.
