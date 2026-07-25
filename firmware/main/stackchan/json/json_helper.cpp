@@ -127,12 +127,12 @@ void update_from_json(Motion* motion, const char* jsonContent)
         return;
     }
 
-    if (doc["yawServo"].is<ArduinoJson::JsonObject>()) {
+    if (motion->hasYaw() && doc["yawServo"].is<ArduinoJson::JsonObject>()) {
         ArduinoJson::JsonObject yawServoObj = doc["yawServo"];
         update_servo(motion->yawServo(), yawServoObj);
     }
 
-    if (doc["pitchServo"].is<ArduinoJson::JsonObject>()) {
+    if (motion->hasPitch() && doc["pitchServo"].is<ArduinoJson::JsonObject>()) {
         ArduinoJson::JsonObject pitchServoObj = doc["pitchServo"];
         update_servo(motion->pitchServo(), pitchServoObj);
     }

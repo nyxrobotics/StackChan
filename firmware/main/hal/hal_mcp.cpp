@@ -31,8 +31,8 @@ void Hal::xiaozhi_mcp_init()
                            LvglLockGuard lock;  // StackChan motion update is under the lvgl lock
 
                            auto& motion      = GetStackChan().motion();
-                           int current_yaw   = motion.yawServo().getCurrentAngle() / 10;
-                           int current_pitch = motion.pitchServo().getCurrentAngle() / 10;
+                           int current_yaw   = motion.getCurrentYawAngle() / 10;
+                           int current_pitch = motion.getCurrentPitchAngle() / 10;
 
                            auto result = fmt::format(R"({{"yaw": {}, "pitch": {}}})", current_yaw, current_pitch);
                            mclog::tagInfo(_tag, "get_head_angles: {}", result);
@@ -60,10 +60,10 @@ void Hal::xiaozhi_mcp_init()
 
                            auto& motion = GetStackChan().motion();
                            if (pitch != -9999) {
-                               motion.pitchServo().moveWithSpeed(pitch * 10, speed);
+                               motion.movePitchWithSpeed(pitch * 10, speed);
                            }
                            if (yaw != -9999) {
-                               motion.yawServo().moveWithSpeed(yaw * 10, speed);
+                               motion.moveYawWithSpeed(yaw * 10, speed);
                            }
 
                            return true;

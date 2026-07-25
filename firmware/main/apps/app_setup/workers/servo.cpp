@@ -128,8 +128,12 @@ public:
             mclog::tagInfo(_tag, "set current angle as zero");
 
             auto& motion = GetStackChan().motion();
-            motion.yawServo().setCurrentAngleAsZero();
-            motion.pitchServo().setCurrentAngleAsZero();
+            if (motion.hasYaw()) {
+                motion.yawServo().setCurrentAngleAsZero();
+            }
+            if (motion.hasPitch()) {
+                motion.pitchServo().setCurrentAngleAsZero();
+            }
 
             view::pop_a_toast("Home position set", view::ToastType::Success);
         }
@@ -150,8 +154,12 @@ public:
             mclog::tagInfo(_tag, "home reset");
 
             auto& motion = GetStackChan().motion();
-            motion.yawServo().resetZeroCalibration();
-            motion.pitchServo().resetZeroCalibration();
+            if (motion.hasYaw()) {
+                motion.yawServo().resetZeroCalibration();
+            }
+            if (motion.hasPitch()) {
+                motion.pitchServo().resetZeroCalibration();
+            }
 
             view::pop_a_toast("Home position reset", view::ToastType::Success);
         }

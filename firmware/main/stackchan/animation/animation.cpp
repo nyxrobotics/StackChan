@@ -25,9 +25,8 @@ void Keyframe::apply()
     apply_feature(rightEye, avatar.rightEye());
     apply_feature(mouth, avatar.mouth());
 
-    auto apply_servo = [&](const ServoKeyframe& kf, motion::Servo& servo) { servo.moveWithSpeed(kf.angle, kf.speed); };
-    apply_servo(yawServo, motion.yawServo());
-    apply_servo(pitchServo, motion.pitchServo());
+    motion.moveYawWithSpeed(yawServo.angle, yawServo.speed);
+    motion.movePitchWithSpeed(pitchServo.angle, pitchServo.speed);
 
     stackchan.leftNeonLight().setColor(leftRgbColor);
     stackchan.rightNeonLight().setColor(rightRgbColor);

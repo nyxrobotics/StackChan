@@ -365,7 +365,7 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
 
         // Return to default pose
         auto& motion = GetStackChan().motion();
-        motion.pitchServo().moveWithSpeed(0, 80);
+        motion.movePitchWithSpeed(0, 80);
 
     } else if (strcmp(emotion, "doubtful") == 0) {
         avatar.setEmotion(Emotion::Doubt);
@@ -567,8 +567,8 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
 
         // if (!is_listening) {
         //     // Return to default pose
-        //     motion.pitchServo().moveWithSpeed(200, 350);
-        //     motion.yawServo().moveWithSpeed(0, 350);
+        //     motion.movePitchWithSpeed(200, 350);
+        //     motion.moveYawWithSpeed(0, 350);
         // }
 
         _is_xiaozhi_idle = false;
