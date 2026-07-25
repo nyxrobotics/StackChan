@@ -3,6 +3,7 @@ SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 SPDX-License-Identifier: MIT
 */
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -35,6 +36,8 @@ class _StackChanArViewState extends State<StackChanArView> {
   late MethodChannel methodChannel;
   late EventChannel expressionChannel;
   late EventChannel frameChannel;
+  StreamSubscription<dynamic>? _expressionSubscription;
+  StreamSubscription<dynamic>? _frameSubscription;
 
   void initializeChannels(int id) {
     String methodName = "${methodChannelName}_${id.toString()}";
@@ -44,31 +47,31 @@ class _StackChanArViewState extends State<StackChanArView> {
   }
 
   void registerExpressionCallback() {
-    if (widget.onCallback != null) {
-      expressionChannel.receiveBroadcastStream().listen((event) {
-        final danceData = DanceData.fromJson(jsonDecode(event));
-        widget.onCallback!(danceData);
-      });
-    }
+    _expressionSubscription ??=
+        expressionChannel.receiveBroadcastStream().listen((event) {
+          if (!mounted) return;
+          final callback = widget.onCallback;
+          if (callback == null) return;
+
+          final danceData = DanceData.fromJson(jsonDecode(event));
+          callback(danceData);
+        });
   }
 
   void registerFrameCallback() {
-    if (widget.onFrameCallback != null) {
-      frameChannel.receiveBroadcastStream().listen((event) {
-        if (event is Uint8List) {
-          widget.onFrameCallback!(event);
-        }
-      });
-    }
+    _frameSubscription ??=
+        frameChannel.receiveBroadcastStream().listen((event) {
+          if (!mounted) return;
+          final callback = widget.onFrameCallback;
+          if (callback == null || event is! Uint8List) return;
+
+          callback(event);
+        });
   }
 
   @override
   void didUpdateWidget(covariant StackChanArView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.onCallback != widget.onCallback ||
-        oldWidget.onFrameCallback != widget.onFrameCallback) {
-      registerCallbacks();
-    }
     if (oldWidget.decorate != widget.decorate) {
       setDecorate();
     }
@@ -84,12 +87,26 @@ class _StackChanArViewState extends State<StackChanArView> {
 
   @override
   void dispose() {
-    disposeNative();
+    unawaited(disposeNative());
     super.dispose();
   }
 
   Future<void> disposeNative() async {
-    if (viewId == null) return;
+    final expressionSubscription = _expressionSubscription;
+    final frameSubscription = _frameSubscription;
+    final currentViewId = viewId;
+    _expressionSubscription = null;
+    _frameSubscription = null;
+    viewId = null;
+
+    try {
+      await expressionSubscription?.cancel();
+    } catch (_) {}
+    try {
+      await frameSubscription?.cancel();
+    } catch (_) {}
+
+    if (currentViewId == null) return;
     try {
       await methodChannel.invokeMethod("dispose");
       methodChannel.setMethodCallHandler(null);
