@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <string_view>
 
 static const char* TAG = "ModLLMBackend";
 
@@ -101,6 +102,7 @@ void ModuleLLMBackend::finishLocalTurn(const char* reason) {
     hal_bridge::notify_local_tts_end();
     pendingTts_.clear();
     inThinkBlock_ = false;
+    thinkTagCarry_.clear();
     currentLlmRequestId_.clear();
     currentTtsRequestId_.clear();
     if (client_) client_->resumeWhisper();
@@ -140,8 +142,8 @@ void ModuleLLMBackend::applyConfig(const CachedAgentConfig& cfg) {
 // ---------------------------------------------------------------------------
 // filterThinkTags
 // <think>...</think> ブロックを chunk から除去する。
-// ブロックが複数チャンクにまたがる場合に備えて inBlock フラグを引き継ぐ。
-// chunk は in-place で書き換えられる。戻り値は新しい inBlock 状態。
+// ブロックやタグ自体が複数チャンクにまたがる場合に備え、状態と末尾を引き継ぐ。
+// chunk は in-place で書き換えられる。
 // ---------------------------------------------------------------------------
 
 static bool isEnglishTtsLang(uint8_t lang)
@@ -351,36 +353,70 @@ static void sanitizeTtsText(std::string& text, uint8_t lang)
 }
 
 
-static bool filterThinkTags(std::string& chunk, bool inBlock)
+static void filterThinkTags(std::string& chunk, bool& inBlock, std::string& carry, bool finish)
 {
+    static constexpr std::string_view kOpenTag  = "<think>";
+    static constexpr std::string_view kCloseTag = "</think>";
+
+    std::string input;
+    input.reserve(carry.size() + chunk.size());
+    input += carry;
+    input += chunk;
+    carry.clear();
+
     std::string result;
     size_t i = 0;
-    while (i < chunk.size()) {
-        if (!inBlock) {
-            size_t open = chunk.find("<think>", i);
-            if (open == std::string::npos) {
-                result += chunk.substr(i);
-                break;
+    while (i < input.size()) {
+        const std::string_view tag = inBlock ? kCloseTag : kOpenTag;
+        const size_t found = input.find(tag, i);
+        if (found != std::string::npos) {
+            if (!inBlock) {
+                result.append(input, i, found - i);
             }
-            result += chunk.substr(i, open - i);
-            i = open + 7;  // skip "<think>"
-            inBlock = true;
-        } else {
-            size_t close = chunk.find("</think>", i);
-            if (close == std::string::npos) {
-                // タグが閉じていない — 次のチャンクまで待つ
-                break;
+            i = found + tag.size();
+            inBlock = !inBlock;
+
+            if (!inBlock) {
+                while (i < input.size() && (input[i] == '\n' || input[i] == '\r' || input[i] == ' ')) {
+                    ++i;
+                }
             }
-            i = close + 8;  // skip "</think>"
-            inBlock = false;
-            // </think> 直後の改行・空白を読み飛ばす
-            while (i < chunk.size() && (chunk[i] == '\n' || chunk[i] == '\r' || chunk[i] == ' ')) {
-                ++i;
+            continue;
+        }
+
+        // Keep only a suffix that may become a complete tag in the next
+        // streamed chunk. Emit normal response text and hide think content.
+        const size_t remaining = input.size() - i;
+        const size_t maxKeep = remaining < tag.size() - 1 ? remaining : tag.size() - 1;
+        size_t keep = 0;
+        for (size_t candidate = maxKeep; candidate > 0; --candidate) {
+            if (input.compare(input.size() - candidate, candidate, tag.data(), candidate) == 0) {
+                keep = candidate;
+                break;
             }
         }
+
+        const size_t contentEnd = input.size() - keep;
+        if (!inBlock && contentEnd > i) {
+            result.append(input, i, contentEnd - i);
+        }
+        if (keep > 0) {
+            carry.assign(input, contentEnd, keep);
+        }
+        break;
     }
-    chunk = result;
-    return inBlock;
+
+    if (finish) {
+        // A partial opening tag is ordinary text. A partial closing tag still
+        // belongs to hidden think content.
+        if (!inBlock) {
+            result += carry;
+        }
+        carry.clear();
+        inBlock = false;
+    }
+
+    chunk = std::move(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +430,8 @@ void ModuleLLMBackend::pollLoop() {
 
     int64_t ttsDispatchedMs = 0;  // TTS 送信時刻
     int64_t ttsTimeoutMs = 10000; // 文字数に応じて動的に設定
+    int64_t llmLastProgressMs = 0;
+    static constexpr int64_t kLlmStallTimeoutMs = 180000;
 
     // 言語別タイムアウト係数
     // BASE: TTS 生成開始までの余裕
@@ -440,9 +478,26 @@ void ModuleLLMBackend::pollLoop() {
             if (micMuted_) {
                 handleAbortRequest();
                 ttsDispatchedMs = 0;
+                llmLastProgressMs = 0;
                 continue;
             }
             ESP_LOGD(TAG, "abort ignored: local turn is not active");
+        }
+
+        // Recover if an inference request never produces a final stream frame.
+        if (micMuted_ && !ttsDispatched_ && !currentLlmRequestId_.empty()) {
+            const int64_t now = esp_timer_get_time() / 1000;
+            if (llmLastProgressMs == 0) {
+                llmLastProgressMs = now;
+            } else if (now - llmLastProgressMs >= kLlmStallTimeoutMs) {
+                client_->pauseLlm();
+                llmPausedForAbort_ = true;
+                finishLocalTurn("llm timeout");
+                llmLastProgressMs = 0;
+                continue;
+            }
+        } else {
+            llmLastProgressMs = 0;
         }
 
         // TTS送信済みかつ micMuted_ 中は タイムアウトで Whisper resume
@@ -475,10 +530,41 @@ void ModuleLLMBackend::pollLoop() {
         cJSON* obj = cJSON_GetObjectItemCaseSensitive(root, "object");
         cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
 
-        // Skip error responses
+        // Recover the active turn immediately when its correlated request
+        // fails instead of waiting forever for a stream finish marker.
         if (cJSON_IsObject(err)) {
             cJSON* code = cJSON_GetObjectItemCaseSensitive(err, "code");
             if (cJSON_IsNumber(code) && code->valueint != 0) {
+                const bool has_request_id = cJSON_IsString(rid);
+                const bool llm_work = cJSON_IsString(wid) && strncmp(wid->valuestring, "llm.", 4) == 0;
+                const bool tts_work = cJSON_IsString(wid) && strncmp(wid->valuestring, "melotts.", 8) == 0;
+                const bool llm_error =
+                    !currentLlmRequestId_.empty() &&
+                    ((has_request_id && currentLlmRequestId_ == rid->valuestring) ||
+                     (!has_request_id && llm_work));
+                const bool openjtalk_error =
+                    !currentTtsRequestId_.empty() &&
+                    has_request_id && currentTtsRequestId_ == rid->valuestring;
+                const bool melotts_error =
+                    micMuted_ && ttsDispatched_ && currentTtsRequestId_.empty() && tts_work &&
+                    (!has_request_id || strcmp(rid->valuestring, "20") == 0);
+
+                if (llm_error || openjtalk_error || melotts_error) {
+                    ESP_LOGE(TAG, "Active local request failed: code=%d request_id=%s work_id=%s",
+                             code->valueint,
+                             has_request_id ? rid->valuestring : "(none)",
+                             cJSON_IsString(wid) ? wid->valuestring : "(none)");
+                    if (llm_error) {
+                        client_->pauseLlm();
+                        llmPausedForAbort_ = true;
+                    } else if (melotts_error) {
+                        client_->pauseTts();
+                        ttsPausedForAbort_ = true;
+                    }
+                    finishLocalTurn(llm_error ? "llm error" : "tts error");
+                    llmLastProgressMs = 0;
+                    ttsDispatchedMs = 0;
+                }
                 cJSON_Delete(root);
                 continue;
             }
@@ -550,6 +636,7 @@ void ModuleLLMBackend::pollLoop() {
                 cJSON_Delete(root);
                 continue;
             }
+            llmLastProgressMs = esp_timer_get_time() / 1000;
 
             cJSON* data_node = cJSON_GetObjectItemCaseSensitive(root, "data");
             if (cJSON_IsObject(data_node)) {
@@ -559,7 +646,7 @@ void ModuleLLMBackend::pollLoop() {
                 bool done = cJSON_IsBool(finish) && cJSON_IsTrue(finish);
 
                 // <think>...</think> フィルタ
-                inThinkBlock_ = filterThinkTags(chunk, inThinkBlock_);
+                filterThinkTags(chunk, inThinkBlock_, thinkTagCarry_, done);
 
                 // 先頭の改行・空白を除去（</think> 直後のゴミ対策）
                 size_t start = chunk.find_first_not_of("\n\r ");
@@ -799,6 +886,7 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     abortRequested_.store(false);
 
     inThinkBlock_ = false;
+    thinkTagCarry_.clear();
     pendingTts_.clear();
     currentTtsRequestId_.clear();
     micMuted_         = true;
