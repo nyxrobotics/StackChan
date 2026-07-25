@@ -8,6 +8,7 @@ package xiaozhi
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"stackChan/internal/model"
 	"stackChan/internal/model/xiaozhi"
@@ -70,65 +71,68 @@ func init() {
 
 // Unified request processing method, auto handle Session expiration
 func doRequest(method string, path string, data interface{}, resp interface{}) error {
-	// Get token
-	tokenString, err := GetToken()
-	if err != nil {
-		return err
-	}
-
-	// Clone client and set Authorization header
-	client := globalClient.Clone()
-	client.SetHeader("Authorization", "Bearer "+tokenString)
-
-	var response *g.Var
-
-	// Send request based on HTTP method
-	switch strings.ToUpper(method) {
-	case "GET":
-		fullUrl := baseUrl + path
-		if params, ok := data.(g.Map); ok && len(params) > 0 {
-			var queryParts []string
-			for k, v := range params {
-				queryParts = append(queryParts, fmt.Sprintf("%s=%v", k, v))
-			}
-			queryStr := strings.Join(queryParts, "&")
-			if strings.Contains(fullUrl, "?") {
-				fullUrl += "&" + queryStr
-			} else {
-				fullUrl += "?" + queryStr
-			}
+	for attempt := 0; attempt < 2; attempt++ {
+		tokenString, err := GetToken()
+		if err != nil {
+			return err
 		}
-		response = client.GetVar(ctx, fullUrl)
-	case "POST":
-		response = client.PostVar(ctx, baseUrl+path, data)
-	case "PUT":
-		response = client.PutVar(ctx, baseUrl+path, data)
-	case "DELETE":
-		response = client.DeleteVar(ctx, baseUrl+path, data)
-	default:
-		return fmt.Errorf("unsupported request method: %s", method)
-	}
 
-	err = response.Scan(resp)
-	if err != nil {
-		return err
-	}
+		client := globalClient.Clone()
+		client.SetHeader("Authorization", "Bearer "+tokenString)
 
-	// Check if response is successful, handle Session expiration
-	json := gjson.New(response.Val())
-	success := json.Get("success").Bool()
-	message := json.Get("message").String()
-	if !success {
-		if message == "Session expired or logged out" {
+		var response *g.Var
+		switch strings.ToUpper(method) {
+		case "GET":
+			fullURL := baseUrl + path
+			if params, ok := data.(g.Map); ok && len(params) > 0 {
+				query := url.Values{}
+				for key, value := range params {
+					query.Set(key, fmt.Sprint(value))
+				}
+				separator := "?"
+				if strings.Contains(fullURL, "?") {
+					separator = "&"
+				}
+				fullURL += separator + query.Encode()
+			}
+			response = client.GetVar(ctx, fullURL)
+		case "POST":
+			response = client.PostVar(ctx, baseUrl+path, data)
+		case "PUT":
+			response = client.PutVar(ctx, baseUrl+path, data)
+		case "DELETE":
+			response = client.DeleteVar(ctx, baseUrl+path, data)
+		default:
+			return fmt.Errorf("unsupported request method: %s", method)
+		}
+
+		if response == nil {
+			return errors.New("xiaozhi request returned no response")
+		}
+		if err = response.Scan(resp); err != nil {
+			return err
+		}
+
+		json := gjson.New(response.Val())
+		if json.Get("success").Bool() {
+			return nil
+		}
+
+		message := json.Get("message").String()
+		if message == "Session expired or logged out" && attempt == 0 {
 			g.Log().Info(ctx, "session expired or logged out, auto refresh token")
 			mu.Lock()
 			token = ""
 			tokenExpire = time.Time{}
 			mu.Unlock()
-			return doRequest(method, path, data, resp)
+			continue
 		}
+		if message == "" {
+			message = "upstream request was unsuccessful"
+		}
+		return fmt.Errorf("xiaozhi request failed: %s", message)
 	}
-	return nil
+	return errors.New("xiaozhi request failed after token refresh")
 }
 
 // GetToken Get Token (thread-safe, 24-hour auto-expiration)
@@ -205,6 +209,9 @@ func GetAgentTemplate(page int, pageSize int) (*xiaozhi.ListData[xiaozhi.AgentTe
 		g.Log().Error(ctx, "Get agent template failed: %v", err)
 		return nil, err
 	}
+	if resp.Data == nil {
+		return nil, errors.New("Get agent template returned no data")
+	}
 
 	g.Log().Info(ctx,
 		"Get agent template success, list length: ", len(resp.Data.List),
@@ -254,6 +261,9 @@ func GetDevices(
 		queryMap["pageSize"] = *pageSize
 	}
 	if macAddress != nil {
+		if newMacAddress == nil {
+			return nil, errors.New("invalid MAC address")
+		}
 		queryMap["mac_address"] = *newMacAddress
 	}
 	if serialNumber != nil {
@@ -275,6 +285,9 @@ func GetDevices(
 	if err != nil {
 		g.Log().Error(ctx, "Get device list failed: %v", err)
 		return nil, err
+	}
+	if resp.Data == nil {
+		return nil, errors.New("Get device list returned no data")
 	}
 
 	g.Log().Info(ctx, "Get device list success, list length:", len(resp.Data.List), " total count:", resp.Pagination.Total)
@@ -308,6 +321,9 @@ func GetAgents(page *int, pageSize *int, keyword *string) (*[]xiaozhi.Agent, err
 	if err != nil {
 		g.Log().Error(ctx, "Get agent list failed: %v", err)
 		return nil, err
+	}
+	if resp.Data == nil {
+		return nil, errors.New("Get agent list returned no data")
 	}
 	g.Log().Info(ctx,
 		"Get agent list success, list length:", len(*resp.Data),
@@ -384,6 +400,9 @@ func refreshToken() (string, error) {
 // @param macAddress Device MAC address
 func UnbindDevice(macAddress *string) (bool, error) {
 	g.Log().Debug(ctx, "unbind device")
+	if formatMac(macAddress) == nil {
+		return false, errors.New("invalid MAC address")
+	}
 
 	// First query device ID
 	devices, err := GetDevices(new(1), new(10), macAddress, nil, nil, nil)

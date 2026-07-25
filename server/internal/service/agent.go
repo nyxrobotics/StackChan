@@ -24,7 +24,7 @@ func RestoreDefaultAgent(mac string) (bool, error) {
 		return false, err
 	}
 
-	if len(*devices) == 0 {
+	if devices == nil || len(*devices) == 0 {
 		log.Printf("[RestoreDefaultAgent] No device found, mac=%s", mac)
 		return false, nil
 	}
@@ -42,7 +42,7 @@ func RestoreDefaultAgent(mac string) (bool, error) {
 		return false, err
 	}
 
-	if len(response.List) == 0 {
+	if response == nil || len(response.List) == 0 {
 		// Fix
 		log.Printf("[RestoreDefaultAgent] Agent template list is empty, agentID=%d, mac=%s", agentID, mac)
 		return false, nil
