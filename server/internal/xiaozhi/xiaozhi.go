@@ -6,8 +6,10 @@ SPDX-License-Identifier: MIT
 package xiaozhi
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"stackChan/internal/model"
@@ -17,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gogf/gf/v2/container/gvar"
 	"github.com/gogf/gf/v2/encoding/gjson"
 	"github.com/gogf/gf/v2/frame/g"
 	"github.com/gogf/gf/v2/net/gclient"
@@ -24,55 +27,52 @@ import (
 )
 
 var (
-	ctx               = gctx.New()
-	token             string       // Memory stored Token
-	tokenExpire       time.Time    // Token expiration time
-	mu                sync.Mutex   // Mutex lock, ensure Token update thread-safe
-	ticker            *time.Ticker // 24-hour timer
-	macSeparatorRegex = regexp.MustCompile(`[^0-9a-fA-F]`)
-	validMacRegex     = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$`)
-	globalClient      *gclient.Client // Global HTTP client
+	ctx                  = gctx.New()
+	token                string
+	tokenExpire          time.Time
+	tokenVersion         uint64
+	tokenMu              sync.Mutex
+	tokenRefreshDone     chan struct{}
+	tokenRefreshErr      error
+	tokenRefreshFailedAt time.Time
+	macSeparatorRegex    = regexp.MustCompile(`[^0-9a-fA-F]`)
+	validMacRegex        = regexp.MustCompile(`^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$`)
+	globalClient         *gclient.Client
+	tokenFetcher         = refreshToken
 )
 
 const (
-	baseUrl            = "https://xiaozhi.me/"
-	tokenPath          = "api/developers/token"
-	agentTemplatesList = "api/developers/agent-templates/list"
-	devices            = "api/developers/devices"
-	deviceUnbind       = "api/developers/unbind-device"
-	agentsDelete       = "api/agents/delete"
-	createAgent        = "api/agents"
-	chats              = "api/chats/list"
-	tokenExpiry        = 24 * time.Hour // Token valid for 24 hours
-	agents             = "api/agents"
+	baseUrl             = "https://xiaozhi.me/"
+	tokenPath           = "api/developers/token"
+	agentTemplatesList  = "api/developers/agent-templates/list"
+	devices             = "api/developers/devices"
+	deviceUnbind        = "api/developers/unbind-device"
+	agentsDelete        = "api/agents/delete"
+	createAgent         = "api/agents"
+	chats               = "api/chats/list"
+	tokenExpiry         = 24 * time.Hour // Token valid for 24 hours
+	refreshFailCooldown = 2 * time.Second
+	maxAgentUpdatePages = 1000
+	responseBodyLimit   = 4 << 20
+	agents              = "api/agents"
 )
 
 func init() {
-	// Initialize global HTTP client
 	globalClient = g.Client()
 	globalClient.SetTimeout(10 * time.Second)
 	globalClient.SetHeader("Content-Type", "application/json")
-
-	// Start 24-hour timer to periodically check and refresh Token
-	ticker = time.NewTicker(tokenExpiry)
-	g.Log().Info(ctx, "xiaozhi token auto refresh ticker started, refresh cycle: 24 hours")
-
-	go func() {
-		for range ticker.C {
-			mu.Lock()
-			// Force clear Token, next GetToken call will auto-refresh
-			token = ""
-			tokenExpire = time.Time{}
-			mu.Unlock()
-			g.Log().Info(ctx, "token expired, auto refresh")
-		}
-	}()
 }
 
 // Unified request processing method, auto handle Session expiration
 func doRequest(method string, path string, data interface{}, resp interface{}) error {
+	return doRequestContext(ctx, method, path, data, resp)
+}
+
+func doRequestContext(requestCtx context.Context, method string, path string, data interface{}, resp interface{}) error {
+	requestCtx = normalizeContext(requestCtx)
+
 	for attempt := 0; attempt < 2; attempt++ {
-		tokenString, err := GetToken()
+		tokenString, version, err := getToken(requestCtx, false)
 		if err != nil {
 			return err
 		}
@@ -80,34 +80,30 @@ func doRequest(method string, path string, data interface{}, resp interface{}) e
 		client := globalClient.Clone()
 		client.SetHeader("Authorization", "Bearer "+tokenString)
 
-		var response *g.Var
+		requestURL := baseUrl + path
 		switch strings.ToUpper(method) {
 		case "GET":
-			fullURL := baseUrl + path
 			if params, ok := data.(g.Map); ok && len(params) > 0 {
 				query := url.Values{}
 				for key, value := range params {
 					query.Set(key, fmt.Sprint(value))
 				}
 				separator := "?"
-				if strings.Contains(fullURL, "?") {
+				if strings.Contains(requestURL, "?") {
 					separator = "&"
 				}
-				fullURL += separator + query.Encode()
+				requestURL += separator + query.Encode()
 			}
-			response = client.GetVar(ctx, fullURL)
 		case "POST":
-			response = client.PostVar(ctx, baseUrl+path, data)
 		case "PUT":
-			response = client.PutVar(ctx, baseUrl+path, data)
 		case "DELETE":
-			response = client.DeleteVar(ctx, baseUrl+path, data)
 		default:
 			return fmt.Errorf("unsupported request method: %s", method)
 		}
 
-		if response == nil {
-			return errors.New("xiaozhi request returned no response")
+		response, err := requestVarContext(requestCtx, client, method, requestURL, data)
+		if err != nil {
+			return err
 		}
 		if err = response.Scan(resp); err != nil {
 			return err
@@ -120,11 +116,8 @@ func doRequest(method string, path string, data interface{}, resp interface{}) e
 
 		message := json.Get("message").String()
 		if message == "Session expired or logged out" && attempt == 0 {
-			g.Log().Info(ctx, "session expired or logged out, auto refresh token")
-			mu.Lock()
-			token = ""
-			tokenExpire = time.Time{}
-			mu.Unlock()
+			g.Log().Info(requestCtx, "session expired or logged out, auto refresh token")
+			invalidateTokenIfCurrent(tokenString, version)
 			continue
 		}
 		if message == "" {
@@ -135,39 +128,177 @@ func doRequest(method string, path string, data interface{}, resp interface{}) e
 	return errors.New("xiaozhi request failed after token refresh")
 }
 
+func requestVarContext(
+	requestCtx context.Context,
+	client *gclient.Client,
+	method string,
+	requestURL string,
+	data interface{},
+) (*gvar.Var, error) {
+	if client == nil {
+		return nil, errors.New("xiaozhi HTTP client is unavailable")
+	}
+	method = strings.ToUpper(method)
+
+	var (
+		response *gclient.Response
+		err      error
+	)
+	if method == "GET" {
+		response, err = client.DoRequest(requestCtx, method, requestURL)
+	} else {
+		response, err = client.DoRequest(requestCtx, method, requestURL, data)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xiaozhi request failed: %w", err)
+	}
+	if response == nil || response.Response == nil || response.Body == nil {
+		return nil, errors.New("xiaozhi request returned no response")
+	}
+	defer response.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, responseBodyLimit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read xiaozhi response: %w", err)
+	}
+	if len(body) > responseBodyLimit {
+		return nil, fmt.Errorf("xiaozhi response exceeds %d bytes", responseBodyLimit)
+	}
+	return gvar.New(body), nil
+}
+
 // GetToken Get Token (thread-safe, 24-hour auto-expiration)
 func GetToken() (string, error) {
-	mu.Lock()
-	defer mu.Unlock()
+	return GetTokenContext(ctx)
+}
 
-	// 1. Check if Token exists and not expired
-	if token != "" && time.Now().Before(tokenExpire) {
-		g.Log().Debug(ctx, "token expired at: %s", tokenExpire.Format("2006-01-02 15:04:05"))
-		return token, nil
-	}
-
-	g.Log().Info(ctx, "token expired or not exist, auto refresh")
-	// 2. Token does not exist/expired, refresh to get
-	newToken, err := refreshToken()
-	if err != nil {
-		g.Log().Error(ctx, "refresh token failed: %v", err)
-		return "", err
-	}
-
-	// 3. Update Token and expiration time
-	token = newToken
-	tokenExpire = time.Now().Add(tokenExpiry) // Record expiration time (current time + 24 hours)
-	g.Log().Info(ctx, "refresh token success, expire at: %s", tokenExpire.Format("2006-01-02 15:04:05"))
-
-	return token, nil
+func GetTokenContext(requestCtx context.Context) (string, error) {
+	tokenString, _, err := getToken(requestCtx, false)
+	return tokenString, err
 }
 
 func GetNewToken() (string, error) {
-	mu.Lock()
+	return GetNewTokenContext(ctx)
+}
+
+func GetNewTokenContext(requestCtx context.Context) (string, error) {
+	tokenString, _, err := getToken(requestCtx, true)
+	return tokenString, err
+}
+
+func getToken(requestCtx context.Context, forceRefresh bool) (string, uint64, error) {
+	requestCtx = normalizeContext(requestCtx)
+	forcePending := forceRefresh
+
+	for {
+		if err := requestCtx.Err(); err != nil {
+			return "", 0, err
+		}
+
+		tokenMu.Lock()
+		if forcePending {
+			if tokenRefreshDone != nil {
+				done := tokenRefreshDone
+				tokenMu.Unlock()
+				select {
+				case <-requestCtx.Done():
+					return "", 0, requestCtx.Err()
+				case <-done:
+					forcePending = false
+					continue
+				}
+			}
+			invalidateTokenLocked()
+			tokenRefreshErr = nil
+			tokenRefreshFailedAt = time.Time{}
+			forcePending = false
+		}
+
+		if token != "" && time.Now().Before(tokenExpire) {
+			tokenString := token
+			version := tokenVersion
+			tokenMu.Unlock()
+			return tokenString, version, nil
+		}
+
+		if tokenRefreshDone != nil {
+			done := tokenRefreshDone
+			tokenMu.Unlock()
+			select {
+			case <-requestCtx.Done():
+				return "", 0, requestCtx.Err()
+			case <-done:
+				continue
+			}
+		}
+
+		if tokenRefreshErr != nil && time.Since(tokenRefreshFailedAt) < refreshFailCooldown {
+			err := tokenRefreshErr
+			tokenMu.Unlock()
+			return "", 0, err
+		}
+
+		done := make(chan struct{})
+		tokenRefreshDone = done
+		tokenMu.Unlock()
+
+		newToken, err := fetchTokenSafely(requestCtx)
+		now := time.Now()
+
+		tokenMu.Lock()
+		if err == nil {
+			token = newToken
+			tokenExpire = now.Add(tokenExpiry)
+			tokenVersion++
+			tokenRefreshErr = nil
+			tokenRefreshFailedAt = time.Time{}
+		} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			tokenRefreshErr = err
+			tokenRefreshFailedAt = now
+		}
+		version := tokenVersion
+		tokenRefreshDone = nil
+		close(done)
+		tokenMu.Unlock()
+
+		if err != nil {
+			g.Log().Error(requestCtx, "refresh token failed: %v", err)
+			return "", 0, err
+		}
+		g.Log().Info(requestCtx, "refresh token success, expire at: %s", now.Add(tokenExpiry).Format("2006-01-02 15:04:05"))
+		return newToken, version, nil
+	}
+}
+
+func fetchTokenSafely(requestCtx context.Context) (newToken string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("refresh token panic: %v", recovered)
+		}
+	}()
+	return tokenFetcher(requestCtx)
+}
+
+func invalidateTokenIfCurrent(tokenString string, version uint64) {
+	tokenMu.Lock()
+	defer tokenMu.Unlock()
+
+	if token == tokenString && tokenVersion == version {
+		invalidateTokenLocked()
+	}
+}
+
+func invalidateTokenLocked() {
 	token = ""
 	tokenExpire = time.Time{}
-	mu.Unlock()
-	return GetToken()
+	tokenVersion++
+}
+
+func normalizeContext(requestCtx context.Context) context.Context {
+	if requestCtx == nil {
+		return context.Background()
+	}
+	return requestCtx
 }
 
 // DeleteAgent Delete agent
@@ -192,28 +323,36 @@ func CreateAgent(params g.Map) (*int, error) {
 		g.Log().Error(ctx, "create agent failed: %v", err)
 		return nil, err
 	}
+	if resp.Data == nil {
+		return nil, errors.New("create agent returned no data")
+	}
 	return &resp.Data.Id, nil
 }
 
 // GetAgentTemplate Get agent template
 func GetAgentTemplate(page int, pageSize int) (*xiaozhi.ListData[xiaozhi.AgentTemplate], error) {
-	g.Log().Debug(ctx, "Get agent template, page: ", page, " pageSize: ", pageSize)
+	return GetAgentTemplateContext(ctx, page, pageSize)
+}
+
+func GetAgentTemplateContext(requestCtx context.Context, page int, pageSize int) (*xiaozhi.ListData[xiaozhi.AgentTemplate], error) {
+	requestCtx = normalizeContext(requestCtx)
+	g.Log().Debug(requestCtx, "Get agent template, page: ", page, " pageSize: ", pageSize)
 	queryMap := g.Map{
 		"page":     page,
 		"pageSize": pageSize,
 	}
 
 	var resp xiaozhi.XiaoZhiResponse[xiaozhi.ListData[xiaozhi.AgentTemplate]]
-	err := doRequest("GET", agentTemplatesList, queryMap, &resp)
+	err := doRequestContext(requestCtx, "GET", agentTemplatesList, queryMap, &resp)
 	if err != nil {
-		g.Log().Error(ctx, "Get agent template failed: %v", err)
+		g.Log().Error(requestCtx, "Get agent template failed: %v", err)
 		return nil, err
 	}
 	if resp.Data == nil {
 		return nil, errors.New("Get agent template returned no data")
 	}
 
-	g.Log().Info(ctx,
+	g.Log().Info(requestCtx,
 		"Get agent template success, list length: ", len(resp.Data.List),
 		" total count: ", resp.Pagination.Total,
 	)
@@ -223,19 +362,24 @@ func GetAgentTemplate(page int, pageSize int) (*xiaozhi.ListData[xiaozhi.AgentTe
 
 // SetAgentSetting Update agent settings
 func SetAgentSetting(agentId int, parameters xiaozhi.AgentConfig) (bool, error) {
+	return SetAgentSettingContext(ctx, agentId, parameters)
+}
+
+func SetAgentSettingContext(requestCtx context.Context, agentId int, parameters xiaozhi.AgentConfig) (bool, error) {
+	requestCtx = normalizeContext(requestCtx)
 	path := "api/agents/" + strconv.Itoa(agentId) + "/config"
 	url := baseUrl + path
-	g.Log().Info(ctx, "Update agent setting, agentId:", agentId, "url: ", url)
-	g.Log().Info(ctx, "Request body parameters: ", gjson.MustEncodeString(parameters))
+	g.Log().Info(requestCtx, "Update agent setting, agentId:", agentId, "url: ", url)
+	g.Log().Info(requestCtx, "Request body parameters: ", gjson.MustEncodeString(parameters))
 
 	var resp xiaozhi.XiaoZhiResponse[model.Empty]
-	err := doRequest("POST", path, parameters, &resp)
+	err := doRequestContext(requestCtx, "POST", path, parameters, &resp)
 	if err != nil {
-		g.Log().Error(ctx, "Update agent setting failed: %v", err)
+		g.Log().Error(requestCtx, "Update agent setting failed: %v", err)
 		return false, err
 	}
 
-	g.Log().Info(ctx, "Update agent setting success, agentId:", agentId)
+	g.Log().Info(requestCtx, "Update agent setting success, agentId:", agentId)
 	return true, nil
 }
 
@@ -248,7 +392,19 @@ func GetDevices(
 	productID *int,
 	DeviceID *int,
 ) (*[]xiaozhi.Device, error) {
+	return GetDevicesContext(ctx, page, pageSize, macAddress, serialNumber, productID, DeviceID)
+}
 
+func GetDevicesContext(
+	requestCtx context.Context,
+	page *int,
+	pageSize *int,
+	macAddress *string,
+	serialNumber *string,
+	productID *int,
+	DeviceID *int,
+) (*[]xiaozhi.Device, error) {
+	requestCtx = normalizeContext(requestCtx)
 	newMacAddress := formatMac(macAddress)
 
 	// Added: Request parameter logging
@@ -276,24 +432,24 @@ func GetDevices(
 		queryMap["device_id"] = *DeviceID
 	}
 
-	g.Log().Debug(ctx,
+	g.Log().Debug(requestCtx,
 		"Get device list, data:", queryMap,
 	)
 
 	var resp xiaozhi.XiaoZhiResponse[xiaozhi.ListData[xiaozhi.Device]]
-	err := doRequest("GET", devices, queryMap, &resp)
+	err := doRequestContext(requestCtx, "GET", devices, queryMap, &resp)
 	if err != nil {
-		g.Log().Error(ctx, "Get device list failed: %v", err)
+		g.Log().Error(requestCtx, "Get device list failed: %v", err)
 		return nil, err
 	}
 	if resp.Data == nil {
 		return nil, errors.New("Get device list returned no data")
 	}
 
-	g.Log().Info(ctx, "Get device list success, list length:", len(resp.Data.List), " total count:", resp.Pagination.Total)
+	g.Log().Info(requestCtx, "Get device list success, list length:", len(resp.Data.List), " total count:", resp.Pagination.Total)
 
 	if len(resp.Data.List) > 0 {
-		g.Log().Info(ctx, "Get device list success, first device:", resp.Data.List[0])
+		g.Log().Info(requestCtx, "Get device list success, first device:", resp.Data.List[0])
 	}
 
 	return &resp.Data.List, nil
@@ -357,62 +513,74 @@ type ZhiGetToken struct {
 	Token string `json:"token"`
 }
 
-// refreshToken Refresh Token from server (core logic)
-func refreshToken() (string, error) {
-	secretKey := g.Cfg().MustGet(ctx, "xiaozhi.secret_key").String()
+// refreshToken refreshes the token without holding tokenMu. Callers coordinate
+// concurrent refreshes through getToken.
+func refreshToken(requestCtx context.Context) (string, error) {
+	requestCtx = normalizeContext(requestCtx)
+	secretKey := g.Cfg().MustGet(requestCtx, "xiaozhi.secret_key").String()
 	if secretKey == "" {
-		g.Log().Error(ctx, "xiaozhi.secret_key is empty, please check config file")
+		g.Log().Error(requestCtx, "xiaozhi.secret_key is empty, please check config file")
 		return "", errors.New("xiaozhi.secret_key is empty")
 	}
 
-	g.Log().Debug(ctx, "refresh token")
+	g.Log().Debug(requestCtx, "refresh token")
 	requestData := g.Map{
 		"secret_key": secretKey,
 	}
 
-	client := g.Client()
-	client.SetTimeout(10 * time.Second)
-	client.SetHeader("Content-Type", "application/json")
+	client := globalClient.Clone()
 
 	var resp xiaozhi.XiaoZhiResponse[ZhiGetToken]
-	err := client.PostVar(ctx, baseUrl+tokenPath, requestData).Scan(&resp)
+	response, err := requestVarContext(requestCtx, client, "POST", baseUrl+tokenPath, requestData)
 	if err != nil {
-		g.Log().Error(ctx, "refresh token failed: %v", err)
+		return "", fmt.Errorf("refresh token request failed: %w", err)
+	}
+	err = response.Scan(&resp)
+	if err != nil {
+		g.Log().Error(requestCtx, "refresh token failed: %v", err)
 		return "", fmt.Errorf("refresh token failed: %w", err)
 	}
 
 	if !resp.Success {
-		g.Log().Error(ctx, "refresh token failed: %s", resp.Message)
+		g.Log().Error(requestCtx, "refresh token failed: %s", resp.Message)
 		return "", fmt.Errorf("refresh token failed: %s", resp.Message)
 	}
 
-	// Generic structure direct value, no need for map assertion!!!
+	if resp.Data == nil {
+		g.Log().Error(requestCtx, "refresh token failed: response data is empty")
+		return "", errors.New("refresh token response data is empty")
+	}
 	if resp.Data.Token == "" {
-		g.Log().Error(ctx, "refresh token failed: token is empty")
+		g.Log().Error(requestCtx, "refresh token failed: token is empty")
 		return "", fmt.Errorf("token is empty")
 	}
 
-	g.Log().Debug(ctx, "refresh token success")
+	g.Log().Debug(requestCtx, "refresh token success")
 	return resp.Data.Token, nil
 }
 
 // UnbindDevice Unbind device from XiaoZhi side
 // @param macAddress Device MAC address
 func UnbindDevice(macAddress *string) (bool, error) {
-	g.Log().Debug(ctx, "unbind device")
+	return UnbindDeviceContext(ctx, macAddress)
+}
+
+func UnbindDeviceContext(requestCtx context.Context, macAddress *string) (bool, error) {
+	requestCtx = normalizeContext(requestCtx)
+	g.Log().Debug(requestCtx, "unbind device")
 	if formatMac(macAddress) == nil {
 		return false, errors.New("invalid MAC address")
 	}
 
 	// First query device ID
-	devices, err := GetDevices(new(1), new(10), macAddress, nil, nil, nil)
+	devices, err := GetDevicesContext(requestCtx, new(1), new(10), macAddress, nil, nil, nil)
 	if err != nil {
-		g.Log().Error(ctx, err.Error())
+		g.Log().Error(requestCtx, err.Error())
 		return false, err
 	}
 
 	if len(*devices) == 0 {
-		g.Log().Error(ctx, "unbind device failed: device not found, mac=%s", *macAddress)
+		g.Log().Error(requestCtx, "unbind device failed: device not found, mac=%s", *macAddress)
 		/// Device not found, return true
 		return true, nil
 	}
@@ -422,25 +590,25 @@ func UnbindDevice(macAddress *string) (bool, error) {
 		"device_id": deviceID,
 	}
 
-	g.Log().Info(ctx, "unbind device, device_id: ", (*devices)[0])
-	g.Log().Info(ctx, "request data: ", gjson.MustEncodeString(requestData))
+	g.Log().Info(requestCtx, "unbind device, device_id: ", (*devices)[0])
+	g.Log().Info(requestCtx, "request data: ", gjson.MustEncodeString(requestData))
 
 	var resp xiaozhi.XiaoZhiResponse[model.Empty]
-	err = doRequest("POST", deviceUnbind, requestData, &resp)
+	err = doRequestContext(requestCtx, "POST", deviceUnbind, requestData, &resp)
 	if err != nil {
-		g.Log().Error(ctx, "unbind device failed: %v", err)
+		g.Log().Error(requestCtx, "unbind device failed: %v", err)
 		return false, err
 	}
 	if !resp.Success {
 		if resp.Message == "device not found" {
-			g.Log().Info(ctx, "unbind device failed: device not found")
+			g.Log().Info(requestCtx, "unbind device failed: device not found")
 			return true, nil
 		}
-		g.Log().Error(ctx, "unbind device failed: %s", resp.Message)
+		g.Log().Error(requestCtx, "unbind device failed: %s", resp.Message)
 		return false, nil
 	}
-	g.Log().Info(ctx, "unbind device success, device_id: ", deviceID)
-	g.Log().Info(ctx, resp.Message)
+	g.Log().Info(requestCtx, "unbind device success, device_id: ", deviceID)
+	g.Log().Info(requestCtx, resp.Message)
 
 	return true, nil
 }
@@ -451,8 +619,9 @@ func UpdateAllDevices() (bool, error) {
 	page := 1
 	pageSize := 100
 
-	// Loop through pages until no more data
-	for {
+	// Loop through pages until no more data. The hard ceiling protects this
+	// maintenance helper from an upstream that repeats the same page forever.
+	for page <= maxAgentUpdatePages {
 		// Get current page device list
 		agents, err := GetAgents(&page, &pageSize, nil)
 		if err != nil {
@@ -462,7 +631,7 @@ func UpdateAllDevices() (bool, error) {
 		// If no data on current page, all pages processed, exit loop
 		if agents == nil || len(*agents) == 0 {
 			g.Log().Info(ctx, "update all devices success")
-			break
+			return true, nil
 		}
 
 		g.Log().Info(ctx, "update all devices, page: ", page, ", total: ", len(*agents))
@@ -505,14 +674,18 @@ func UpdateAllDevices() (bool, error) {
 			}
 
 			g.Log().Info(ctx, "update agent config success, agentId: ", agentId)
-			g.Log().Info(ctx, "update agent config success, agentId: ", agentId)
+		}
+
+		if len(*agents) < pageSize {
+			g.Log().Info(ctx, "update all devices success")
+			return true, nil
 		}
 
 		// Page number +1, continue requesting next page
 		page++
 	}
 
-	return true, nil
+	return false, fmt.Errorf("update all devices exceeded %d pages", maxAgentUpdatePages)
 }
 
 func DeleteChats() {
@@ -530,6 +703,10 @@ func DeleteChats() {
 	}
 
 	if !resp.Success {
+		return
+	}
+	if resp.Data == nil {
+		g.Log().Error(ctx, "delete chats returned no data")
 		return
 	}
 

@@ -37,7 +37,7 @@ func (c *ControllerV2) AgentRestoreDefault(ctx context.Context, req *v2.AgentRes
 		return nil, gerror.NewCode(gcode.CodeNotAuthorized, "device not found or not owned by current user")
 	}
 
-	restoreResponse, err := service.RestoreDefaultAgent(req.Mac)
+	restoreResponse, err := service.RestoreDefaultAgentContext(ctx, req.Mac)
 	if err != nil {
 		return nil, err
 	}

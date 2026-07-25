@@ -13,7 +13,7 @@ import (
 )
 
 func (c *ControllerV1) GetXiaoZhiToken(ctx context.Context, req *v1.GetXiaoZhiTokenReq) (res *v1.GetXiaoZhiTokenRes, err error) {
-	token, err := xiaozhi.GetToken()
+	token, err := xiaozhi.GetTokenContext(ctx)
 	if err != nil {
 		return nil, err
 	}

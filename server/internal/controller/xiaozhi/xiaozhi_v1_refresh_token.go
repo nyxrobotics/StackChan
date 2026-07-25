@@ -13,7 +13,7 @@ import (
 )
 
 func (c *ControllerV1) RefreshToken(ctx context.Context, req *v1.RefreshTokenReq) (res *v1.RefreshTokenRes, err error) {
-	token, err := xiaozhi.GetNewToken()
+	token, err := xiaozhi.GetNewTokenContext(ctx)
 	if err != nil {
 		return nil, err
 	}

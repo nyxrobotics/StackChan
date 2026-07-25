@@ -7,13 +7,20 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
 	v2 "stackChan/api/user/v2"
 	"stackChan/internal/dao"
 	"stackChan/internal/model"
 	"stackChan/internal/model/entity"
-	"strings"
-	"time"
 
+	"github.com/gogf/gf/v2/container/gvar"
 	"github.com/gogf/gf/v2/errors/gcode"
 	"github.com/gogf/gf/v2/errors/gerror"
 	"github.com/gogf/gf/v2/frame/g"
@@ -22,8 +29,77 @@ import (
 )
 
 const (
-	TokenExpire = 365 * 24 * time.Hour
+	TokenExpire                 = 365 * 24 * time.Hour
+	remoteUserRequestTimeout    = 10 * time.Second
+	remoteUserResponseBodyLimit = 1 << 20
 )
+
+var (
+	errRemoteUserResponseTooLarge = errors.New("remote user response exceeds size limit")
+	remoteUserHTTPClient          = newRemoteUserHTTPClient(remoteUserRequestTimeout)
+)
+
+func newRemoteUserHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+type remoteUserHTTPStatusError struct {
+	statusCode int
+	status     string
+}
+
+func (e *remoteUserHTTPStatusError) Error() string {
+	return fmt.Sprintf("remote user service returned unexpected HTTP status %s", e.status)
+}
+
+func postRemoteUserForm(
+	ctx context.Context,
+	client *http.Client,
+	endpoint string,
+	headers http.Header,
+	form url.Values,
+) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create remote user request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Accept", "application/json")
+	for name, values := range headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+
+	response, err := client.Do(request)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, fmt.Errorf("send remote user request: %w", err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, remoteUserResponseBodyLimit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read remote user response: %w", err)
+	}
+	if len(body) > remoteUserResponseBodyLimit {
+		return nil, errRemoteUserResponseTooLarge
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, &remoteUserHTTPStatusError{
+			statusCode: response.StatusCode,
+			status:     response.Status,
+		}
+	}
+	return body, nil
+}
 
 // Login User login
 func Login(ctx context.Context, req *v2.LoginReq) (res *v2.LoginRes, err error) {
@@ -57,24 +133,30 @@ func callRemoteLogin(ctx context.Context, req *v2.LoginReq) (*model.RemoteLoginR
 
 	loginUrl := g.Cfg().MustGet(ctx, "m5stack.loginUrl").String()
 
-	clientResp := g.Client().PostVar(ctx, loginUrl, g.Map{
-		"username": req.Username,
-		"password": req.Password,
-	})
-	if clientResp == nil {
-		g.Log().Errorf(ctx, "Remote login no response, username=%s", req.Username)
-		return nil, gerror.NewCode(gcode.CodeInternalError, "remote service unavailable")
-	}
-	respBody := clientResp.String()
-	g.Log().Debugf(ctx, "Remote login raw response: %s", respBody)
-	if strings.Contains(respBody, "[[error:") {
-		g.Log().Errorf(ctx, "Remote login failed: %s", respBody)
-		return nil, gerror.NewCode(gcode.CodeBusinessValidationFailed, respBody)
-	}
-	err := clientResp.Scan(&remoteLoginResp)
+	respBody, err := postRemoteUserForm(
+		ctx,
+		remoteUserHTTPClient,
+		loginUrl,
+		nil,
+		url.Values{
+			"username": {req.Username},
+			"password": {req.Password},
+		},
+	)
 	if err != nil {
-		g.Log().Errorf(ctx, "Login response parsing failed: %+v, raw response: %s", err, respBody)
-		return nil, gerror.WrapCode(gcode.CodeInternalError, err, respBody)
+		g.Log().Errorf(ctx, "Remote login request failed, username=%s: %+v", req.Username, err)
+		return nil, gerror.WrapCode(gcode.CodeInternalError, err, "remote service unavailable")
+	}
+	respBodyText := string(respBody)
+	g.Log().Debugf(ctx, "Remote login raw response: %s", respBodyText)
+	if strings.Contains(respBodyText, "[[error:") {
+		g.Log().Errorf(ctx, "Remote login failed: %s", respBodyText)
+		return nil, gerror.NewCode(gcode.CodeBusinessValidationFailed, respBodyText)
+	}
+	err = gvar.New(respBody).Scan(&remoteLoginResp)
+	if err != nil {
+		g.Log().Errorf(ctx, "Login response parsing failed: %+v, raw response: %s", err, respBodyText)
+		return nil, gerror.WrapCode(gcode.CodeInternalError, err, respBodyText)
 	}
 	if remoteLoginResp.Status.Code != "ok" {
 		errMsg := remoteLoginResp.Status.Message
@@ -152,30 +234,34 @@ func callRemoteRegister(ctx context.Context, req *v2.RegistrationReq) (res *mode
 	RegistrationToken := g.Cfg().MustGet(ctx, "m5stack.registrationToken").String()
 	RegistrationUrl := g.Cfg().MustGet(ctx, "m5stack.registrationUrl").String()
 
-	clientResp := g.Client().
-		SetHeader("Authorization", RegistrationToken).
-		PostVar(ctx, RegistrationUrl, g.Map{
-			"username": req.UserName,
-			"email":    req.Email,
-			"password": req.Password,
-		})
-
-	if clientResp == nil {
-		return nil, gerror.NewCode(gcode.CodeInternalError, "remote service unavailable")
-	}
-
-	respBody := clientResp.String()
-	g.Log().Debugf(ctx, "Remote registration raw response: %s", respBody)
-
-	if strings.Contains(respBody, "[[error:") {
-		g.Log().Errorf(ctx, "Remote registration failed: %s", respBody)
-		return nil, gerror.NewCode(gcode.CodeBusinessValidationFailed, respBody)
-	}
-
-	err = clientResp.Scan(&resp)
+	respBody, err := postRemoteUserForm(
+		ctx,
+		remoteUserHTTPClient,
+		RegistrationUrl,
+		http.Header{"Authorization": {RegistrationToken}},
+		url.Values{
+			"username": {req.UserName},
+			"email":    {req.Email},
+			"password": {req.Password},
+		},
+	)
 	if err != nil {
-		g.Log().Errorf(ctx, "Registration response parsing failed: %+v, raw response: %s", err, respBody)
-		return nil, gerror.WrapCode(gcode.CodeInternalError, err, respBody)
+		g.Log().Errorf(ctx, "Remote registration request failed, username=%s: %+v", req.UserName, err)
+		return nil, gerror.WrapCode(gcode.CodeInternalError, err, "remote service unavailable")
+	}
+
+	respBodyText := string(respBody)
+	g.Log().Debugf(ctx, "Remote registration raw response: %s", respBodyText)
+
+	if strings.Contains(respBodyText, "[[error:") {
+		g.Log().Errorf(ctx, "Remote registration failed: %s", respBodyText)
+		return nil, gerror.NewCode(gcode.CodeBusinessValidationFailed, respBodyText)
+	}
+
+	err = gvar.New(respBody).Scan(&resp)
+	if err != nil {
+		g.Log().Errorf(ctx, "Registration response parsing failed: %+v, raw response: %s", err, respBodyText)
+		return nil, gerror.WrapCode(gcode.CodeInternalError, err, respBodyText)
 	}
 
 	if resp.Status.Code != "ok" {

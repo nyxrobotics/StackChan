@@ -6,6 +6,7 @@ SPDX-License-Identifier: MIT
 package service
 
 import (
+	"context"
 	"log"
 	xiaozhiModel "stackChan/internal/model/xiaozhi"
 	"stackChan/internal/xiaozhi"
@@ -14,11 +15,15 @@ import (
 
 // RestoreDefaultAgent / Restore to template agent when unbinding
 func RestoreDefaultAgent(mac string) (bool, error) {
+	return RestoreDefaultAgentContext(context.Background(), mac)
+}
+
+func RestoreDefaultAgentContext(ctx context.Context, mac string) (bool, error) {
 	// Entry log
 	log.Printf("[RestoreDefaultAgent] Start restoring device default agent configuration, mac=%s", mac)
 
 	/// First query device information
-	devices, err := xiaozhi.GetDevices(nil, nil, &mac, nil, nil, nil)
+	devices, err := xiaozhi.GetDevicesContext(ctx, nil, nil, &mac, nil, nil, nil)
 	if err != nil {
 		log.Printf("[RestoreDefaultAgent] Failed to query device information, mac=%s, err=%v", mac, err)
 		return false, err
@@ -35,7 +40,7 @@ func RestoreDefaultAgent(mac string) (bool, error) {
 	log.Printf("[RestoreDefaultAgent] Found device agentID=%d, mac=%s", agentID, mac)
 
 	// Get default template
-	response, err := xiaozhi.GetAgentTemplate(1, 10)
+	response, err := xiaozhi.GetAgentTemplateContext(ctx, 1, 10)
 	if err != nil {
 		// Fix
 		log.Printf("[RestoreDefaultAgent] Failed to get agent template, agentID=%d, mac=%s, err=%v", agentID, mac, err)
@@ -70,7 +75,7 @@ func RestoreDefaultAgent(mac string) (bool, error) {
 		ProductMcpEndpoints: nil,
 	}
 	// Start update
-	return xiaozhi.SetAgentSetting(agentID, agentConfig)
+	return xiaozhi.SetAgentSettingContext(ctx, agentID, agentConfig)
 }
 
 // getItsVoice Get TTS voice based on language, return pure voice name without language prefix

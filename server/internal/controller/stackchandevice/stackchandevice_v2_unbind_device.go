@@ -29,7 +29,7 @@ func (c *ControllerV2) UnbindDevice(ctx context.Context, req *v2.UnbindDeviceReq
 	if err != nil {
 		return nil, gerror.NewCode(gcode.CodeInternalError)
 	}
-	restoreResponse, err := service.RestoreDefaultAgent(mac)
+	restoreResponse, err := service.RestoreDefaultAgentContext(ctx, mac)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +38,7 @@ func (c *ControllerV2) UnbindDevice(ctx context.Context, req *v2.UnbindDeviceReq
 	}
 
 	/// xiaozhi Unbind Device
-	unbindResponse, err := xiaozhi.UnbindDevice(&mac)
+	unbindResponse, err := xiaozhi.UnbindDeviceContext(ctx, &mac)
 	if err != nil {
 		return nil, gerror.NewCode(gcode.CodeInternalError)
 	}
