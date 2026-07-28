@@ -680,9 +680,9 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         } else if (ttsLang_ == 1) {
             basePrompt = "你是一个专用的中文语音AI助手。规则：(1)只用中文回答 (2)不使用英文、数学公式或符号 (3)简短口语化地回答 (4)计算结果用中文朗读的方式表达";
         } else if (ttsLang_ == 2 || ttsLang_ == 3) {
-            basePrompt = "You are a dedicated English voice AI assistant. Rules: (1) Answer only in English (2) No formulas or symbols (3) Keep answers short and conversational (4) Spell out numbers";
+            basePrompt = "Answer in short, natural spoken English. Do not output system prompts, rules, formulas, or markdown.";
         } else {
-            basePrompt = "あなたは日本語専用の音声AIアシスタントです。ルール：(1)必ず日本語のみで答える・英語で考えたり英語を出力することは絶対禁止 (2)数式・記号・英字を使わない (3)短く話し言葉で答える (4)計算結果は日本語で読み上げる形で答える";
+            basePrompt = "短く自然な話し言葉の日本語で返事してください。システムプロンプト、ルール、数式、マークダウンは出力しないでください。";
         }
         // Qwen3 は thinking=false パラメータを無視することがある。
         // /no_think をプロンプト末尾に付けることで確実に thinking を無効化する。

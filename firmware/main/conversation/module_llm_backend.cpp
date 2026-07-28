@@ -180,210 +180,31 @@ void ModuleLLMBackend::applyConfig(const CachedAgentConfig& cfg) {
 // chunk は in-place で書き換えられる。
 // ---------------------------------------------------------------------------
 
-static bool isEnglishTtsLang(uint8_t lang)
+// Preserve the model's response verbatim apart from whitespace and ASCII
+// control characters. Formatting and language heuristics must not discard
+// legitimate speech such as numbers, Latin text, or parenthesized content.
+static void normalizeTtsText(std::string& text)
 {
-    return lang == 2 || lang == 3;
-}
+    std::string normalized;
+    normalized.reserve(text.size());
+    bool pendingSpace = false;
 
-// sanitizeTtsText — TTS に送る前に読み上げ不可能な記法を除去する
-// 処理順:
-//   1. LaTeX コマンド・Markdown 記号を除去
-//   2. 括弧（ASCII/全角/【】/「」等）とその内容を除去
-//   3. 文末の記号を除去（! ? ！ ？ は1個まで残す）
-static void sanitizeTtsText(std::string& text, uint8_t lang)
-{
-    const bool english = isEnglishTtsLang(lang);
-
-    // --- Step 1: LaTeX・Markdown 除去 ---
-    {
-        std::string r;
-        r.reserve(text.size());
-        const unsigned char* p = reinterpret_cast<const unsigned char*>(text.c_str());
-        while (*p) {
-            if (*p == '\\') {
-                ++p;
-                while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) ++p;
-                continue;
-            }
-            if (*p == '*' || *p == '#' || *p == '^' || *p == '_') { ++p; continue; }
-            if (*p == '{' || *p == '}') { ++p; continue; }
-            // マルチバイト
-            if (*p & 0x80) {
-                // 「U+300C」U+300D『U+300E』U+300F の括弧文字のみ除去（中身は残す）
-                static const char* kQuoteChars[] = {
-                    "\xE3\x80\x8C", "\xE3\x80\x8D",  // 「」
-                    "\xE3\x80\x8E", "\xE3\x80\x8F",  // 『』
-                    nullptr
-                };
-                bool isQuote = false;
-                for (int qi = 0; kQuoteChars[qi]; qi++) {
-                    if (memcmp(p, kQuoteChars[qi], 3) == 0) { p += 3; isQuote = true; break; }
-                }
-                if (isQuote) continue;
-                int len = (*p & 0xE0) == 0xC0 ? 2 : (*p & 0xF0) == 0xE0 ? 3 : 4;
-                for (int i = 0; i < len && *p; i++) r += (char)*p++;
-                continue;
-            }
-            // ASCII: 日本語/中国語 TTS では英字を落とし、英語 TTS では英字を保持する。
-            if (english &&
-                (((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) ||
-                 (*p >= '0' && *p <= '9') ||
-                 *p == ',' || *p == '.' || *p == '!' || *p == '?' ||
-                 *p == ';' || *p == ':' || *p == '\'' || *p == '"' ||
-                 *p == '-' || *p == '\n' || *p == ' ')) {
-                r += (char)*p++;
-                continue;
-            }
-            if (!english &&
-                ((*p >= '0' && *p <= '9') ||
-                 *p == ',' || *p == '.' || *p == '!' || *p == '?' ||
-                 *p == '\n' || *p == ' ')) {
-                r += (char)*p++;
-                continue;
-            }
-            ++p;  // 英字・その他ASCII記号はスキップ
+    for (const unsigned char c : text) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            pendingSpace = !normalized.empty();
+            continue;
         }
-        text = r;
+        if (c < 0x20 || c == 0x7f) {
+            continue;
+        }
+        if (pendingSpace) {
+            normalized.push_back(' ');
+            pendingSpace = false;
+        }
+        normalized.push_back(static_cast<char>(c));
     }
 
-    // --- Step 2: 括弧とその内容を除去 ---
-    // 対応ペア: () [] （）【】「」『』〔〕
-    // ネスト非対応（1段のみ）
-    {
-        // 全角括弧の UTF-8 バイト列
-        static const char kAsciiOpen[]  = "([";
-        static const char kAsciiClose[] = ")]";
-        // 全角括弧は3バイト: U+FF08（）U+3010【U+3011】U+300C「U+300D」U+300E『U+300F』U+3014〔U+3015〕
-        static const struct { const char* open; const char* close; } kWide[] = {
-            {"\xEF\xBC\x88", "\xEF\xBC\x89"},  // （）← 注釈括弧
-            {"\xE3\x80\x90", "\xE3\x80\x91"},  // 【】← 注釈括弧
-            {"\xE3\x80\x94", "\xE3\x80\x95"},  // 〔〕← 注釈括弧
-            // 「」『』は引用符のため除外（中身を消さない）
-        };
-
-        std::string r;
-        r.reserve(text.size());
-        const unsigned char* p = reinterpret_cast<const unsigned char*>(text.c_str());
-        while (*p) {
-            // ASCII 括弧チェック
-            bool skipAscii = false;
-            for (int i = 0; kAsciiOpen[i]; i++) {
-                if (*p == (unsigned char)kAsciiOpen[i]) {
-                    ++p;
-                    while (*p && *p != (unsigned char)kAsciiClose[i]) {
-                        if (*p & 0x80) {
-                            int len = (*p & 0xE0) == 0xC0 ? 2 : (*p & 0xF0) == 0xE0 ? 3 : 4;
-                            p += len;
-                        } else ++p;
-                    }
-                    if (*p) ++p;  // 閉じ括弧をスキップ
-                    skipAscii = true;
-                    break;
-                }
-            }
-            if (skipAscii) continue;
-
-            // 全角括弧チェック
-            bool skipWide = false;
-            if (*p & 0x80) {
-                for (auto& pair : kWide) {
-                    if (memcmp(p, pair.open, 3) == 0) {
-                        p += 3;
-                        while (*p) {
-                            if ((*p & 0x80) && memcmp(p, pair.close, 3) == 0) { p += 3; break; }
-                            if (*p & 0x80) {
-                                int len = (*p & 0xE0) == 0xC0 ? 2 : (*p & 0xF0) == 0xE0 ? 3 : 4;
-                                p += len;
-                            } else ++p;
-                        }
-                        skipWide = true;
-                        break;
-                    }
-                }
-            }
-            if (skipWide) continue;
-
-            // 通常文字はそのまま
-            if (*p & 0x80) {
-                int len = (*p & 0xE0) == 0xC0 ? 2 : (*p & 0xF0) == 0xE0 ? 3 : 4;
-                for (int i = 0; i < len && *p; i++) r += (char)*p++;
-            } else {
-                r += (char)*p++;
-            }
-        }
-        text = r;
-    }
-
-    // --- Step 3: 文末の記号を除去（! ? ！ ？ は1個まで残す）---
-    // 「記号」= ASCII の非英数字・非空白、または全角句読点類
-    // ただし ！（U+FF01）と ？（U+FF1F）は例外
-    static const char* kBang  = "\xEF\xBC\x81";  // ！
-    static const char* kQuery = "\xEF\xBC\x9F";  // ？
-
-    // 文末から逆方向にスキャンして「最後の本文文字」位置を探す
-    // 本文文字 = 日本語かな漢字、英数字、または通常の句読点以外
-    // ここでは末尾から記号のみで構成されるスパンを切り取る
-    if (!text.empty()) {
-        // 末尾のトレイリング記号を集める（逆順）
-        bool foundBang = false, foundQuery = false;
-        // 末尾から本文文字が出るまで戻る
-        // バイト列を末尾から解析（UTF-8 は末尾バイトの範囲で判別可能）
-        size_t end = text.size();
-        while (end > 0) {
-            // 3バイト文字の末尾か確認
-            if (end >= 3) {
-                const char* tail = text.c_str() + end - 3;
-                if (memcmp(tail, kBang,  3) == 0) { foundBang  = true; end -= 3; continue; }
-                if (memcmp(tail, kQuery, 3) == 0) { foundQuery = true; end -= 3; continue; }
-                // 他の全角句読点（。、・…—〜）
-                // U+3000-U+303F: 3バイト E3 80 80-BF
-                unsigned char b0 = (unsigned char)tail[0];
-                unsigned char b1 = (unsigned char)tail[1];
-                if (b0 == 0xE3 && b1 == 0x80) { end -= 3; continue; }
-                // U+FF00-U+FFEF: EF BC-BF
-                if (b0 == 0xEF && (b1 == 0xBC || b1 == 0xBD)) { end -= 3; continue; }
-            }
-            // ASCII 1バイト記号
-            unsigned char c = (unsigned char)text[end - 1];
-            if (c < 0x80) {
-                if (c == '!' ) { foundBang  = true; end--; continue; }
-                if (c == '?' ) { foundQuery = true; end--; continue; }
-                // その他のASCII記号（句読点・スペース等）
-                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') || c == '\n')) {
-                    end--; continue;
-                }
-            }
-            break;  // 本文文字に到達
-        }
-        text = text.substr(0, end);
-        // ! ? を1個まで付加（! 優先）
-        if (foundBang)       text += "！";
-        else if (foundQuery) text += "？";
-    }
-
-    // --- Step 4: 日本語（3バイトUTF-8）を含まない行を除去 ---
-    // 英語 thinking が本文に漏れた場合の残骸（", . , ."等）を除去
-    if (!english) {
-        std::string result;
-        std::istringstream ss(text);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // 3バイトUTF-8文字が含まれるか確認
-            bool hasJapanese = false;
-            const unsigned char* p = reinterpret_cast<const unsigned char*>(line.c_str());
-            while (*p) {
-                if ((*p & 0xF0) == 0xE0) { hasJapanese = true; break; }
-                if (*p & 0x80) p += ((*p & 0xE0) == 0xC0) ? 2 : 4;
-                else ++p;
-            }
-            if (hasJapanese) {
-                if (!result.empty()) result += '\n';
-                result += line;
-            }
-        }
-        text = result;
-    }
+    text.swap(normalized);
 }
 
 
@@ -696,35 +517,10 @@ void ModuleLLMBackend::pollLoop() {
                         uint8_t lang = client_->getTtsLang();
                         if (lang >= 4) lang = 0;
 
-                        // TTS送信前に読み上げ不可能な記法を除去
-                        sanitizeTtsText(pendingTts_, lang);
-                        // JA/ZH では英語 thinking の残骸を弾くため CJK 比率を確認する。
-                        // EN では ASCII 英字を正規の発話として許可する。
-                        int nonSpaceBytes = 0;
-                        int cjkBytes = 0;
-                        {
-                            const unsigned char* cp2 = reinterpret_cast<const unsigned char*>(pendingTts_.c_str());
-                            while (*cp2) {
-                                if ((*cp2 & 0xF0) == 0xE0) {
-                                    cjkBytes += 3; nonSpaceBytes += 3; cp2 += 3;
-                                } else if (*cp2 & 0x80) {
-                                    nonSpaceBytes += 2; cp2 += 2;
-                                } else {
-                                    if (*cp2 != ' ' && *cp2 != '\n' && *cp2 != '\r' && *cp2 != '\t')
-                                        nonSpaceBytes++;
-                                    cp2++;
-                                }
-                            }
-                        }
-                        bool languageOk = nonSpaceBytes > 0;
-                        if (languageOk && !isEnglishTtsLang(lang)) {
-                            languageOk = cjkBytes * 10 >= nonSpaceBytes * 8;  // 80%以上
-                        }
-                        if (pendingTts_.empty() || !languageOk) {
-                            ESP_LOGW(TAG, "LLM→TTS: skipped (lang=%u cjk=%d%% of %d non-space bytes)",
-                                     lang,
-                                     nonSpaceBytes > 0 ? cjkBytes * 100 / nonSpaceBytes : 0,
-                                     nonSpaceBytes);
+                        ESP_LOGI(TAG, "LLM raw response: %.300s", pendingTts_.c_str());
+                        normalizeTtsText(pendingTts_);
+                        if (pendingTts_.find_first_not_of(" \n\r\t") == std::string::npos) {
+                            ESP_LOGW(TAG, "LLM→TTS: skipped empty text after sanitization");
                             finishLocalTurn("tts skipped");
                             goto skip_tts_dispatch;
                         }
