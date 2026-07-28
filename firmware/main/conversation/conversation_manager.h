@@ -5,6 +5,10 @@
 #include "agent_config_provider.h"
 #include "agent_config_store.h"
 
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <memory>
 
 // Forward declarations
@@ -112,4 +116,17 @@ private:
 
     // Module LLM の初期化（LocalOnly 起動時 / Auto でネット失敗時に呼ぶ）
     void initModuleLLM();
+
+    // Module LLM recovery runs outside backend callbacks because reconnecting
+    // and loading models are blocking operations.
+    void startRecoveryTask();
+    void stopRecoveryTask();
+    void requestModuleRecovery(const char* reason);
+    bool waitForRecoveryDelay(int delayMs);
+    void recoveryLoop();
+
+    std::atomic<bool> localRecoveryRequested_ {false};
+    std::atomic<bool> recoveryTaskRunning_ {false};
+    TaskHandle_t      recoveryTask_ = nullptr;
+    SemaphoreHandle_t recoveryTaskDone_ = nullptr;
 };

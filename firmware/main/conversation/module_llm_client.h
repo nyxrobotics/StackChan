@@ -3,6 +3,7 @@
 #include "conversation_health.h"
 #include "agent_config_store.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -61,6 +62,9 @@ public:
     // Returns true if UART + StackFlow handshake succeed.
     bool connect();
 
+    // Close UART and discard all runtime work IDs before reconnecting.
+    void disconnect();
+
     // Load Whisper + Qwen3 + MeloTTS and verify pipeline.
     // Blocking — call once at startup to avoid first-turn latency (Section 9.3).
     // Returns true if all models are loaded and pipeline is confirmed.
@@ -99,12 +103,13 @@ public:
     // ------------------------------------------------------------------
     // State
     // ------------------------------------------------------------------
-    ModuleLLMState state() const { return state_; }
-    bool isReady() const { return state_ == ModuleLLMState::PipelineReady; }
+    ModuleLLMState state() const { return state_.load(); }
+    bool isReady() const { return state_.load() == ModuleLLMState::PipelineReady; }
 
     // Public so ModuleLLMBackend polling loop can read UART messages
     std::string stackflowReceive(int timeoutMs = 5000);
     bool        stackflowSend(const std::string& jsonMsg);
+    bool        sendHealthPing(const std::string& requestId);
 
     // Send filtered text to MeloTTS manually
     bool sendToTts(const std::string& text, bool finish = false);
@@ -124,10 +129,20 @@ public:
 
 private:
     // Low-level StackFlow JSON-RPC helpers
-    bool waitForAck(const std::string& method, int timeoutMs = 10000);
+    bool waitForAck(const std::string& requestId,
+                    const char* label,
+                    int timeoutMs = 10000);
     // UART handle (platform-specific)
     int          uartFd_    = -1;
-    ModuleLLMState state_   = ModuleLLMState::NotConnected;
+    std::atomic<ModuleLLMState> state_ {ModuleLLMState::NotConnected};
+
+    // A StackFlow JSON frame can pause mid-message while the module is busy.
+    // Preserve parser state across short receive polls instead of dropping it.
+    std::string  rxFrameBuffer_;
+    int          rxFrameDepth_    = 0;
+    bool         rxFrameStarted_  = false;
+    bool         rxFrameInString_ = false;
+    bool         rxFrameEscape_   = false;
 
     // Config applied via applyConfig()
     CachedAgentConfig config_;

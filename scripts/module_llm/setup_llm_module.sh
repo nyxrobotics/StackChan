@@ -123,6 +123,7 @@ main() {
     "${SCRIPT_DIR}/setup_vad.sh"
     "${SCRIPT_DIR}/setup_melotts.sh" "${model_args[@]}"
     "${SCRIPT_DIR}/setup_openjtalk.sh"
+    "${SCRIPT_DIR}/setup_llm_sys_watchdog.sh"
     "${SCRIPT_DIR}/verify_setup.sh" "${model_args[@]}"
     maybe_reboot
 }

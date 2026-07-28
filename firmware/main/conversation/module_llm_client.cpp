@@ -104,6 +104,7 @@ ModuleLLMClient::ModuleLLMClient()
         if (nvs_get_u8(h, kTtsLangKey, &lang) == ESP_OK) ttsLang_ = lang;
         nvs_close(h);
     }
+
     ESP_LOGI(TAG, "thinkingEnabled=%d vadEnabled=%d ttsLang=%d (from NVS)",
              thinkingEnabled_, vadEnabled_, (int)ttsLang_);
 }
@@ -133,10 +134,29 @@ void ModuleLLMClient::setVadEnabled(bool enabled)
 }
 
 ModuleLLMClient::~ModuleLLMClient() {
+    disconnect();
+}
+
+void ModuleLLMClient::disconnect()
+{
     if (uartFd_ >= 0) {
         uart_driver_delete(static_cast<uart_port_t>(kUartNum));
         uartFd_ = -1;
     }
+
+    state_ = ModuleLLMState::NotConnected;
+    rxFrameBuffer_.clear();
+    rxFrameDepth_ = 0;
+    rxFrameStarted_ = false;
+    rxFrameInString_ = false;
+    rxFrameEscape_ = false;
+
+    audioWorkId_.clear();
+    vadWorkId_.clear();
+    whisperWorkId_.clear();
+    llmWorkId_.clear();
+    melottsWorkId_.clear();
+    openJTalkTtsReady_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +165,17 @@ ModuleLLMClient::~ModuleLLMClient() {
 
 bool ModuleLLMClient::stackflowSend(const std::string& jsonMsg)
 {
+    if (uartFd_ < 0) return false;
     std::string line = jsonMsg + "\n";
     int written = uart_write_bytes(static_cast<uart_port_t>(kUartNum),
                                    line.c_str(), line.size());
     return written == static_cast<int>(line.size());
+}
+
+bool ModuleLLMClient::sendHealthPing(const std::string& requestId)
+{
+    if (requestId.empty()) return false;
+    return sendAction(requestId, "sys", "ping");
 }
 
 bool ModuleLLMClient::sendAction(const std::string& reqId,
@@ -287,8 +314,7 @@ bool ModuleLLMClient::applyModuleMicrophoneGain(const std::string& requestId)
 
 std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
 {
-    std::string result;
-    if (timeoutMs <= 0) return result;
+    if (timeoutMs <= 0) return {};
 
     const TickType_t startTick = xTaskGetTickCount();
     TickType_t timeoutTicks = pdMS_TO_TICKS(timeoutMs);
@@ -296,11 +322,6 @@ std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
 
     TickType_t readWaitTicks = pdMS_TO_TICKS(10);
     if (readWaitTicks == 0) readWaitTicks = 1;
-
-    int depth = 0;
-    bool started = false;
-    bool inString = false;
-    bool escape = false;
 
     while (true) {
         // Unsigned subtraction keeps this comparison safe across tick wrap.
@@ -317,46 +338,48 @@ std::string ModuleLLMClient::stackflowReceive(int timeoutMs)
         if (n <= 0) continue;
 
         // Ignore boot logs and other UART noise before the JSON object.
-        if (!started) {
+        if (!rxFrameStarted_) {
             if (ch != '{') continue;
 
-            started = true;
-            depth = 1;
-            inString = false;
-            escape = false;
-            result.clear();
-            result += '{';
+            rxFrameStarted_ = true;
+            rxFrameDepth_ = 1;
+            rxFrameInString_ = false;
+            rxFrameEscape_ = false;
+            rxFrameBuffer_.clear();
+            rxFrameBuffer_ += '{';
             continue;
         }
 
-        result += static_cast<char>(ch);
-        if (result.size() > kMaxStackflowFrameBytes) {
+        rxFrameBuffer_ += static_cast<char>(ch);
+        if (rxFrameBuffer_.size() > kMaxStackflowFrameBytes) {
             ESP_LOGW(TAG, "discarding oversized StackFlow frame (> %u bytes)",
                      static_cast<unsigned>(kMaxStackflowFrameBytes));
-            result.clear();
-            depth = 0;
-            started = false;
-            inString = false;
-            escape = false;
+            rxFrameBuffer_.clear();
+            rxFrameDepth_ = 0;
+            rxFrameStarted_ = false;
+            rxFrameInString_ = false;
+            rxFrameEscape_ = false;
             continue;
         }
 
         // 文字列リテラル内のエスケープ処理
-        if (escape) { escape = false; continue; }
-        if (ch == '\\' && inString) { escape = true; continue; }
-        if (ch == '"') { inString = !inString; }
-        if (inString) continue;
+        if (rxFrameEscape_) { rxFrameEscape_ = false; continue; }
+        if (ch == '\\' && rxFrameInString_) { rxFrameEscape_ = true; continue; }
+        if (ch == '"') { rxFrameInString_ = !rxFrameInString_; }
+        if (rxFrameInString_) continue;
 
-        if (ch == '{') { depth++; }
+        if (ch == '{') { rxFrameDepth_++; }
         else if (ch == '}') {
-            depth--;
-            if (depth == 0) return result;  // JSON オブジェクト完了
+            rxFrameDepth_--;
+            if (rxFrameDepth_ == 0) {
+                std::string result;
+                result.swap(rxFrameBuffer_);
+                rxFrameStarted_ = false;
+                rxFrameInString_ = false;
+                rxFrameEscape_ = false;
+                return result;
+            }
         }
-    }
-
-    if (started) {
-        ESP_LOGW(TAG, "discarding incomplete StackFlow frame after %d ms",
-                 timeoutMs);
     }
     return {};
 }
@@ -461,34 +484,49 @@ std::string ModuleLLMClient::sfCommand(const std::string& reqId,
 // waitForAck — used after ping (no data payload)
 // ---------------------------------------------------------------------------
 
-bool ModuleLLMClient::waitForAck(const std::string& method, int timeoutMs)
+bool ModuleLLMClient::waitForAck(const std::string& requestId,
+                                 const char* label,
+                                 int timeoutMs)
 {
-    std::string resp = stackflowReceive(timeoutMs);
-    if (resp.empty()) {
-        ESP_LOGW(TAG, "waitForAck(%s): timeout", method.c_str());
-        return false;
+    const int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+    while (esp_timer_get_time() / 1000 < deadline) {
+        const int remaining = static_cast<int>(deadline - esp_timer_get_time() / 1000);
+        if (remaining < 1) break;
+
+        std::string resp = stackflowReceive(remaining > 500 ? 500 : remaining);
+        if (resp.empty()) continue;
+
+        cJSON* root = cJSON_Parse(resp.c_str());
+        if (!root) {
+            ESP_LOGW(TAG, "waitForAck(%s): parse error: %.200s",
+                     label, resp.c_str());
+            continue;
+        }
+
+        cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+        const bool matches = cJSON_IsString(rid) && requestId == rid->valuestring;
+        if (!matches) {
+            cJSON_Delete(root);
+            continue;
+        }
+
+        bool ok = false;
+        cJSON* errObj = cJSON_GetObjectItemCaseSensitive(root, "error");
+        if (cJSON_IsObject(errObj)) {
+            cJSON* code = cJSON_GetObjectItemCaseSensitive(errObj, "code");
+            ok = cJSON_IsNumber(code) && code->valueint == 0;
+        }
+
+        if (!ok) {
+            ESP_LOGW(TAG, "waitForAck(%s): not ok — %s", label, resp.c_str());
+        }
+
+        cJSON_Delete(root);
+        return ok;
     }
 
-    cJSON* root = cJSON_Parse(resp.c_str());
-    if (!root) {
-        ESP_LOGW(TAG, "waitForAck(%s): parse error: %s", method.c_str(), resp.c_str());
-        return false;
-    }
-
-    // StackFlow response: {"error":{"code":0,"message":""},...}
-    bool ok = false;
-    cJSON* errObj = cJSON_GetObjectItemCaseSensitive(root, "error");
-    if (cJSON_IsObject(errObj)) {
-        cJSON* code = cJSON_GetObjectItemCaseSensitive(errObj, "code");
-        ok = cJSON_IsNumber(code) && (code->valueint == 0);
-    }
-
-    if (!ok) {
-        ESP_LOGW(TAG, "waitForAck(%s): not ok — %s", method.c_str(), resp.c_str());
-    }
-
-    cJSON_Delete(root);
-    return ok;
+    ESP_LOGW(TAG, "waitForAck(%s): timeout", label);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -497,43 +535,40 @@ bool ModuleLLMClient::waitForAck(const std::string& method, int timeoutMs)
 
 bool ModuleLLMClient::connect()
 {
-    if (uartFd_ >= 0) return true;  // already open
-
-    auto close_uart = [this]() {
-        if (uartFd_ >= 0) {
-            uart_driver_delete(static_cast<uart_port_t>(kUartNum));
-            uartFd_ = -1;
-        }
-        state_ = ModuleLLMState::NotConnected;
-    };
+    if (uartFd_ >= 0) {
+        ESP_LOGW(TAG, "discarding stale UART connection before handshake");
+        disconnect();
+    }
 
     if (!uartInit(kUartNum, kTxPin, kRxPin, kBaud)) {
         ESP_LOGE(TAG, "UART init failed");
-        close_uart();
+        disconnect();
         return false;
     }
     uartFd_ = kUartNum;
+    uart_flush_input(static_cast<uart_port_t>(kUartNum));
 
     // Send ping — StackFlow format
+    const std::string requestId = runtimeRequestId("ping_");
     cJSON* ping = cJSON_CreateObject();
-    cJSON_AddStringToObject(ping, "request_id", "1");
+    cJSON_AddStringToObject(ping, "request_id", requestId.c_str());
     cJSON_AddStringToObject(ping, "work_id",    "sys");
     cJSON_AddStringToObject(ping, "action",     "ping");
     char* pingStr = cJSON_PrintUnformatted(ping);
-    bool sent = stackflowSend(pingStr);
-    free(pingStr);
+    bool sent = pingStr != nullptr && stackflowSend(pingStr);
+    if (pingStr) free(pingStr);
     cJSON_Delete(ping);
 
     if (!sent) {
         ESP_LOGE(TAG, "ping send failed");
-        close_uart();
+        disconnect();
         return false;
     }
 
-    bool ack = waitForAck("sys.ping", 3000);
+    bool ack = waitForAck(requestId, "sys.ping", 3000);
     if (!ack) {
         ESP_LOGW(TAG, "Module LLM did not respond to ping");
-        close_uart();
+        disconnect();
         return false;
     }
 

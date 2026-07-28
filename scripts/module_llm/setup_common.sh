@@ -21,6 +21,12 @@ VAD_PCM_BRIDGE_SOURCE="${STACKCHAN_VAD_PCM_BRIDGE:-${SCRIPT_DIR}/stackchan_vad_p
 VAD_PCM_BRIDGE_TARGET="/opt/stackchan/stackchan_vad_pcm_bridge.py"
 VAD_PCM_BRIDGE_SERVICE_SOURCE="${STACKCHAN_VAD_PCM_BRIDGE_SERVICE:-${SCRIPT_DIR}/stackchan-vad-pcm-bridge.service}"
 VAD_PCM_BRIDGE_SERVICE_TARGET="/etc/systemd/system/stackchan-vad-pcm-bridge.service"
+LLM_SYS_WATCHDOG_SOURCE="${STACKCHAN_LLM_SYS_WATCHDOG:-${SCRIPT_DIR}/stackchan_llm_sys_watchdog.py}"
+LLM_SYS_WATCHDOG_TARGET="/opt/stackchan/stackchan_llm_sys_watchdog.py"
+LLM_SYS_WATCHDOG_SERVICE_SOURCE="${STACKCHAN_LLM_SYS_WATCHDOG_SERVICE:-${SCRIPT_DIR}/stackchan-llm-sys-watchdog.service}"
+LLM_SYS_WATCHDOG_SERVICE_TARGET="/etc/systemd/system/stackchan-llm-sys-watchdog.service"
+LLM_SYS_WATCHDOG_DROPIN_SOURCE="${STACKCHAN_LLM_SYS_WATCHDOG_DROPIN:-${SCRIPT_DIR}/llm-sys-stackchan-watchdog.conf}"
+LLM_SYS_WATCHDOG_DROPIN_TARGET="/etc/systemd/system/llm-sys.service.d/stackchan-watchdog.conf"
 QWEN3_MODEL_ID="qwen3-0.6B-ax630c"
 QWEN3_TOKENIZER_SCRIPT="/opt/m5stack/scripts/tokenizer_${QWEN3_MODEL_ID}.py"
 QWEN3_TOKENIZER_COMPAT="/opt/m5stack/scripts/${QWEN3_MODEL_ID}_tokenizer.py"
@@ -91,6 +97,10 @@ SERVICES_MELOTTS=(
 SERVICES_VAD=(
     llm-vad.service
     stackchan-vad-pcm-bridge.service
+)
+
+SERVICES_LLM_SYS_WATCHDOG=(
+    stackchan-llm-sys-watchdog.service
 )
 
 RED='\033[0;31m'

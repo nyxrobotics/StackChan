@@ -22,6 +22,7 @@ public:
 
     void start()     override;
     void stop()      override;
+    bool waitUntilIdle(int timeoutMs) const;
     void abortSpeaking() { abortRequested_.store(true); }  // 顔タッチ中断
     void beginTurn() override;
     void endTurn()   override;
@@ -51,6 +52,7 @@ private:
     CachedAgentConfig                config_;
     std::atomic<bool>                active_          {false};
     std::atomic<bool>                taskRunning_     {false};
+    std::atomic<bool>                pollIdle_         {true};
     bool                             inThinkBlock_ = false;
     bool                             micMuted_         = false;
     bool                             ttsDispatched_    = false;

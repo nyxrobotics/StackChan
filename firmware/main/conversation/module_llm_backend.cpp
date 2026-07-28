@@ -60,6 +60,8 @@ void ModuleLLMBackend::start() {
         return;
     }
 
+    pollIdle_.store(false);
+
     if (pollTask_ != nullptr) {
         ESP_LOGI(TAG, "start: reusing existing pollLoop task");
         xTaskNotifyGive(pollTask_);
@@ -71,6 +73,7 @@ void ModuleLLMBackend::start() {
     if (pollTaskDone_ == nullptr) {
         active_.store(false);
         taskRunning_.store(false);
+        pollIdle_.store(true);
         ESP_LOGE(TAG, "pollLoop completion semaphore allocation failed");
         if (onFailure_) onFailure_(BackendKind::ModuleLLM);
         return;
@@ -93,6 +96,7 @@ void ModuleLLMBackend::start() {
     if (created != pdPASS) {
         active_.store(false);
         taskRunning_.store(false);
+        pollIdle_.store(true);
         pollTask_ = nullptr;
         vSemaphoreDelete(pollTaskDone_);
         pollTaskDone_ = nullptr;
@@ -112,6 +116,17 @@ void ModuleLLMBackend::stop() {
     stopLocalMouthAnimation("backend stop");
     ESP_LOGI(TAG, "stop requested");
     // The poll task remains alive and idles until start() activates it again.
+}
+
+bool ModuleLLMBackend::waitUntilIdle(int timeoutMs) const {
+    if (pollTask_ == nullptr || pollIdle_.load()) return true;
+
+    const int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+    while (esp_timer_get_time() / 1000 < deadline) {
+        if (pollIdle_.load()) return true;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return pollIdle_.load();
 }
 
 void ModuleLLMBackend::beginTurn() { ESP_LOGD(TAG, "beginTurn"); }
@@ -327,7 +342,12 @@ void ModuleLLMBackend::pollLoop() {
     int64_t ttsDispatchedMs = 0;  // TTS 送信時刻
     int64_t ttsTimeoutMs = 10000; // 文字数に応じて動的に設定
     int64_t llmLastProgressMs = 0;
-    static constexpr int64_t kLlmStallTimeoutMs = 180000;
+    int64_t lastHealthPingMs = esp_timer_get_time() / 1000;
+    int64_t healthPingSentMs = 0;
+    std::string healthPingRequestId;
+    static constexpr int64_t kLlmStallTimeoutMs = 45000;
+    static constexpr int64_t kHealthPingIntervalMs = 10000;
+    static constexpr int64_t kHealthPingTimeoutMs = 8000;
 
     // 言語別タイムアウト係数
     // BASE: TTS 生成開始までの余裕
@@ -360,13 +380,40 @@ void ModuleLLMBackend::pollLoop() {
 
     while (taskRunning_.load()) {
         if (!active_.load()) {
+            pollIdle_.store(true);
+            healthPingRequestId.clear();
+            healthPingSentMs = 0;
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            pollIdle_.store(false);
+            lastHealthPingMs = esp_timer_get_time() / 1000;
             continue;
         }
 
         if (!client_ || !client_->isReady()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
+        }
+
+        const int64_t heartbeatNow = esp_timer_get_time() / 1000;
+        if (!healthPingRequestId.empty() &&
+            heartbeatNow - healthPingSentMs >= kHealthPingTimeoutMs) {
+            ESP_LOGE(TAG, "Module LLM UART health ping timed out after %d ms",
+                     logMs(heartbeatNow - healthPingSentMs));
+            healthPingRequestId.clear();
+            if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+            continue;
+        }
+        if (healthPingRequestId.empty() && !micMuted_ && lastVadSpeech_ != 1 &&
+            heartbeatNow - lastHealthPingMs >= kHealthPingIntervalMs) {
+            healthPingRequestId = nextRequestId("health_");
+            if (!client_->sendHealthPing(healthPingRequestId)) {
+                ESP_LOGE(TAG, "Module LLM UART health ping send failed");
+                healthPingRequestId.clear();
+                if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+                continue;
+            }
+            healthPingSentMs = heartbeatNow;
+            lastHealthPingMs = heartbeatNow;
         }
 
         bool abortRequested = abortRequested_.exchange(false);
@@ -425,6 +472,26 @@ void ModuleLLMBackend::pollLoop() {
         cJSON* wid = cJSON_GetObjectItemCaseSensitive(root, "work_id");
         cJSON* obj = cJSON_GetObjectItemCaseSensitive(root, "object");
         cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
+
+        if (cJSON_IsString(rid) && !healthPingRequestId.empty() &&
+            healthPingRequestId == rid->valuestring) {
+            bool healthy = false;
+            if (cJSON_IsObject(err)) {
+                cJSON* code = cJSON_GetObjectItemCaseSensitive(err, "code");
+                healthy = cJSON_IsNumber(code) && code->valueint == 0;
+            }
+            healthPingRequestId.clear();
+            healthPingSentMs = 0;
+            if (!healthy) {
+                ESP_LOGE(TAG, "Module LLM UART health ping returned an error");
+                cJSON_Delete(root);
+                if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+                continue;
+            }
+            ESP_LOGD(TAG, "Module LLM UART health ping ok");
+            cJSON_Delete(root);
+            continue;
+        }
 
         // Recover the active turn immediately when its correlated request
         // fails instead of waiting forever for a stream finish marker.
@@ -702,6 +769,7 @@ void ModuleLLMBackend::pollLoop() {
     }
 
     active_.store(false);
+    pollIdle_.store(true);
     ESP_LOGI(TAG, "pollLoop exit");
 }
 
