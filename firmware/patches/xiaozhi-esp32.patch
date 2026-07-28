@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..fd7871f 100644
+index d69d43d..cb4d3dc 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -8,7 +8,7 @@
@@ -237,7 +237,7 @@ index d69d43d..fd7871f 100644
 -
 -    if (!download_url.empty()) {
 -        settings.EraseKey("download_url");
--
+ 
 -        char message[256];
 -        snprintf(message, sizeof(message), Lang::Strings::FOUND_NEW_ASSETS, download_url.c_str());
 -        Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_arrow_down", Lang::Sounds::OGG_UPGRADE);
@@ -247,7 +247,7 @@ index d69d43d..fd7871f 100644
 -        SetDeviceState(kDeviceStateUpgrading);
 -        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 -        display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
- 
+-
 -        bool success = assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
 -            char buffer[32];
 -            snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
@@ -361,7 +361,7 @@ index d69d43d..fd7871f 100644
      auto& board = Board::GetInstance();
      auto display = board.GetDisplay();
      auto codec = board.GetAudioCodec();
-@@ -487,12 +524,38 @@ void Application::InitializeProtocol() {
+@@ -487,16 +524,44 @@ void Application::InitializeProtocol() {
      }
  
      protocol_->OnConnected([this]() {
@@ -370,6 +370,7 @@ index d69d43d..fd7871f 100644
      });
  
 +    protocol_->OnDisconnected([this]() {
++        audio_service_.EndStreamingPlayback();
 +        hal_bridge::notify_xiaozhi_disconnected();
 +        if (!IsNetworkRequired()) {
 +            Schedule([this]() {
@@ -383,6 +384,7 @@ index d69d43d..fd7871f 100644
 +    });
 +
      protocol_->OnNetworkError([this](const std::string& message) {
++        audio_service_.EndStreamingPlayback();
          last_error_message_ = message;
 -        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
 +        hal_bridge::notify_xiaozhi_error();
@@ -401,7 +403,34 @@ index d69d43d..fd7871f 100644
      });
      
      protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-@@ -606,7 +669,13 @@ void Application::InitializeProtocol() {
+-        if (GetDeviceState() == kDeviceStateSpeaking) {
++        if (packet->streaming || GetDeviceState() == kDeviceStateSpeaking) {
+             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+         }
+     });
+@@ -510,6 +575,7 @@ void Application::InitializeProtocol() {
+     });
+     
+     protocol_->OnAudioChannelClosed([this, &board]() {
++        audio_service_.EndStreamingPlayback();
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+         Schedule([this]() {
+             auto display = Board::GetInstance().GetDisplay();
+@@ -524,11 +590,13 @@ void Application::InitializeProtocol() {
+         if (strcmp(type->valuestring, "tts") == 0) {
+             auto state = cJSON_GetObjectItem(root, "state");
+             if (strcmp(state->valuestring, "start") == 0) {
++                audio_service_.BeginStreamingPlayback();
+                 Schedule([this]() {
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
++                audio_service_.EndStreamingPlayback();
+                 Schedule([this]() {
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
+                         if (listening_mode_ == kListeningModeManualStop) {
+@@ -606,7 +674,13 @@ void Application::InitializeProtocol() {
          }
      });
      
@@ -416,7 +445,7 @@ index d69d43d..fd7871f 100644
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
-@@ -687,8 +756,15 @@ void Application::HandleToggleChatEvent() {
+@@ -687,8 +761,15 @@ void Application::HandleToggleChatEvent() {
          return;
      }
  
@@ -433,7 +462,7 @@ index d69d43d..fd7871f 100644
          return;
      }
  
-@@ -715,6 +791,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+@@ -715,6 +796,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
      if (GetDeviceState() != kDeviceStateConnecting) {
          return;
      }
@@ -444,7 +473,7 @@ index d69d43d..fd7871f 100644
  
      if (!protocol_->IsAudioChannelOpened()) {
          if (!protocol_->OpenAudioChannel()) {
-@@ -737,8 +817,15 @@ void Application::HandleStartListeningEvent() {
+@@ -737,8 +822,15 @@ void Application::HandleStartListeningEvent() {
          return;
      }
  
@@ -461,7 +490,7 @@ index d69d43d..fd7871f 100644
          return;
      }
      
-@@ -766,6 +853,9 @@ void Application::HandleStopListeningEvent() {
+@@ -766,6 +858,9 @@ void Application::HandleStopListeningEvent() {
          SetDeviceState(kDeviceStateWifiConfiguring);
          return;
      } else if (state == kDeviceStateListening) {
@@ -471,7 +500,7 @@ index d69d43d..fd7871f 100644
          if (protocol_) {
              protocol_->SendStopListening();
          }
-@@ -774,7 +864,7 @@ void Application::HandleStopListeningEvent() {
+@@ -774,7 +869,7 @@ void Application::HandleStopListeningEvent() {
  }
  
  void Application::HandleWakeWordDetectedEvent() {
@@ -480,7 +509,7 @@ index d69d43d..fd7871f 100644
          return;
      }
  
-@@ -803,7 +893,9 @@ void Application::HandleWakeWordDetectedEvent() {
+@@ -803,7 +898,9 @@ void Application::HandleWakeWordDetectedEvent() {
          while (audio_service_.PopPacketFromSendQueue());
  
          if (state == kDeviceStateListening) {
@@ -491,7 +520,7 @@ index d69d43d..fd7871f 100644
              audio_service_.ResetDecoder();
              audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
              // Re-enable wake word detection as it was stopped by the detection itself
-@@ -824,6 +916,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+@@ -824,6 +921,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
      if (GetDeviceState() != kDeviceStateConnecting) {
          return;
      }
@@ -502,7 +531,7 @@ index d69d43d..fd7871f 100644
  
      if (!protocol_->IsAudioChannelOpened()) {
          if (!protocol_->OpenAudioChannel()) {
-@@ -855,6 +951,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+@@ -855,6 +956,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
  void Application::HandleStateChangedEvent() {
      DeviceState new_state = state_machine_.GetState();
      clock_ticks_ = 0;
@@ -510,7 +539,7 @@ index d69d43d..fd7871f 100644
  
      auto& board = Board::GetInstance();
      auto display = board.GetDisplay();
-@@ -867,8 +964,9 @@ void Application::HandleStateChangedEvent() {
+@@ -867,8 +969,9 @@ void Application::HandleStateChangedEvent() {
              display->SetStatus(Lang::Strings::STANDBY);
              display->ClearChatMessages();  // Clear messages first
              display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
@@ -522,7 +551,7 @@ index d69d43d..fd7871f 100644
              break;
          case kDeviceStateConnecting:
              display->SetStatus(Lang::Strings::CONNECTING);
-@@ -878,9 +976,13 @@ void Application::HandleStateChangedEvent() {
+@@ -878,9 +981,13 @@ void Application::HandleStateChangedEvent() {
          case kDeviceStateListening:
              display->SetStatus(Lang::Strings::LISTENING);
              display->SetEmotion("neutral");
@@ -537,7 +566,7 @@ index d69d43d..fd7871f 100644
                  // For auto mode, wait for playback queue to be empty before enabling voice processing
                  // This prevents audio truncation when STOP arrives late due to network jitter
                  if (listening_mode_ == kListeningModeAutoStop) {
-@@ -888,13 +990,17 @@ void Application::HandleStateChangedEvent() {
+@@ -888,13 +995,17 @@ void Application::HandleStateChangedEvent() {
                  }
                  
                  // Send the start listening command
@@ -557,7 +586,7 @@ index d69d43d..fd7871f 100644
  #else
              // Disable wake word detection in listening mode
              audio_service_.EnableWakeWordDetection(false);
-@@ -910,9 +1016,11 @@ void Application::HandleStateChangedEvent() {
+@@ -910,11 +1021,15 @@ void Application::HandleStateChangedEvent() {
              display->SetStatus(Lang::Strings::SPEAKING);
  
              if (listening_mode_ != kListeningModeRealtime) {
@@ -568,10 +597,15 @@ index d69d43d..fd7871f 100644
 +                if (!local_backend && protocol_) {
 +                    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
 +                }
++            }
++            if (local_backend) {
++                audio_service_.ResetDecoder();
              }
-             audio_service_.ResetDecoder();
+-            audio_service_.ResetDecoder();
              break;
-@@ -937,7 +1045,9 @@ void Application::Schedule(std::function<void()>&& callback) {
+         case kDeviceStateWifiConfiguring:
+             audio_service_.EnableVoiceProcessing(false);
+@@ -937,7 +1052,9 @@ void Application::Schedule(std::function<void()>&& callback) {
  void Application::AbortSpeaking(AbortReason reason) {
      ESP_LOGI(TAG, "Abort speaking");
      aborted_ = true;
@@ -582,7 +616,7 @@ index d69d43d..fd7871f 100644
          protocol_->SendAbortSpeaking(reason);
      }
  }
-@@ -1116,4 +1226,3 @@ void Application::ResetProtocol() {
+@@ -1116,4 +1233,3 @@ void Application::ResetProtocol() {
          protocol_.reset();
      });
  }
@@ -765,10 +799,37 @@ index 3692e0c..7231b08 100644
      std::unique_ptr<AssetStrategy> strategy_;
  
 diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
-index 350ac58..af48044 100644
+index 350ac58..36a9aeb 100644
 --- a/main/audio/audio_service.cc
 +++ b/main/audio/audio_service.cc
-@@ -124,7 +124,8 @@ void AudioService::Initialize(AudioCodec* codec) {
+@@ -1,6 +1,8 @@
+ #include "audio_service.h"
+ #include <esp_log.h>
++#include <esp_heap_caps.h>
+ #include <cstring>
++#include <algorithm>
+ 
+ #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
+     (esp_ae_rate_cvt_cfg_t)                                  \
+@@ -63,6 +65,17 @@ void AudioService::Initialize(AudioCodec* codec) {
+     codec_ = codec;
+     codec_->Start();
+ 
++    playback_psram_available_ = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
++    if (playback_psram_available_) {
++        max_playback_tasks_in_queue_ = OnlineAudioBufferSettings::kMaxBufferedFrames;
++        streaming_prebuffer_frames_ = OnlineAudioBufferSettings::kStartBufferedFrames;
++    }
++    streaming_prebuffer_target_frames_ = streaming_prebuffer_frames_;
++    ESP_LOGI(TAG, "Playback buffer: max=%u frames, prebuffer=%u frames, storage=%s",
++             static_cast<unsigned>(max_playback_tasks_in_queue_),
++             static_cast<unsigned>(streaming_prebuffer_frames_),
++             playback_psram_available_ ? "PSRAM" : "internal RAM");
++
+     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
+     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
+     if (opus_decoder_ == nullptr) {
+@@ -124,7 +137,8 @@ void AudioService::Initialize(AudioCodec* codec) {
  
  void AudioService::Start() {
      service_stopped_ = false;
@@ -778,7 +839,18 @@ index 350ac58..af48044 100644
  
      esp_timer_start_periodic(audio_power_timer_, 1000000);
  
-@@ -228,14 +229,35 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
+@@ -175,9 +189,7 @@ void AudioService::Stop() {
+ 
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     audio_encode_queue_.clear();
+-    audio_decode_queue_.clear();
+-    audio_playback_queue_.clear();
+-    audio_testing_queue_.clear();
++    ResetPlaybackStateLocked();
+     audio_queue_cv_.notify_all();
+ }
+ 
+@@ -228,14 +240,35 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
  }
  
  void AudioService::AudioInputTask() {
@@ -816,7 +888,420 @@ index 350ac58..af48044 100644
          if (audio_input_need_warmup_) {
              audio_input_need_warmup_ = false;
              vTaskDelay(pdMS_TO_TICKS(120));
-@@ -684,7 +706,9 @@ void AudioService::CheckAndUpdateAudioPowerState() {
+@@ -290,16 +323,68 @@ void AudioService::AudioInputTask() {
+ void AudioService::AudioOutputTask() {
+     while (true) {
+         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+-        audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
++        bool prebuffer_timed_out = false;
++        while (!service_stopped_) {
++            audio_queue_cv_.wait(lock, [this]() {
++                return !audio_playback_queue_.empty() || service_stopped_;
++            });
++            if (service_stopped_) {
++                break;
++            }
++
++            const auto& next = audio_playback_queue_.front();
++            const bool needs_prebuffer = next->streaming && streaming_playback_active_ &&
++                !streaming_playback_started_ &&
++                audio_playback_queue_.size() < streaming_prebuffer_target_frames_;
++            if (!needs_prebuffer) {
++                break;
++            }
++
++            if (streaming_prebuffer_started_at_.time_since_epoch().count() == 0) {
++                streaming_prebuffer_started_at_ = std::chrono::steady_clock::now();
++            }
++            const auto deadline = streaming_prebuffer_started_at_ +
++                std::chrono::milliseconds(OnlineAudioBufferSettings::kStartBufferTimeoutMs +
++                    (streaming_prebuffer_target_frames_ - streaming_prebuffer_frames_) *
++                    OPUS_FRAME_DURATION_MS);
++            const bool ready = audio_queue_cv_.wait_until(lock, deadline, [this]() {
++                return service_stopped_ || audio_playback_queue_.empty() ||
++                    !audio_playback_queue_.front()->streaming || !streaming_playback_active_ ||
++                    streaming_playback_started_ ||
++                    audio_playback_queue_.size() >= streaming_prebuffer_target_frames_;
++            });
++            if (!ready && !audio_playback_queue_.empty()) {
++                prebuffer_timed_out = true;
++                break;
++            }
++        }
+         if (service_stopped_) {
+             break;
+         }
++        if (audio_playback_queue_.empty()) {
++            continue;
++        }
+ 
++        const size_t buffered_frames = audio_playback_queue_.size();
+         auto task = std::move(audio_playback_queue_.front());
+         audio_playback_queue_.pop_front();
++        const bool starting_stream = task->streaming && !streaming_playback_started_;
++        if (starting_stream) {
++            streaming_playback_started_ = true;
++            streaming_prebuffer_started_at_ = {};
++        }
++        output_in_flight_ = true;
+         audio_queue_cv_.notify_all();
+         lock.unlock();
+ 
++        if (starting_stream && prebuffer_timed_out) {
++            ESP_LOGW(TAG, "Streaming playback prebuffer timed out with %u frame(s)",
++                     static_cast<unsigned>(buffered_frames));
++        } else if (starting_stream) {
++            ESP_LOGI(TAG, "Streaming playback started with %u buffered frames",
++                     static_cast<unsigned>(buffered_frames));
++        }
++
+         if (!codec_->output_enabled()) {
+             esp_timer_stop(audio_power_timer_);
+             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+@@ -312,13 +397,41 @@ void AudioService::AudioOutputTask() {
+         last_output_time_ = std::chrono::steady_clock::now();
+         debug_statistics_.playback_count++;
+ 
++        bool underrun = false;
++        uint32_t underrun_count = 0;
++        size_t rebuffer_target = 0;
++        lock.lock();
++        if (task->generation == playback_generation_) {
+ #if CONFIG_USE_SERVER_AEC
+-        /* Record the timestamp for server AEC */
+-        if (task->timestamp > 0) {
+-            lock.lock();
+-            timestamp_queue_.push_back(task->timestamp);
+-        }
++            /* Record the timestamp for server AEC */
++            if (task->timestamp > 0) {
++                timestamp_queue_.push_back(task->timestamp);
++            }
+ #endif
++            const bool streaming_pipeline_empty = audio_playback_queue_.empty() &&
++                audio_decode_queue_.empty() && !decode_in_flight_;
++            if (task->streaming && streaming_pipeline_empty) {
++                streaming_playback_started_ = false;
++                streaming_prebuffer_started_at_ = {};
++                if (streaming_playback_active_) {
++                    underrun = true;
++                    underrun_count = ++streaming_underrun_count_;
++                    if (streaming_prebuffer_target_frames_ < max_playback_tasks_in_queue_) {
++                        ++streaming_prebuffer_target_frames_;
++                    }
++                    rebuffer_target = streaming_prebuffer_target_frames_;
++                }
++            }
++        }
++        output_in_flight_ = false;
++        audio_queue_cv_.notify_all();
++        lock.unlock();
++
++        if (underrun) {
++            ESP_LOGW(TAG, "Streaming playback underrun (%lu total); rebuffering to %u frames",
++                     static_cast<unsigned long>(underrun_count),
++                     static_cast<unsigned>(rebuffer_target));
++        }
+     }
+ 
+     ESP_LOGW(TAG, "Audio output task stopped");
+@@ -330,66 +443,84 @@ void AudioService::OpusCodecTask() {
+         audio_queue_cv_.wait(lock, [this]() {
+             return service_stopped_ ||
+                 (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) ||
+-                (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
++                (!audio_decode_queue_.empty() && audio_playback_queue_.size() < max_playback_tasks_in_queue_);
+         });
+         if (service_stopped_) {
+             break;
+         }
+ 
+         /* Decode the audio from decode queue */
+-        if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
++        if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < max_playback_tasks_in_queue_) {
+             auto packet = std::move(audio_decode_queue_.front());
+             audio_decode_queue_.pop_front();
++            decode_in_flight_ = true;
++            const uint32_t generation = playback_generation_;
++            DrainStreamingReorderQueueLocked(!streaming_playback_active_);
+             audio_queue_cv_.notify_all();
+             lock.unlock();
+ 
+             auto task = std::make_unique<AudioTask>();
+             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+             task->timestamp = packet->timestamp;
++            task->generation = generation;
++            task->streaming = packet->streaming;
+ 
+             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
++            bool decoded = false;
+             if (opus_decoder_ != nullptr) {
+                 task->pcm.resize(decoder_frame_size_);
+-                esp_audio_dec_in_raw_t raw = {
+-                    .buffer = (uint8_t *)(packet->payload.data()),
+-                    .len = (uint32_t)(packet->payload.size()),
+-                    .consumed = 0,
+-                    .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+-                };
+-                esp_audio_dec_out_frame_t out_frame = {
+-                    .buffer = (uint8_t *)(task->pcm.data()),
+-                    .len = (uint32_t)(task->pcm.size() * sizeof(int16_t)),
+-                    .decoded_size = 0,
+-                };
+-                esp_audio_dec_info_t dec_info = {};
+-                std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+-                auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
+-                decoder_lock.unlock();
+-                if (ret == ESP_AUDIO_ERR_OK) {
+-                    task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+-                    if (decoder_sample_rate_ != codec_->output_sample_rate() && output_resampler_ != nullptr) {
+-                        uint32_t target_size = 0;
+-                        esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task->pcm.size(), &target_size);
+-                        std::vector<int16_t> resampled(target_size);
+-                        uint32_t actual_output = target_size;
+-                        esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task->pcm.data(), task->pcm.size(),
+-                                                (esp_ae_sample_t)resampled.data(), &actual_output);
+-                        resampled.resize(actual_output);
+-                        task->pcm = std::move(resampled);
+-                    }
+-                    lock.lock();
+-                    audio_playback_queue_.push_back(std::move(task));
+-                    audio_queue_cv_.notify_all();
+-                    debug_statistics_.decode_count++;
++                if (packet->packet_loss) {
++                    std::fill(task->pcm.begin(), task->pcm.end(), 0);
++                    decoded = true;
+                 } else {
+-                    ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
+-                    lock.lock();
++                    esp_audio_dec_in_raw_t raw = {
++                        .buffer = packet->payload.data(),
++                        .len = (uint32_t)(packet->payload.size()),
++                        .consumed = 0,
++                        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
++                    };
++                    esp_audio_dec_out_frame_t out_frame = {
++                        .buffer = (uint8_t *)(task->pcm.data()),
++                        .len = (uint32_t)(task->pcm.size() * sizeof(int16_t)),
++                        .decoded_size = 0,
++                    };
++                    esp_audio_dec_info_t dec_info = {};
++                    std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
++                    auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
++                    decoder_lock.unlock();
++                    if (ret == ESP_AUDIO_ERR_OK && out_frame.decoded_size > 0) {
++                        task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
++                        decoded = true;
++                    } else {
++                        ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
++                    }
++                }
++
++                if (decoded && decoder_sample_rate_ != codec_->output_sample_rate() && output_resampler_ != nullptr) {
++                    uint32_t target_size = 0;
++                    esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task->pcm.size(), &target_size);
++                    std::vector<int16_t> resampled(target_size);
++                    uint32_t actual_output = target_size;
++                    esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task->pcm.data(), task->pcm.size(),
++                                            (esp_ae_sample_t)resampled.data(), &actual_output);
++                    resampled.resize(actual_output);
++                    task->pcm = std::move(resampled);
+                 }
+             } else {
+                 ESP_LOGE(TAG, "Audio decoder is not configured");
+-                lock.lock();
+             }
++
++            lock.lock();
++            if (decoded && generation == playback_generation_ && !service_stopped_) {
++                if (task->streaming && !streaming_playback_started_ &&
++                    audio_playback_queue_.empty()) {
++                    streaming_prebuffer_started_at_ = std::chrono::steady_clock::now();
++                }
++                audio_playback_queue_.push_back(std::move(task));
++            }
++            decode_in_flight_ = false;
+             debug_statistics_.decode_count++;
++            audio_queue_cv_.notify_all();
+         }
+         /* Encode the audio to send queue */
+         if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+@@ -504,19 +635,109 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
+ }
+ 
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
++    if (packet == nullptr) {
++        return false;
++    }
++
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
++    if (packet->streaming && !streaming_playback_active_) {
++        return false;
++    }
++
++    if (packet->has_sequence) {
++        if (audio_decode_queue_.size() + streaming_reorder_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
++            return false;
++        }
++        if (streaming_sequence_initialized_ &&
++            static_cast<int32_t>(packet->sequence - expected_streaming_sequence_) < 0) {
++            ESP_LOGD(TAG, "Dropping late audio packet %lu (expected %lu)",
++                     static_cast<unsigned long>(packet->sequence),
++                     static_cast<unsigned long>(expected_streaming_sequence_));
++            return false;
++        }
++
++        const uint32_t sequence = packet->sequence;
++        auto [it, inserted] = streaming_reorder_queue_.emplace(sequence, std::move(packet));
++        if (!inserted) {
++            ESP_LOGD(TAG, "Dropping duplicate audio packet %lu", static_cast<unsigned long>(sequence));
++            return false;
++        }
++        DrainStreamingReorderQueueLocked(false);
++        audio_queue_cv_.notify_all();
++        return true;
++    }
++
+     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+         if (wait) {
+-            audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
++            audio_queue_cv_.wait(lock, [this]() {
++                return service_stopped_ || audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
++            });
+         } else {
+             return false;
+         }
+     }
++    if (service_stopped_) {
++        return false;
++    }
+     audio_decode_queue_.push_back(std::move(packet));
+     audio_queue_cv_.notify_all();
+     return true;
+ }
+ 
++void AudioService::DrainStreamingReorderQueueLocked(bool force) {
++    if (!streaming_sequence_initialized_) {
++        if (streaming_reorder_queue_.empty() ||
++            (!force && streaming_reorder_queue_.size() <
++                OnlineAudioBufferSettings::kReorderWindowFrames)) {
++            return;
++        }
++        expected_streaming_sequence_ = streaming_reorder_queue_.begin()->first;
++        streaming_sequence_initialized_ = true;
++    }
++
++    while (!streaming_reorder_queue_.empty() &&
++           audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE) {
++        auto expected = streaming_reorder_queue_.find(expected_streaming_sequence_);
++        if (expected != streaming_reorder_queue_.end()) {
++            audio_decode_queue_.push_back(std::move(expected->second));
++            streaming_reorder_queue_.erase(expected);
++            ++expected_streaming_sequence_;
++            continue;
++        }
++
++        auto next = streaming_reorder_queue_.begin();
++        if (static_cast<int32_t>(next->first - expected_streaming_sequence_) < 0) {
++            streaming_reorder_queue_.erase(next);
++            continue;
++        }
++        if (!force && streaming_reorder_queue_.size() <
++            OnlineAudioBufferSettings::kReorderWindowFrames) {
++            break;
++        }
++
++        const uint32_t missing = next->first - expected_streaming_sequence_;
++        if (missing > OnlineAudioBufferSettings::kMaxConcealmentFrames) {
++            ESP_LOGW(TAG, "Audio sequence jumped by %lu packets; resynchronizing at %lu",
++                     static_cast<unsigned long>(missing),
++                     static_cast<unsigned long>(next->first));
++            expected_streaming_sequence_ = next->first;
++            continue;
++        }
++
++        ESP_LOGW(TAG, "Audio packet %lu missing; inserting a concealment frame",
++                 static_cast<unsigned long>(expected_streaming_sequence_));
++        auto loss = std::make_unique<AudioStreamPacket>();
++        loss->sample_rate = next->second->sample_rate;
++        loss->frame_duration = next->second->frame_duration;
++        loss->sequence = expected_streaming_sequence_;
++        loss->has_sequence = true;
++        loss->streaming = true;
++        loss->packet_loss = true;
++        audio_decode_queue_.push_back(std::move(loss));
++        ++expected_streaming_sequence_;
++    }
++}
++
+ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+     if (audio_send_queue_.empty()) {
+@@ -655,18 +876,40 @@ void AudioService::PlaySound(const std::string_view& ogg) {
+ 
+ bool AudioService::IsIdle() {
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
++    return audio_encode_queue_.empty() && IsPlaybackDrainedLocked() && audio_testing_queue_.empty();
+ }
+ 
+ void AudioService::WaitForPlaybackQueueEmpty() {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+-    audio_queue_cv_.wait(lock, [this]() { 
+-        return service_stopped_ || (audio_decode_queue_.empty() && audio_playback_queue_.empty()); 
++    audio_queue_cv_.wait(lock, [this]() {
++        return service_stopped_ || IsPlaybackDrainedLocked();
+     });
+ }
+ 
++void AudioService::BeginStreamingPlayback() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    ResetPlaybackStateLocked();
++    streaming_playback_active_ = true;
++    audio_queue_cv_.notify_all();
++    ESP_LOGI(TAG, "Streaming playback buffer opened (target=%u frames)",
++             static_cast<unsigned>(streaming_prebuffer_target_frames_));
++}
++
++void AudioService::EndStreamingPlayback() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    DrainStreamingReorderQueueLocked(true);
++    streaming_playback_active_ = false;
++    audio_queue_cv_.notify_all();
++}
++
+ void AudioService::ResetDecoder() {
+     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    ResetPlaybackStateLocked();
++    audio_queue_cv_.notify_all();
++}
++
++void AudioService::ResetPlaybackStateLocked() {
++    ++playback_generation_;
+     std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+     if (opus_decoder_ != nullptr) {
+         esp_opus_dec_reset(opus_decoder_);
+@@ -676,7 +919,18 @@ void AudioService::ResetDecoder() {
+     audio_decode_queue_.clear();
+     audio_playback_queue_.clear();
+     audio_testing_queue_.clear();
+-    audio_queue_cv_.notify_all();
++    streaming_reorder_queue_.clear();
++    streaming_playback_active_ = false;
++    streaming_playback_started_ = false;
++    streaming_sequence_initialized_ = false;
++    expected_streaming_sequence_ = 0;
++    streaming_underrun_count_ = 0;
++    streaming_prebuffer_started_at_ = {};
++}
++
++bool AudioService::IsPlaybackDrainedLocked() const {
++    return audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
++        streaming_reorder_queue_.empty() && !decode_in_flight_ && !output_in_flight_;
+ }
+ 
+ void AudioService::CheckAndUpdateAudioPowerState() {
+@@ -684,7 +938,9 @@ void AudioService::CheckAndUpdateAudioPowerState() {
      auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
      auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
      if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
@@ -828,10 +1313,41 @@ index 350ac58..af48044 100644
      if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
          // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
 diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
-index 99db546..97238f7 100644
+index 99db546..4e7877e 100644
 --- a/main/audio/audio_service.h
 +++ b/main/audio/audio_service.h
-@@ -51,6 +51,7 @@
+@@ -3,6 +3,7 @@
+ 
+ #include <memory>
+ #include <deque>
++#include <map>
+ #include <condition_variable>
+ #include <chrono>
+ #include <mutex>
+@@ -38,12 +39,21 @@
+ 
+ #define OPUS_FRAME_DURATION_MS 60
+ #define MAX_ENCODE_TASKS_IN_QUEUE 2
+-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+ #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+ #define AUDIO_TESTING_MAX_DURATION_MS 10000
+ #define MAX_TIMESTAMPS_IN_QUEUE 3
+ 
++// Online TTS jitter-buffer tuning. Frame counts use 60 ms Opus frames.
++struct OnlineAudioBufferSettings {
++    static constexpr size_t kMaxBufferedFrames = 10;       // 600 ms in PSRAM
++    static constexpr size_t kStartBufferedFrames = 6;      // 360 ms before playback
++    static constexpr size_t kReorderWindowFrames = 6;      // wait up to 360 ms for late UDP
++    static constexpr size_t kMaxConcealmentFrames = 3;     // resync after 180 ms of loss
++    static constexpr uint32_t kStartBufferTimeoutMs = 750;
++    static constexpr size_t kMaxFramesWithoutPsram = 2;
++};
++
+ #define AUDIO_POWER_TIMEOUT_MS 15000
+ #define AUDIO_POWER_CHECK_INTERVAL_MS 1000
+ 
+@@ -51,6 +61,7 @@
  #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
  #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
  #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
@@ -839,8 +1355,56 @@ index 99db546..97238f7 100644
  
  #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                   \
      ((duration_ms) == 5 ? ESP_OPUS_ENC_FRAME_DURATION_5_MS :      \
-@@ -192,4 +193,4 @@ private:
+@@ -92,7 +103,9 @@ enum AudioTaskType {
+ struct AudioTask {
+     AudioTaskType type;
+     std::vector<int16_t> pcm;
+-    uint32_t timestamp;
++    uint32_t timestamp = 0;
++    uint32_t generation = 0;
++    bool streaming = false;
+ };
+ 
+ struct DebugStatistics {
+@@ -131,6 +144,8 @@ public:
+     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
+     void PlaySound(const std::string_view& sound);
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
++    void BeginStreamingPlayback();
++    void EndStreamingPlayback();
+     void ResetDecoder();
+     void SetModelsList(srmodel_list_t* models_list);
+ 
+@@ -171,6 +186,22 @@ private:
+     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
+     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
+     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
++    std::map<uint32_t, std::unique_ptr<AudioStreamPacket>> streaming_reorder_queue_;
++    size_t max_playback_tasks_in_queue_ = OnlineAudioBufferSettings::kMaxFramesWithoutPsram;
++    size_t streaming_prebuffer_frames_ = 1;
++    size_t streaming_prebuffer_target_frames_ = 1;
++    bool playback_psram_available_ = false;
++    bool decode_in_flight_ = false;
++    bool output_in_flight_ = false;
++    uint32_t playback_generation_ = 0;
++
++    // Network playback jitter state. All fields are protected by audio_queue_mutex_.
++    bool streaming_playback_active_ = false;
++    bool streaming_playback_started_ = false;
++    bool streaming_sequence_initialized_ = false;
++    uint32_t expected_streaming_sequence_ = 0;
++    uint32_t streaming_underrun_count_ = 0;
++    std::chrono::steady_clock::time_point streaming_prebuffer_started_at_;
+     // For server AEC
+     std::deque<uint32_t> timestamp_queue_;
+ 
+@@ -190,6 +221,9 @@ private:
+     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+     void SetDecodeSampleRate(int sample_rate, int frame_duration);
      void CheckAndUpdateAudioPowerState();
++    void DrainStreamingReorderQueueLocked(bool force);
++    void ResetPlaybackStateLocked();
++    bool IsPlaybackDrainedLocked() const;
  };
  
 -#endif
@@ -1136,3 +1700,112 @@ index 1e5d687..1d25efc 100644
      std::string GetActivationPayload();
      std::unique_ptr<Http> SetupHttp();
  };
+diff --git a/main/protocols/mqtt_protocol.cc b/main/protocols/mqtt_protocol.cc
+index 94d9d12..ea41358 100644
+--- a/main/protocols/mqtt_protocol.cc
++++ b/main/protocols/mqtt_protocol.cc
+@@ -256,13 +256,6 @@ bool MqttProtocol::OpenAudioChannel() {
+         }
+         uint32_t timestamp = ntohl(*(uint32_t*)&data[8]);
+         uint32_t sequence = ntohl(*(uint32_t*)&data[12]);
+-        if (sequence < remote_sequence_) {
+-            ESP_LOGW(TAG, "Received audio packet with old sequence: %lu, expected: %lu", sequence, remote_sequence_);
+-            return;
+-        }
+-        if (sequence != remote_sequence_ + 1) {
+-            ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu", sequence, remote_sequence_ + 1);
+-        }
+ 
+         size_t decrypted_size = data.size() - aes_nonce_.size();
+         size_t nc_off = 0;
+@@ -273,6 +266,9 @@ bool MqttProtocol::OpenAudioChannel() {
+         packet->sample_rate = server_sample_rate_;
+         packet->frame_duration = server_frame_duration_;
+         packet->timestamp = timestamp;
++        packet->sequence = sequence;
++        packet->has_sequence = true;
++        packet->streaming = true;
+         packet->payload.resize(decrypted_size);
+         int ret = mbedtls_aes_crypt_ctr(&aes_ctx_, decrypted_size, &nc_off, nonce, stream_block, encrypted, (uint8_t*)packet->payload.data());
+         if (ret != 0) {
+@@ -282,7 +278,6 @@ bool MqttProtocol::OpenAudioChannel() {
+         if (on_incoming_audio_ != nullptr) {
+             on_incoming_audio_(std::move(packet));
+         }
+-        remote_sequence_ = sequence;
+         last_incoming_time_ = std::chrono::steady_clock::now();
+     });
+ 
+@@ -361,7 +356,6 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
+     mbedtls_aes_init(&aes_ctx_);
+     mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)DecodeHexString(key).c_str(), 128);
+     local_sequence_ = 0;
+-    remote_sequence_ = 0;
+     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
+ }
+ 
+diff --git a/main/protocols/mqtt_protocol.h b/main/protocols/mqtt_protocol.h
+index 90963db..e7a00b9 100644
+--- a/main/protocols/mqtt_protocol.h
++++ b/main/protocols/mqtt_protocol.h
+@@ -50,7 +50,6 @@ private:
+     std::string udp_server_;
+     int udp_port_;
+     uint32_t local_sequence_;
+-    uint32_t remote_sequence_;
+     esp_timer_handle_t reconnect_timer_;
+ 
+     bool StartMqttClient(bool report_error=false);
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 28ef604..cf548cc 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -12,6 +12,10 @@ struct AudioStreamPacket {
+     int frame_duration = 0;
+     uint32_t timestamp = 0;
+     std::vector<uint8_t> payload;
++    uint32_t sequence = 0;
++    bool has_sequence = false;
++    bool streaming = false;
++    bool packet_loss = false;
+ };
+ 
+ struct BinaryProtocol2 {
+@@ -95,4 +99,3 @@ protected:
+ };
+ 
+ #endif // PROTOCOL_H
+-
+diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index f0cc034..2be0823 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -123,7 +123,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
+                         .sample_rate = server_sample_rate_,
+                         .frame_duration = server_frame_duration_,
+                         .timestamp = bp2->timestamp,
+-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)
++                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size),
++                        .streaming = true
+                     }));
+                 } else if (version_ == 3) {
+                     BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
+@@ -134,14 +135,16 @@ bool WebsocketProtocol::OpenAudioChannel() {
+                         .sample_rate = server_sample_rate_,
+                         .frame_duration = server_frame_duration_,
+                         .timestamp = 0,
+-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)
++                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size),
++                        .streaming = true
+                     }));
+                 } else {
+                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
+                         .sample_rate = server_sample_rate_,
+                         .frame_duration = server_frame_duration_,
+                         .timestamp = 0,
+-                        .payload = std::vector<uint8_t>((uint8_t*)data, (uint8_t*)data + len)
++                        .payload = std::vector<uint8_t>((uint8_t*)data, (uint8_t*)data + len),
++                        .streaming = true
+                     }));
+                 }
+             }
