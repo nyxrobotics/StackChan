@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/setup_common.sh"
 RUN_UPGRADE=0
 INSTALL_ZH_TTS=0
 INSTALL_EN_TTS=0
-REBOOT_MODE="ask"
+REBOOT_MODE="no"
 
 usage() {
     cat <<'EOF'
@@ -21,8 +21,8 @@ Options:
   --with-en-tts    Install the optional English MeloTTS models.
   --with-all-tts   Install all optional MeloTTS language models.
   --upgrade        Run apt upgrade after registering the apt repository.
-  --reboot         Reboot automatically after setup.
-  --no-reboot      Do not reboot after setup.
+  --reboot         Request a Linux reboot after setup. Some modules power off.
+  --no-reboot      Do not reboot after setup. This is the default.
   -h, --help       Show this help.
 EOF
 }
@@ -70,25 +70,7 @@ maybe_reboot() {
             reboot
             ;;
         no)
-            warn "Reboot skipped. Run 'reboot' on the Module LLM before starting StackChan."
-            ;;
-        ask)
-            if [ -t 0 ]; then
-                local answer
-                read -r -p "Reboot Module LLM now? [Y/n]: " answer
-                answer="${answer:-y}"
-                case "${answer,,}" in
-                    y|yes)
-                        info "Rebooting Module LLM..."
-                        reboot
-                        ;;
-                    *)
-                        warn "Reboot skipped. Run 'reboot' on the Module LLM before starting StackChan."
-                        ;;
-                esac
-            else
-                warn "Non-interactive shell: reboot skipped. Run 'reboot' on the Module LLM before starting StackChan."
-            fi
+            ok "Reboot skipped. Installed services are already active."
             ;;
     esac
 }

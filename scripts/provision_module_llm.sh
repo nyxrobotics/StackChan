@@ -53,6 +53,7 @@ Targets:
   vad        Install VAD support and model.
   melotts    Install MeloTTS fallback support and models.
   openjtalk  Install OpenJTalk, tohoku voice, and StackChan TTS helper.
+  watchdog   Install automatic llm-sys hang recovery.
   verify     Verify installed packages and the OpenJTalk helper.
 
 Options:
@@ -60,8 +61,8 @@ Options:
   --with-en-tts    Install the optional English MeloTTS models.
   --with-all-tts   Install all optional MeloTTS language models.
   --upgrade        Run apt upgrade during Module LLM setup.
-  --reboot         Reboot automatically after setup.
-  --no-reboot      Do not reboot after setup.
+  --reboot         Request a Linux reboot after setup. Some modules power off.
+  --no-reboot      Do not reboot after setup. This is the default.
   -h, --help       Show this help.
 
 Examples:
@@ -85,7 +86,7 @@ TARGET="all"
 RUN_UPGRADE=0
 INSTALL_ZH_TTS=0
 INSTALL_EN_TTS=0
-REBOOT_MODE="ask"
+REBOOT_MODE="no"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -307,6 +308,9 @@ target_script() {
         openjtalk)
             echo "setup_openjtalk.sh"
             ;;
+        watchdog|llm-sys-watchdog)
+            echo "setup_llm_sys_watchdog.sh"
+            ;;
         verify)
             echo "verify_setup.sh"
             ;;
@@ -352,7 +356,7 @@ build_target_args() {
                 die "--upgrade is only valid for all or repo targets."
             fi
             ;;
-        runtime|whisper|qwen3|vad|openjtalk)
+        runtime|whisper|qwen3|vad|openjtalk|watchdog|llm-sys-watchdog)
             if [ "$RUN_UPGRADE" -eq 1 ]; then
                 die "--upgrade is only valid for all or repo targets."
             fi
@@ -438,10 +442,31 @@ check_adb() {
 }
 
 push_module_scripts() {
-    [ -f "${MODULE_SCRIPT_DIR}/setup_llm_module.sh" ] \
-        || die "Missing ${MODULE_SCRIPT_DIR}/setup_llm_module.sh"
-    [ -f "${MODULE_SCRIPT_DIR}/openjtalk_tts.sh" ] \
-        || die "Missing ${MODULE_SCRIPT_DIR}/openjtalk_tts.sh"
+    local required_files=(
+        setup_common.sh
+        setup_llm_module.sh
+        setup_repo.sh
+        setup_runtime.sh
+        setup_whisper.sh
+        setup_qwen3.sh
+        setup_vad.sh
+        setup_melotts.sh
+        setup_openjtalk.sh
+        setup_llm_sys_watchdog.sh
+        verify_setup.sh
+        openjtalk_tts.sh
+        stackflow_pcm_ready.py
+        stackchan_vad_pcm_bridge.py
+        stackchan-vad-pcm-bridge.service
+        stackchan_llm_sys_watchdog.py
+        stackchan-llm-sys-watchdog.service
+        llm-sys-stackchan-watchdog.conf
+    )
+    local required_file
+    for required_file in "${required_files[@]}"; do
+        [ -f "${MODULE_SCRIPT_DIR}/${required_file}" ] \
+            || die "Missing ${MODULE_SCRIPT_DIR}/${required_file}"
+    done
 
     info "Transferring Module LLM setup scripts..."
     adb_shell "mkdir -m 0700 '$REMOTE_DIR'" >/dev/null \
@@ -480,6 +505,16 @@ run_module_setup() {
 
 maybe_reboot() {
     echo ""
+
+    case "$TARGET" in
+        verify|watchdog|llm-sys-watchdog)
+            if [ "$REBOOT_MODE" != "yes" ]; then
+                ok "Reboot is not required for the ${TARGET} target."
+                return
+            fi
+            ;;
+    esac
+
     case "$REBOOT_MODE" in
         yes)
             info "Rebooting Module LLM..."
@@ -490,29 +525,7 @@ maybe_reboot() {
             fi
             ;;
         no)
-            warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
-            ;;
-        ask)
-            if [ -t 0 ]; then
-                local answer
-                read -r -p "Reboot Module LLM now? [Y/n]: " answer
-                answer="${answer:-y}"
-                case "${answer,,}" in
-                    y|yes)
-                        info "Rebooting Module LLM..."
-                        if adb_shell "reboot"; then
-                            ok "Reboot command sent"
-                        else
-                            warn "ADB disconnected before reboot confirmation; verify that the Module LLM restarted."
-                        fi
-                        ;;
-                    *)
-                        warn "Reboot skipped. Run 'adb shell reboot' before starting StackChan."
-                        ;;
-                esac
-            else
-                warn "Non-interactive shell: reboot skipped. Run 'adb shell reboot' before starting StackChan."
-            fi
+            ok "Reboot skipped. Installed services are already active."
             ;;
     esac
 }
@@ -539,10 +552,12 @@ main() {
     echo " Setup complete"
     echo "======================================================"
     echo ""
-    echo "Next steps:"
-    echo "  1. After the Module LLM reboots, attach it to the CoreS3."
+    echo "The ${TARGET} target is active now."
+    echo "Next steps for a full setup:"
+    echo "  1. Disconnect the Module LLM USB cable and attach the module to the CoreS3."
     echo "  2. Flash the StackChan firmware."
-    echo "  3. Power on StackChan; the Module LLM pipeline will start automatically."
+    echo "  3. Power on the stack and open AI Agent from the face or its saved startup setting."
+    echo "If a full power cycle is needed, use the hardware power switch."
     echo ""
 }
 

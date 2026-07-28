@@ -72,8 +72,8 @@ validate_tohoku_copyright() {
 }
 
 install_tohoku_voice() {
-    local voice_file="/opt/stackchan/voices/tohoku-f01-neutral.htsvoice"
-    local copyright_file="/opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt"
+    local voice_file="$TOHOKU_VOICE_TARGET"
+    local copyright_file="$TOHOKU_COPYRIGHT_TARGET"
 
     info "Checking tohoku-f01 neutral voice..."
     mkdir -p /opt/stackchan/voices

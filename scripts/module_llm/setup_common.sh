@@ -12,6 +12,8 @@ STACKFLOW_REPO="deb [arch=arm64 signed-by=/etc/apt/keyrings/StackFlow.gpg] https
 
 TOHOKU_VOICE_URL="${TOHOKU_VOICE_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice}"
 TOHOKU_COPYRIGHT_URL="${TOHOKU_COPYRIGHT_URL:-https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt}"
+TOHOKU_VOICE_TARGET="/opt/stackchan/voices/tohoku-f01-neutral.htsvoice"
+TOHOKU_COPYRIGHT_TARGET="/opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt"
 
 OPENJTALK_HELPER_SOURCE="${STACKCHAN_OPENJTALK_HELPER:-${SCRIPT_DIR}/openjtalk_tts.sh}"
 OPENJTALK_HELPER_TARGET="/opt/stackchan/openjtalk_tts.sh"
@@ -410,6 +412,16 @@ ensure_qwen3_tokenizer_compat() (
     temporary_directory=""
     ok "Qwen3 tokenizer compatibility link: $QWEN3_TOKENIZER_COMPAT"
 )
+
+verify_qwen3_tokenizer_compat() {
+    [ -f "$QWEN3_TOKENIZER_SCRIPT" ] \
+        || die "Qwen3 tokenizer script was not found: $QWEN3_TOKENIZER_SCRIPT"
+    [ -L "$QWEN3_TOKENIZER_COMPAT" ] \
+        || die "Qwen3 tokenizer compatibility link is missing: $QWEN3_TOKENIZER_COMPAT"
+    [ "$(readlink -f "$QWEN3_TOKENIZER_COMPAT")" = "$QWEN3_TOKENIZER_SCRIPT" ] \
+        || die "Qwen3 tokenizer compatibility link has the wrong target."
+    ok "Qwen3 tokenizer compatibility link"
+}
 
 ensure_silero_vad_mode_config() (
     local config_path="${SILERO_VAD_MODE_CONFIG}"

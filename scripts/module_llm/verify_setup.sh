@@ -47,6 +47,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 require_root
+require_stackflow_repo
 
 packages=(
     "${PACKAGES_RUNTIME[@]}"
@@ -102,15 +103,63 @@ if [ "${#outdated[@]}" -gt 0 ]; then
     exit 1
 fi
 
-"$OPENJTALK_HELPER_TARGET" --check || die "OpenJTalk helper check failed."
+required_executables=(
+    "$OPENJTALK_HELPER_TARGET"
+    "$PCM_READY_HELPER_TARGET"
+    "$VAD_PCM_BRIDGE_TARGET"
+    "$LLM_SYS_WATCHDOG_TARGET"
+)
 
-ensure_qwen3_tokenizer_compat
+for executable in "${required_executables[@]}"; do
+    [ -x "$executable" ] || die "Required executable is missing: $executable"
+    ok "$executable"
+done
 
-if command -v systemctl >/dev/null 2>&1 &&
-    systemctl is-active --quiet llm-sys.service &&
-    systemctl is-active --quiet llm-audio.service &&
-    systemctl is-active --quiet llm-llm.service; then
-    ok "StackFlow services are running"
-else
-    warn "StackFlow core services are not all running. They should start after reboot."
+openjtalk_status="$("$OPENJTALK_HELPER_TARGET" --check)" \
+    || die "OpenJTalk helper check failed."
+printf '%s\n' "$openjtalk_status"
+[[ "$openjtalk_status" == *"voice=${TOHOKU_VOICE_TARGET}"* ]] \
+    || die "OpenJTalk is not using the tohoku-f01 neutral voice."
+[ -s "$TOHOKU_COPYRIGHT_TARGET" ] \
+    || die "Tohoku voice copyright file is missing: $TOHOKU_COPYRIGHT_TARGET"
+
+"$PCM_READY_HELPER_TARGET" --check \
+    || die "StackFlow PCM readiness helper check failed."
+"$VAD_PCM_BRIDGE_TARGET" --check \
+    || die "VAD PCM bridge check failed."
+"$LLM_SYS_WATCHDOG_TARGET" --check \
+    || die "llm-sys watchdog check failed."
+
+verify_qwen3_tokenizer_compat
+verify_silero_vad_mode_config
+
+command -v systemctl >/dev/null 2>&1 \
+    || die "systemd is required to verify Module LLM services."
+
+services=(
+    "${SERVICES_RUNTIME[@]}"
+    "${SERVICES_WHISPER[@]}"
+    "${SERVICES_QWEN3[@]}"
+    "${SERVICES_VAD[@]}"
+    "${SERVICES_MELOTTS[@]}"
+    "${SERVICES_LLM_SYS_WATCHDOG[@]}"
+)
+failed_services=()
+for service in "${services[@]}"; do
+    if systemctl is-enabled --quiet "$service" &&
+        systemctl is-active --quiet "$service"; then
+        ok "$service enabled and active"
+    else
+        error "$service is not both enabled and active"
+        failed_services+=("$service")
+    fi
+done
+
+if [ "${#failed_services[@]}" -gt 0 ]; then
+    echo ""
+    error "Service verification failed:"
+    printf '  - %s\n' "${failed_services[@]}"
+    exit 1
 fi
+
+ok "Module LLM environment verification completed"
