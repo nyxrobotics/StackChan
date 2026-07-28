@@ -39,6 +39,9 @@ private:
     // LLM → TTS pipeline
     void runLlmTts(const std::string& userText);
     void handleAbortRequest();
+    void startLocalMouthAnimation(const char* reason);
+    void stopLocalMouthAnimation(const char* reason);
+    void resetVadTracking();
     void finishLocalTurn(const char* reason);
     void resumePausedUnitsForNextTurn();
     std::string nextRequestId(const char* prefix);
@@ -51,11 +54,17 @@ private:
     bool                             inThinkBlock_ = false;
     bool                             micMuted_         = false;
     bool                             ttsDispatched_    = false;
+    bool                             localMouthAnimationActive_ = false;
     bool                             llmPausedForAbort_ = false;
     bool                             ttsPausedForAbort_ = false;
     std::atomic<bool>                abortRequested_   {false};  // 顔タッチ中断フラグ
     std::atomic<uint32_t>            requestSeq_        {0};
     int                              lastVadSpeech_    = -1;  // -1=未初期化, 0=silence, 1=speech
+    int64_t                          lastVadSpeechStartMs_ = 0;
+    int64_t                          lastVadSpeechEndMs_   = 0;
+    int64_t                          lastAsrResultMs_      = 0;
+    int64_t                          currentLlmStartedMs_  = 0;
+    bool                             llmFirstChunkSeen_    = false;
     std::string                      pendingTts_;
     std::string                      thinkTagCarry_;
     std::string                      currentLlmRequestId_;

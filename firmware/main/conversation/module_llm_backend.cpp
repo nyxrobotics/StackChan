@@ -9,10 +9,16 @@
 #include <cJSON.h>
 #include <cstdio>
 #include <cstring>
-#include <sstream>
+#include <limits>
 #include <string_view>
 
 static const char* TAG = "ModLLMBackend";
+
+static int logMs(int64_t value) {
+    if (value > std::numeric_limits<int>::max()) return std::numeric_limits<int>::max();
+    if (value < std::numeric_limits<int>::min()) return std::numeric_limits<int>::min();
+    return static_cast<int>(value);
+}
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -103,6 +109,7 @@ void ModuleLLMBackend::stop() {
         ESP_LOGD(TAG, "stop ignored: already inactive");
         return;
     }
+    stopLocalMouthAnimation("backend stop");
     ESP_LOGI(TAG, "stop requested");
     // The poll task remains alive and idles until start() activates it again.
 }
@@ -131,17 +138,51 @@ void ModuleLLMBackend::resumePausedUnitsForNextTurn() {
     }
 }
 
+void ModuleLLMBackend::startLocalMouthAnimation(const char* reason) {
+    if (localMouthAnimationActive_) {
+        ESP_LOGD(TAG, "Local mouth animation already active: %s", reason ? reason : "start");
+        return;
+    }
+
+    localMouthAnimationActive_ = true;
+    ESP_LOGI(TAG, "Local mouth animation start: %s", reason ? reason : "start");
+    hal_bridge::notify_local_tts_start();
+}
+
+void ModuleLLMBackend::stopLocalMouthAnimation(const char* reason) {
+    if (!localMouthAnimationActive_) {
+        ESP_LOGD(TAG, "Local mouth animation already idle: %s", reason ? reason : "end");
+        return;
+    }
+
+    localMouthAnimationActive_ = false;
+    ESP_LOGI(TAG, "Local mouth animation stop: %s", reason ? reason : "end");
+    hal_bridge::notify_local_tts_end();
+}
+
+void ModuleLLMBackend::resetVadTracking() {
+    lastVadSpeech_ = 0;
+    lastVadSpeechStartMs_ = 0;
+    lastVadSpeechEndMs_ = 0;
+}
+
 void ModuleLLMBackend::finishLocalTurn(const char* reason) {
     ESP_LOGI(TAG, "Local turn finished: %s", reason ? reason : "done");
-    hal_bridge::notify_local_tts_end();
+    stopLocalMouthAnimation(reason);
     pendingTts_.clear();
     inThinkBlock_ = false;
     thinkTagCarry_.clear();
     currentLlmRequestId_.clear();
     currentTtsRequestId_.clear();
-    if (client_) client_->resumeWhisper();
+    currentLlmStartedMs_ = 0;
+    llmFirstChunkSeen_ = false;
     micMuted_      = false;
     ttsDispatched_ = false;
+    resetVadTracking();
+    if (client_ && !client_->resumeWhisper()) {
+        ESP_LOGE(TAG, "Failed to reopen the local microphone input path");
+        if (onFailure_) onFailure_(BackendKind::ModuleLLM);
+    }
 }
 
 void ModuleLLMBackend::handleAbortRequest() {
@@ -437,19 +478,66 @@ void ModuleLLMBackend::pollLoop() {
             continue;
         }
 
-        // VAD 応答: 音声検出状態をログ出力
-        if (cJSON_IsString(wid) && strncmp(wid->valuestring, "vad.", 4) == 0) {
+        // VAD 応答: control ack (pause/work/setup) と実イベントを分ける。
+        const bool vadFrame =
+            (cJSON_IsString(wid) && strncmp(wid->valuestring, "vad", 3) == 0) ||
+            (cJSON_IsString(obj) && strncmp(obj->valuestring, "vad", 3) == 0);
+        if (vadFrame) {
             cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
-            // VAD は vad.bool を返す: data が true=speech / false=silence
-            if (cJSON_IsBool(data)) {
-                bool speech = cJSON_IsTrue(data);
+            auto handleVadState = [this](bool speech) {
+                // A VAD frame can already be in flight when the bridge pause
+                // takes effect. It belongs to the old turn and must not seed
+                // the next turn's state.
+                if (micMuted_) return;
+
+                const int previousSpeech = lastVadSpeech_;
+                const int64_t now = esp_timer_get_time() / 1000;
                 int speechInt = speech ? 1 : 0;
                 if (speechInt != lastVadSpeech_) {
                     lastVadSpeech_ = speechInt;
-                    ESP_LOGI(TAG, "VAD: %s", speech ? "SPEECH" : "silence");
+                    if (speech) {
+                        lastVadSpeechStartMs_ = now;
+                        ESP_LOGI(TAG, "VAD: SPEECH");
+                    } else {
+                        lastVadSpeechEndMs_ = now;
+                        int64_t speechMs = lastVadSpeechStartMs_ > 0 ? now - lastVadSpeechStartMs_ : -1;
+                        ESP_LOGI(TAG, "VAD: silence (speech_ms=%d)", logMs(speechMs));
+                    }
+                }
+                if (!speech && previousSpeech == 1 && !micMuted_ && currentLlmRequestId_.empty() && !ttsDispatched_) {
+                    startLocalMouthAnimation("vad silence");
+                } else if (speech && !micMuted_) {
+                    stopLocalMouthAnimation("vad speech resumed");
+                }
+            };
+
+            // VAD は vad.bool を返す: data が true=speech / false=silence
+            if (cJSON_IsBool(data)) {
+                handleVadState(cJSON_IsTrue(data));
+            } else if (cJSON_IsObject(data)) {
+                cJSON* delta = cJSON_GetObjectItemCaseSensitive(data, "delta");
+                cJSON* finish = cJSON_GetObjectItemCaseSensitive(data, "finish");
+                if (cJSON_IsBool(delta)) {
+                    handleVadState(cJSON_IsTrue(delta));
+                } else if (cJSON_IsBool(finish) && cJSON_IsTrue(finish)) {
+                    ESP_LOGI(TAG, "VAD event: finish");
+                } else {
+                    ESP_LOGD(TAG, "VAD ack/object ignored");
                 }
             } else if (cJSON_IsString(data)) {
-                ESP_LOGD(TAG, "VAD ack: %s", data->valuestring);
+                if (strcmp(data->valuestring, "None") == 0) {
+                    ESP_LOGD(TAG, "VAD ack ignored: None");
+                } else if (strcmp(data->valuestring, "true") == 0) {
+                    handleVadState(true);
+                } else if (strcmp(data->valuestring, "false") == 0) {
+                    handleVadState(false);
+                } else {
+                    ESP_LOGI(TAG, "VAD event: %s", data->valuestring);
+                }
+            } else {
+                ESP_LOGD(TAG, "VAD ack ignored: work_id=%s object=%s",
+                         cJSON_IsString(wid) ? wid->valuestring : "(none)",
+                         cJSON_IsString(obj) ? obj->valuestring : "(none)");
             }
             cJSON_Delete(root);
             continue;
@@ -461,16 +549,26 @@ void ModuleLLMBackend::pollLoop() {
             continue;
         }
 
-        // Whisper ASR result: work_id=whisper.xxxx, object=asr.utf-8
-        if (cJSON_IsString(wid) && cJSON_IsString(obj) &&
-            strncmp(wid->valuestring, "whisper.", 8) == 0 &&
-            strcmp(obj->valuestring, "asr.utf-8") == 0)
+        // Whisper/STT event. Ignore control acks (object/data None); only
+        // actual ASR payloads should start a local conversation turn.
+        if (cJSON_IsString(wid) &&
+            strncmp(wid->valuestring, "whisper.", 8) == 0)
         {
+            if (!cJSON_IsString(obj) || strcmp(obj->valuestring, "asr.utf-8") != 0) {
+                ESP_LOGD(TAG, "STT ack ignored: object=%s",
+                         cJSON_IsString(obj) ? obj->valuestring : "(none)");
+                cJSON_Delete(root);
+                continue;
+            }
+
             cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
             std::string text = cJSON_IsString(data) ? data->valuestring : "";
 
             if (!text.empty()) {
-                ESP_LOGI(TAG, "ASR: %s", text.c_str());
+                lastAsrResultMs_ = esp_timer_get_time() / 1000;
+                int64_t sinceVadEndMs = lastVadSpeechEndMs_ > 0 ? lastAsrResultMs_ - lastVadSpeechEndMs_ : -1;
+                ESP_LOGI(TAG, "ASR: %s (since_vad_end_ms=%d)",
+                         text.c_str(), logMs(sinceVadEndMs));
                 cJSON_Delete(root);
                 onAsrResult(text);
                 continue;
@@ -499,6 +597,13 @@ void ModuleLLMBackend::pollLoop() {
                 cJSON* finish = cJSON_GetObjectItemCaseSensitive(data_node, "finish");
                 std::string chunk = cJSON_IsString(delta) ? delta->valuestring : "";
                 bool done = cJSON_IsBool(finish) && cJSON_IsTrue(finish);
+                if (!llmFirstChunkSeen_ && !chunk.empty()) {
+                    llmFirstChunkSeen_ = true;
+                    if (currentLlmStartedMs_ > 0) {
+                        ESP_LOGI(TAG, "LLM first chunk latency: %d ms",
+                                 logMs(llmLastProgressMs - currentLlmStartedMs_));
+                    }
+                }
 
                 // <think>...</think> フィルタ
                 filterThinkTags(chunk, inThinkBlock_, thinkTagCarry_, done);
@@ -512,6 +617,10 @@ void ModuleLLMBackend::pollLoop() {
                     pendingTts_ += chunk;
                 }
                 if (done) {
+                    if (currentLlmStartedMs_ > 0) {
+                        ESP_LOGI(TAG, "LLM done latency: %d ms",
+                                 logMs(llmLastProgressMs - currentLlmStartedMs_));
+                    }
                     currentLlmRequestId_.clear();
                     if (!pendingTts_.empty()) {
                         uint8_t lang = client_->getTtsLang();
@@ -596,52 +705,57 @@ void ModuleLLMBackend::pollLoop() {
     ESP_LOGI(TAG, "pollLoop exit");
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// isAsrNoise — ノイズと判定する ASR 結果のフィルタ
-// 新しいパターンはここに追加する
-// ---------------------------------------------------------------------------
+static bool stripAsciiSuffix(std::string& text) {
+    if (text.empty()) return false;
+    char c = text.back();
+    if (c == '.' || c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+        text.pop_back();
+        return true;
+    }
+    return false;
+}
 
-static std::string stripTrailing(const std::string& s) {
-    std::string t = s;
-    while (!t.empty() && (t.back() == '.' || t.back() == ' ')) t.pop_back();
+static bool stripUtf8Suffix(std::string& text, const char* suffix) {
+    const std::string s(suffix);
+    if (text.size() < s.size()) return false;
+    if (text.compare(text.size() - s.size(), s.size(), s) != 0) return false;
+    text.erase(text.size() - s.size());
+    return true;
+}
+
+static std::string trimAsrBoundaryMarks(const std::string& text) {
+    std::string t = text;
+    while (stripAsciiSuffix(t) ||
+           stripUtf8Suffix(t, "\xE3\x80\x82")) {}
+    while (!t.empty() &&
+           (t.front() == ' ' || t.front() == '\n' || t.front() == '\r' || t.front() == '\t')) {
+        t.erase(0, 1);
+    }
     return t;
 }
 
-static bool isAsrNoise(const std::string& text) {
-    std::string t = stripTrailing(text);
-    if (t.empty()) return true;
+static bool isWrappedAsrAnnotation(const std::string& text) {
+    const std::string t = trimAsrBoundaryMarks(text);
+    static constexpr struct {
+        std::string_view open;
+        std::string_view close;
+    } kAnnotationDelimiters[] = {
+        {"(", ")"},
+        {"[", "]"},
+        {"\xEF\xBC\x88", "\xEF\xBC\x89"},  // full-width parentheses
+        {"\xE3\x80\x90", "\xE3\x80\x91"},  // lenticular brackets
+    };
 
-    // ---- パターン1: カッコだけ (笑) （笑） 等 ----
-    if (t.front() == '(' && t.back() == ')') return true;
-
-    static const std::string kOpen  = "\xEF\xBC\x88";
-    static const std::string kClose = "\xEF\xBC\x89";
-    if (t.size() >= 6 &&
-        t.substr(0, 3) == kOpen &&
-        t.substr(t.size() - 3) == kClose) return true;
-
-    // ---- パターン2: 同じフレーズの繰り返し（Whisper ハルシネーション）----
-    // 「きてきてきて...」「2、3、2、3、...」のように途中から繰り返すケースも検出する
-    // バイト列上で任意長のフレーズが5回以上連続する箇所があればノイズ
-    if (t.size() >= 20) {
-        // plen: 2〜20バイトを1バイト刻みで試す（ASCII+全角混在パターンも検出できる）
-        for (int plen = 2; plen <= 20; plen++) {
-            // 各開始位置を1バイト刻みで試す
-            for (size_t start = 0; start + plen * 5 <= t.size(); start++) {
-                const char* base = t.c_str() + start;
-                int repeat = 1;
-                size_t pos = start + plen;
-                while (pos + plen <= t.size() &&
-                       memcmp(base, t.c_str() + pos, plen) == 0) {
-                    repeat++;
-                    pos += plen;
-                }
-                if (repeat >= 5) return true;  // 5回以上連続 → ノイズ
-            }
+    for (const auto& delimiters : kAnnotationDelimiters) {
+        const size_t wrapperSize = delimiters.open.size() + delimiters.close.size();
+        if (t.size() <= wrapperSize ||
+            t.compare(0, delimiters.open.size(), delimiters.open) != 0 ||
+            t.compare(t.size() - delimiters.close.size(),
+                      delimiters.close.size(), delimiters.close) != 0) {
+            continue;
         }
+        return true;
     }
-
     return false;
 }
 
@@ -658,9 +772,9 @@ void ModuleLLMBackend::onAsrResult(const std::string& text) {
         ESP_LOGD(TAG, "onAsrResult: mic muted (LLM/TTS in progress), ignoring: %s", text.c_str());
         return;
     }
-
-    if (isAsrNoise(text)) {
-        ESP_LOGI(TAG, "onAsrResult: ignoring noise: %s", text.c_str());
+    if (isWrappedAsrAnnotation(text)) {
+        ESP_LOGI(TAG, "onAsrResult: ignoring non-speech annotation: %s", text.c_str());
+        stopLocalMouthAnimation("asr annotation");
         return;
     }
 
@@ -691,8 +805,9 @@ void ModuleLLMBackend::processText(const std::string& text) {
 // ---------------------------------------------------------------------------
 
 void ModuleLLMBackend::processAudio(const uint8_t* /*pcm*/, size_t /*len*/) {
-    // Module LLM's Whisper reads from sys.pcm (its own mic).
-    // ASR results arrive asynchronously via pollLoop().
+    // The Module LLM captures its own microphone. With VAD enabled, Whisper
+    // receives only the completed VAD-delimited PCM submitted by the bridge.
+    // ASR results arrive asynchronously through pollLoop().
     // Nothing to do here.
 }
 
@@ -702,11 +817,16 @@ void ModuleLLMBackend::processAudio(const uint8_t* /*pcm*/, size_t /*len*/) {
 // ---------------------------------------------------------------------------
 
 void ModuleLLMBackend::runLlmTts(const std::string& userText) {
-    if (!client_) { ESP_LOGE(TAG, "runLlmTts: client_ null"); return; }
+    if (!client_) {
+        ESP_LOGE(TAG, "runLlmTts: client_ null");
+        stopLocalMouthAnimation("client unavailable");
+        return;
+    }
 
     const std::string& llmWorkId = client_->llmWorkId();
     if (llmWorkId.empty()) {
         ESP_LOGW(TAG, "LLM work_id empty");
+        stopLocalMouthAnimation("llm unavailable");
         if (onFailure_) onFailure_(BackendKind::ModuleLLM);
         return;
     }
@@ -720,9 +840,16 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     currentTtsRequestId_.clear();
     micMuted_         = true;
     ttsDispatched_    = false;
-    client_->pauseWhisper();   // LLM推論〜TTS完了まで Whisper を停止
-    ESP_LOGI(TAG, "Local response start: begin mouth animation before LLM inference");
-    hal_bridge::notify_local_tts_start();  // LLM推論開始時点で口パクアニメ開始
+    resetVadTracking();
+    currentLlmStartedMs_ = esp_timer_get_time() / 1000;
+    llmFirstChunkSeen_ = false;
+    // ローカル応答の本体は LLM 推論からなので、口パクもここで開始する。
+    startLocalMouthAnimation("llm start");
+    if (!client_->pauseWhisper()) {
+        ESP_LOGE(TAG, "Failed to close the local microphone input path");
+        finishLocalTurn("microphone gate error");
+        return;
+    }
     currentLlmRequestId_ = nextRequestId("llm_");
     ESP_LOGI(TAG, "LLM inference: %s (llmWorkId=%s request_id=%s)",
              userText.c_str(), client_->llmWorkId().c_str(), currentLlmRequestId_.c_str());

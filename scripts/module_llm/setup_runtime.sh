@@ -31,4 +31,9 @@ done
 require_root
 require_stackflow_repo
 install_package_group "Module LLM runtime" "${PACKAGES_RUNTIME[@]}"
+mkdir -p "$(dirname "$PCM_READY_HELPER_TARGET")"
+install_file_atomic "$PCM_READY_HELPER_SOURCE" "$PCM_READY_HELPER_TARGET" 0755 \
+    || die "Failed to install $PCM_READY_HELPER_TARGET."
+"$PCM_READY_HELPER_TARGET" --check || die "StackFlow PCM readiness helper check failed."
+ok "$PCM_READY_HELPER_TARGET"
 ensure_services_active "${SERVICES_RUNTIME[@]}"

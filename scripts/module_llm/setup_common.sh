@@ -15,9 +15,16 @@ TOHOKU_COPYRIGHT_URL="${TOHOKU_COPYRIGHT_URL:-https://raw.githubusercontent.com/
 
 OPENJTALK_HELPER_SOURCE="${STACKCHAN_OPENJTALK_HELPER:-${SCRIPT_DIR}/openjtalk_tts.sh}"
 OPENJTALK_HELPER_TARGET="/opt/stackchan/openjtalk_tts.sh"
+PCM_READY_HELPER_SOURCE="${STACKCHAN_PCM_READY_HELPER:-${SCRIPT_DIR}/stackflow_pcm_ready.py}"
+PCM_READY_HELPER_TARGET="/opt/stackchan/stackflow_pcm_ready.py"
+VAD_PCM_BRIDGE_SOURCE="${STACKCHAN_VAD_PCM_BRIDGE:-${SCRIPT_DIR}/stackchan_vad_pcm_bridge.py}"
+VAD_PCM_BRIDGE_TARGET="/opt/stackchan/stackchan_vad_pcm_bridge.py"
+VAD_PCM_BRIDGE_SERVICE_SOURCE="${STACKCHAN_VAD_PCM_BRIDGE_SERVICE:-${SCRIPT_DIR}/stackchan-vad-pcm-bridge.service}"
+VAD_PCM_BRIDGE_SERVICE_TARGET="/etc/systemd/system/stackchan-vad-pcm-bridge.service"
 QWEN3_MODEL_ID="qwen3-0.6B-ax630c"
 QWEN3_TOKENIZER_SCRIPT="/opt/m5stack/scripts/tokenizer_${QWEN3_MODEL_ID}.py"
 QWEN3_TOKENIZER_COMPAT="/opt/m5stack/scripts/${QWEN3_MODEL_ID}_tokenizer.py"
+SILERO_VAD_MODE_CONFIG="/opt/m5stack/data/models/mode_silero-vad.json"
 
 DOWNLOAD_TIMEOUT_SECONDS="${STACKCHAN_DOWNLOAD_TIMEOUT_SECONDS:-30}"
 DOWNLOAD_RETRIES="${STACKCHAN_DOWNLOAD_RETRIES:-3}"
@@ -83,6 +90,7 @@ SERVICES_MELOTTS=(
 
 SERVICES_VAD=(
     llm-vad.service
+    stackchan-vad-pcm-bridge.service
 )
 
 RED='\033[0;31m'
@@ -392,3 +400,110 @@ ensure_qwen3_tokenizer_compat() (
     temporary_directory=""
     ok "Qwen3 tokenizer compatibility link: $QWEN3_TOKENIZER_COMPAT"
 )
+
+ensure_silero_vad_mode_config() (
+    local config_path="${SILERO_VAD_MODE_CONFIG}"
+    local temporary=""
+
+    [ -f "$config_path" ] || die "Silero VAD mode config was not found: $config_path"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to normalize $config_path"
+
+    temporary="$(mktemp "${config_path}.tmp.XXXXXX")" \
+        || die "Failed to create a temporary VAD config file."
+
+    cleanup_vad_config() {
+        if [ -n "$temporary" ]; then
+            rm -f -- "$temporary"
+        fi
+    }
+    trap cleanup_vad_config EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    set +e
+    python3 - "$config_path" "$temporary" <<'PY'
+import json
+import sys
+
+source, destination = sys.argv[1:3]
+defaults = {
+    "silero_vad.model": "silero_vad.ort",
+    "silero_vad.threshold": 0.5,
+    "silero_vad.min_silence_duration": 0.5,
+    "silero_vad.min_speech_duration": 0.25,
+    "silero_vad.window_size": 512,
+    "sample_rate": 16000,
+    "num_threads": 1,
+    "provider": "cpu",
+}
+
+with open(source, encoding="utf-8") as f:
+    body = json.load(f)
+
+mode_param = body.setdefault("mode_param", {})
+mode_param_bak = body.get("mode_param_bak", {})
+changed = False
+
+for key, fallback in defaults.items():
+    if key not in mode_param:
+        mode_param[key] = mode_param_bak.get(key, fallback)
+        changed = True
+
+with open(destination, "w", encoding="utf-8") as f:
+    json.dump(body, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+
+sys.exit(10 if changed else 0)
+PY
+    local status=$?
+    set -e
+    if [ "$status" -ne 0 ] && [ "$status" -ne 10 ]; then
+        return "$status"
+    fi
+
+    chmod 0644 "$temporary" || return 1
+    if cmp -s "$config_path" "$temporary"; then
+        rm -f -- "$temporary"
+        temporary=""
+        ok "Silero VAD mode config already normalized"
+        return 0
+    fi
+
+    mv -f -- "$temporary" "$config_path" || return 1
+    temporary=""
+    ok "Silero VAD mode config normalized: $config_path"
+)
+
+verify_silero_vad_mode_config() {
+    [ -f "$SILERO_VAD_MODE_CONFIG" ] \
+        || die "Silero VAD mode config was not found: $SILERO_VAD_MODE_CONFIG"
+    command -v python3 >/dev/null 2>&1 \
+        || die "python3 is required to verify $SILERO_VAD_MODE_CONFIG"
+
+    python3 - "$SILERO_VAD_MODE_CONFIG" <<'PY'
+import json
+import sys
+
+required = {
+    "silero_vad.model",
+    "silero_vad.threshold",
+    "silero_vad.min_silence_duration",
+    "silero_vad.min_speech_duration",
+    "silero_vad.window_size",
+    "sample_rate",
+    "num_threads",
+    "provider",
+}
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    body = json.load(source)
+
+mode_param = body.get("mode_param")
+missing = sorted(required - set(mode_param or {}))
+if missing:
+    print("Missing Silero VAD mode parameters: " + ", ".join(missing), file=sys.stderr)
+    raise SystemExit(1)
+PY
+    ok "Silero VAD mode config"
+}

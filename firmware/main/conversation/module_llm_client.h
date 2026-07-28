@@ -109,8 +109,8 @@ public:
     // Send filtered text to MeloTTS manually
     bool sendToTts(const std::string& text, bool finish = false);
     bool sendToOpenJTalkTts(const std::string& requestId, const std::string& text);
-    void pauseWhisper();         // TTS再生中はASRを停止
-    void resumeWhisper();        // TTS完了後にASR再開
+    bool pauseWhisper();         // TTS再生中はASR/VAD PCM bridgeを停止
+    bool resumeWhisper();        // TTS完了後にASR/VAD PCM bridgeを再開
     bool pauseLlm();             // 顔タッチ中断: 生成中のLLM unitを停止
     bool resumeLlm();            // 次ターン開始前にLLM unitを再開
     bool pauseTts();             // 顔タッチ中断: 再生中のMeloTTS unitを停止
@@ -156,6 +156,8 @@ private:
                      const std::string& command,
                      int timeoutMs = 0,
                      std::string* output = nullptr);
+    bool setVadPcmBridgePaused(bool paused);
+    bool applyModuleMicrophoneGain(const std::string& requestId);
     bool checkOpenJTalkTts();
 
     // UART configuration (Section 9.1)

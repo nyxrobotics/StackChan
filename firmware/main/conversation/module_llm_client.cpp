@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // StackFlow JSON-RPC protocol
@@ -53,6 +54,27 @@ static constexpr const char* kLlmNvsNamespace = "modllm_cfg";
 static constexpr const char* kThinkingKey     = "thinking";
 static constexpr const char* kVadEnabledKey   = "vad_enabled";
 static constexpr const char* kTtsLangKey      = "tts_lang";  // 0=ja 1=zh 2=en
+static constexpr const char* kVadPcmBridgeCommand =
+    "/opt/stackchan/stackchan_vad_pcm_bridge.py";
+static constexpr const char* kVadPcmBridgePauseFile =
+    "/run/stackchan-vad-pcm-bridge.paused";
+static constexpr const char* kVadPcmWhisperInput = "whisper.vad.pcm.base64";
+static constexpr double kVadSpeechThreshold = 0.10;
+static constexpr double kVadMinSilenceSeconds = 1.0;
+static constexpr double kWhisperRawChunkSeconds = 5.0;
+static constexpr const char* kCaptureGainReadyMarker =
+    "STACKCHAN_CAPTURE_GAIN_READY";
+static constexpr const char* kCaptureGainCommand =
+    "amixer -q -c 0 sset 'RX LEFT ANA GAIN' 54 && "
+    "amixer -q -c 0 sset 'RX RIGHT ANA GAIN' 54 && "
+    "amixer -q -c 0 sset 'RX LEFT DIG GAIN' 40 && "
+    "amixer -q -c 0 sset 'RX RIGHT DIG GAIN' 40 && "
+    "echo STACKCHAN_CAPTURE_GAIN_READY";
+
+static std::string runtimeRequestId(const char* prefix)
+{
+    return std::string(prefix) + std::to_string(esp_timer_get_time());
+}
 
 static std::string shellQuote(const std::string& value)
 {
@@ -210,6 +232,32 @@ bool ModuleLLMClient::sysBashExec(const std::string& reqId,
     return false;
 }
 
+bool ModuleLLMClient::setVadPcmBridgePaused(bool paused)
+{
+    const char* expected = paused
+        ? "STACKCHAN_VAD_PCM_BRIDGE_PAUSED"
+        : "STACKCHAN_VAD_PCM_BRIDGE_RUNNING";
+    const std::string command = std::string(kVadPcmBridgeCommand) +
+        (paused ? " --pause && test -f " : " --resume && test ! -f ") +
+        kVadPcmBridgePauseFile + " && echo " + expected;
+
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        std::string output;
+        const std::string requestId = runtimeRequestId(
+            paused ? "vad_bridge_pause_" : "vad_bridge_resume_");
+        if (sysBashExec(requestId, command, 5000, &output) &&
+            output.find(expected) != std::string::npos) {
+            ESP_LOGI(TAG, "VAD PCM bridge %s confirmed",
+                     paused ? "pause" : "resume");
+            return true;
+        }
+        ESP_LOGW(TAG, "VAD PCM bridge %s attempt %d failed: %s",
+                 paused ? "pause" : "resume", attempt, output.c_str());
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
+}
+
 bool ModuleLLMClient::checkOpenJTalkTts()
 {
     std::string output;
@@ -220,6 +268,20 @@ bool ModuleLLMClient::checkOpenJTalkTts()
     }
 
     ESP_LOGI(TAG, "OpenJTalk TTS ready: %s", output.c_str());
+    return true;
+}
+
+bool ModuleLLMClient::applyModuleMicrophoneGain(const std::string& requestId)
+{
+    std::string output;
+    const bool ready = sysBashExec(
+        requestId, kCaptureGainCommand, 10000, &output);
+    if (!ready || output.find(kCaptureGainReadyMarker) == std::string::npos) {
+        ESP_LOGE(TAG, "module microphone gain setup failed: %s", output.c_str());
+        return false;
+    }
+
+    ESP_LOGI(TAG, "module microphone gain ready: RX analog=27.0 dB digital=20.0 dB");
     return true;
 }
 
@@ -482,11 +544,11 @@ bool ModuleLLMClient::connect()
 
 // ---------------------------------------------------------------------------
 // loadModelsAndPipeline()
-// Setup order (matches Arduino voice assistant example):
-//   1. sys.reset
+// Setup order:
+//   1. release existing StackChan tasks without restarting services
 //   2. audio.setup
-//   3. vad.setup    (Silero VAD, input: sys.pcm)
-//   4. whisper.setup  (ASR from Module LLM mic, input: sys.pcm + vad_work_id)
+//   3. vad.setup      (Silero VAD, input: sys.pcm)
+//   4. whisper.setup  (ASR input: VAD-delimited PCM bridge when VAD is enabled)
 //   5. llm.setup      (Qwen3, UART input)
 //   6. melotts.setup  (MeloTTS ja-JP, input from LLM)
 // ---------------------------------------------------------------------------
@@ -496,101 +558,151 @@ bool ModuleLLMClient::loadModelsAndPipeline()
     state_ = ModuleLLMState::ModelLoading;
     ESP_LOGI(TAG, "Setting up StackFlow units...");
 
-    auto waitForRequest = [this](const char* requestId, int timeoutMs, const char* label) -> bool {
-        int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
-        while (esp_timer_get_time() / 1000 < deadline) {
-            int remaining = static_cast<int>(deadline - esp_timer_get_time() / 1000);
-            if (remaining < 1) break;
+    const bool bridgePaused = setVadPcmBridgePaused(true);
+    if (!bridgePaused) {
+        if (vadEnabled_) {
+            ESP_LOGE(TAG, "VAD PCM bridge setup pause failed");
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
+        ESP_LOGW(TAG, "VAD PCM bridge setup pause unavailable while VAD is disabled");
+    }
 
-            std::string resp = stackflowReceive(remaining > 500 ? 500 : remaining);
+    auto drainStackflowInput = [this](const char* label, int totalMs) {
+        const int64_t deadline = esp_timer_get_time() / 1000 + totalMs;
+        int drained = 0;
+        while (esp_timer_get_time() / 1000 < deadline) {
+            std::string resp = stackflowReceive(50);
+            if (!resp.empty()) {
+                ++drained;
+                continue;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (drained > 0) {
+            ESP_LOGI(TAG, "%s: drained %d stale StackFlow frame(s)", label, drained);
+        }
+    };
+
+    auto waitForResponse = [this](const std::string& requestId, int timeoutMs) -> cJSON* {
+        const int64_t deadline = esp_timer_get_time() / 1000 + timeoutMs;
+        while (esp_timer_get_time() / 1000 < deadline) {
+            std::string resp = stackflowReceive(500);
             if (resp.empty()) continue;
 
             cJSON* root = cJSON_Parse(resp.c_str());
             if (!root) continue;
 
             cJSON* rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
-            bool matches = false;
-            if (cJSON_IsString(rid)) {
-                matches = strcmp(rid->valuestring, requestId) == 0;
-            } else if (cJSON_IsNumber(rid)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", rid->valueint);
-                matches = strcmp(buf, requestId) == 0;
+            bool matches = cJSON_IsString(rid) && requestId == rid->valuestring;
+            if (!matches && cJSON_IsNumber(rid)) {
+                matches = requestId == std::to_string(rid->valueint);
             }
-
-            if (!matches) {
-                cJSON_Delete(root);
-                continue;
-            }
-
-            bool ok = false;
-            cJSON* errObj = cJSON_GetObjectItemCaseSensitive(root, "error");
-            if (cJSON_IsObject(errObj)) {
-                cJSON* code = cJSON_GetObjectItemCaseSensitive(errObj, "code");
-                ok = cJSON_IsNumber(code) && code->valueint == 0;
-            }
-
-            if (ok) {
-                ESP_LOGI(TAG, "%s done", label);
-            } else {
-                ESP_LOGW(TAG, "%s failed: %s", label, resp.c_str());
-            }
+            if (matches) return root;
             cJSON_Delete(root);
-            return ok;
         }
-
-        ESP_LOGW(TAG, "%s timeout", label);
-        return false;
+        return nullptr;
     };
 
-    // sys.reset でサービスをクリーンな状態に戻す（公式 Arduino ライブラリと同じ）
-    {
+    auto responseSucceeded = [](cJSON* root) {
+        if (!root) return false;
+        cJSON* error = cJSON_GetObjectItemCaseSensitive(root, "error");
+        cJSON* code = cJSON_IsObject(error)
+            ? cJSON_GetObjectItemCaseSensitive(error, "code")
+            : nullptr;
+        return cJSON_IsNumber(code) && code->valueint == 0;
+    };
+
+    int cleanupSequence = 0;
+    auto releaseTasks = [this, &cleanupSequence, &waitForResponse,
+                         &responseSucceeded](const char* unit) -> bool {
+        static constexpr int kCleanupResponseTimeoutMs = 15000;
+        const std::string requestId = "list" + std::to_string(cleanupSequence++);
         cJSON* msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "request_id", "sys_reset");
-        cJSON_AddStringToObject(msg, "work_id",    "sys");
-        cJSON_AddStringToObject(msg, "action",     "reset");
-        cJSON_AddStringToObject(msg, "object",     "None");
-        cJSON_AddStringToObject(msg, "data",       "None");
-        char* s = cJSON_PrintUnformatted(msg);
-        bool sent = s && stackflowSend(s);
-        free(s);
+        cJSON_AddStringToObject(msg, "request_id", requestId.c_str());
+        cJSON_AddStringToObject(msg, "work_id", unit);
+        // StackFlow returns <unit>.tasklist when taskinfo targets a base unit.
+        cJSON_AddStringToObject(msg, "action", "taskinfo");
+        char* encoded = cJSON_PrintUnformatted(msg);
+        const bool sent = encoded && stackflowSend(encoded);
+        if (encoded) free(encoded);
         cJSON_Delete(msg);
-
         if (!sent) {
-            ESP_LOGE(TAG, "sys.reset send failed");
-            state_ = ModuleLLMState::Error;
+            ESP_LOGE(TAG, "%s task list send failed", unit);
             return false;
         }
 
-        if (!waitForRequest("sys_reset", 2000, "sys.reset ack")) {
-            state_ = ModuleLLMState::Error;
+        cJSON* response = waitForResponse(requestId, kCleanupResponseTimeoutMs);
+        cJSON* data = response
+            ? cJSON_GetObjectItemCaseSensitive(response, "data")
+            : nullptr;
+        if (!responseSucceeded(response) || !cJSON_IsArray(data)) {
+            char* dump = response ? cJSON_PrintUnformatted(response) : nullptr;
+            ESP_LOGE(TAG, "%s task list failed: %s", unit, dump ? dump : "timeout");
+            if (dump) free(dump);
+            if (response) cJSON_Delete(response);
             return false;
         }
 
-        if (!waitForRequest("0", 15000, "sys.reset finish")) {
+        std::vector<std::string> taskIds;
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, data) {
+            if (cJSON_IsString(item) && item->valuestring && item->valuestring[0] != '\0') {
+                taskIds.emplace_back(item->valuestring);
+            }
+        }
+        cJSON_Delete(response);
+
+        for (const std::string& taskId : taskIds) {
+            const std::string exitRequest =
+                "exit" + std::to_string(cleanupSequence++);
+            if (!sendAction(exitRequest, taskId, "exit")) {
+                ESP_LOGE(TAG, "%s exit send failed", taskId.c_str());
+                return false;
+            }
+
+            cJSON* exitResponse = waitForResponse(exitRequest, kCleanupResponseTimeoutMs);
+            const bool exited = responseSucceeded(exitResponse);
+            if (!exited) {
+                char* dump = exitResponse ? cJSON_PrintUnformatted(exitResponse) : nullptr;
+                ESP_LOGE(TAG, "%s exit failed: %s", taskId.c_str(), dump ? dump : "timeout");
+                if (dump) free(dump);
+            }
+            if (exitResponse) cJSON_Delete(exitResponse);
+            if (!exited) return false;
+        }
+
+        ESP_LOGI(TAG, "%s cleanup: released %u task(s)", unit,
+                 static_cast<unsigned>(taskIds.size()));
+        return true;
+    };
+
+    // llm-audio 1.9 does not recover its capture device after sys.reset
+    // restarts the service. Release only the model tasks and keep the Audio
+    // service and driver alive across Core reboots.
+    const char* cleanupUnits[] = {"melotts", "llm", "whisper", "vad"};
+    for (const char* unit : cleanupUnits) {
+        if (!releaseTasks(unit)) {
             state_ = ModuleLLMState::Error;
             return false;
         }
     }
+    drainStackflowInput("post task cleanup", 250);
 
-    {
+    auto waitForPcmFrame = [this]() {
         std::string output;
-        bool ok = sysBashExec("svc_start",
-                              "systemctl start llm-audio.service llm-vad.service "
-                              "llm-whisper.service llm-llm.service llm-melotts.service 2>&1 || true",
-                              20000,
-                              &output);
-        if (ok) {
-            ESP_LOGI(TAG, "StackFlow services ensured");
-        } else {
-            ESP_LOGW(TAG, "StackFlow service start command did not complete: %s", output.c_str());
+        const bool ok = sysBashExec(
+            "pcm_ready",
+            "/opt/stackchan/stackflow_pcm_ready.py --timeout 10",
+            15000,
+            &output);
+        if (!ok || output.find("STACKCHAN_PCM_READY") == std::string::npos) {
+            ESP_LOGE(TAG, "sys.pcm did not become ready: %s", output.c_str());
+            return false;
         }
-    }
-
-    // sys.reset already releases existing StackFlow units. Sending many exit
-    // commands immediately after reset can race with the Module LLM services as
-    // systemd restarts them, so let the reset be the single cleanup path.
-    vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGI(TAG, "sys.pcm ready: %s", output.c_str());
+        return true;
+    };
 
     // 2. Audio setup
     {
@@ -598,10 +710,10 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON* data = cJSON_CreateObject();
         cJSON_AddNumberToObject(data, "capcard",   0);
         cJSON_AddNumberToObject(data, "capdevice", 0);
-        cJSON_AddNumberToObject(data, "capVolume", 0.5);
+        cJSON_AddNumberToObject(data, "capVolume", 10.0);
         cJSON_AddNumberToObject(data, "playcard",  0);
         cJSON_AddNumberToObject(data, "playdevice", 1);
-        cJSON_AddNumberToObject(data, "playVolume", 0.15);
+        cJSON_AddNumberToObject(data, "playVolume", 0.05);
         std::string wid = sfCommand("3", "audio", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "audio.setup failed");
@@ -610,6 +722,14 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         }
         audioWorkId_ = wid;
         ESP_LOGI(TAG, "audio setup: work_id=%s", wid.c_str());
+
+        // capVolume controls the AX VQE stage, while the Module LLM microphone
+        // preamp remains near 0 dB after audio.setup. Set the codec RX path to
+        // the level validated against the onboard MSM421A microphone.
+        if (!applyModuleMicrophoneGain("capture_gain_setup")) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
     }
 
     // 3. VAD setup (Silero VAD — vadEnabled_ が true の場合のみ)
@@ -618,9 +738,23 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "silero-vad");
         cJSON_AddStringToObject(data, "response_format", "vad.bool");
-        cJSON_AddBoolToObject(  data, "enoutput",        true);
-        cJSON* inputs = cJSON_AddArrayToObject(data, "input");
-        cJSON_AddItemToArray(inputs, cJSON_CreateString("sys.pcm"));
+        // The VAD PCM bridge forwards only accepted microphone activity to
+        // CoreS3. Direct UART output would also expose StackChan's own TTS.
+        cJSON_AddBoolToObject(  data, "enoutput",        false);
+        // llm-vad requires the scalar input form documented by StackFlow.
+        // The array form appears in taskinfo but does not consume live PCM on
+        // the Module LLM llm-vad 1.9 runtime.
+        cJSON_AddStringToObject(data, "input", "sys.pcm");
+        // The packaged 0.5 default rejects valid low-pitched and synthetic
+        // speech that Whisper can transcribe cleanly at the measured mic SNR.
+        cJSON_AddNumberToObject(data, "silero_vad.threshold", kVadSpeechThreshold);
+        // Keep short pauses inside one utterance instead of dispatching a
+        // partial sentence to Whisper.
+        cJSON_AddNumberToObject(
+            data, "silero_vad.min_silence_duration", kVadMinSilenceSeconds);
+        char* vadSetupPreview = cJSON_PrintUnformatted(data);
+        ESP_LOGI(TAG, "vad.setup data: %.300s", vadSetupPreview ? vadSetupPreview : "(null)");
+        if (vadSetupPreview) free(vadSetupPreview);
 
         std::string wid = sfCommand("4", "vad", "setup", data, 30000);
         if (wid.empty()) {
@@ -630,12 +764,19 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         }
         vadWorkId_ = wid;
         ESP_LOGI(TAG, "VAD setup: work_id=%s", wid.c_str());
+
+        // Audio capture is demand-driven: sys.pcm starts only after a consumer
+        // such as VAD subscribes. Verify the real frame flow at that point.
+        if (!waitForPcmFrame()) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
     } else {
         vadWorkId_.clear();
         ESP_LOGI(TAG, "VAD disabled — skipping vad.setup");
     }
 
-    // 4. Whisper ASR setup (VAD あり: sys.pcm + vad_work_id、なし: sys.pcm のみ)
+    // 4. Whisper ASR setup
     {
         ESP_LOGI(TAG, "whisper.setup starting");
         cJSON* data = cJSON_CreateObject();
@@ -643,10 +784,19 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON_AddStringToObject(data, "response_format", "asr.utf-8");
         cJSON_AddStringToObject(data, "language",        "ja");
         cJSON_AddBoolToObject(  data, "enoutput",        true);
-        cJSON* inputs = cJSON_AddArrayToObject(data, "input");
-        cJSON_AddItemToArray(inputs, cJSON_CreateString("sys.pcm"));
+
+        // StackFlow VAD emits only vad.bool, not audio. The Module-side bridge
+        // buffers sys.pcm and submits one complete PCM payload after a VAD
+        // endpoint. Whisper never subscribes to the raw microphone in this mode.
         if (!vadWorkId_.empty()) {
-            cJSON_AddItemToArray(inputs, cJSON_CreateString(vadWorkId_.c_str()));
+            cJSON_AddStringToObject(data, "input", kVadPcmWhisperInput);
+        } else {
+            cJSON_AddStringToObject(data, "input", "sys.pcm");
+            // Without VAD, Whisper has no endpoint signal and transcribes at a
+            // fixed cadence. Keep enough context for a short utterance without
+            // inheriting the packaged model's 30-second response delay.
+            cJSON_AddNumberToObject(
+                data, "whisper_chunk_size", kWhisperRawChunkSeconds);
         }
 
         std::string wid = sfCommand("5", "whisper", "setup", data, 30000);
@@ -656,7 +806,34 @@ bool ModuleLLMClient::loadModelsAndPipeline()
             return false;
         }
         whisperWorkId_ = wid;
-        ESP_LOGI(TAG, "Whisper setup: work_id=%s", wid.c_str());
+        if (vadWorkId_.empty()) {
+            ESP_LOGI(TAG, "Whisper setup: work_id=%s input=sys.pcm chunk=%.1fs",
+                     wid.c_str(), kWhisperRawChunkSeconds);
+        } else {
+            ESP_LOGI(TAG, "Whisper setup: work_id=%s input=%s",
+                     wid.c_str(), kVadPcmWhisperInput);
+        }
+
+        if (!vadEnabled_ && !waitForPcmFrame()) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
+
+        if (vadEnabled_) {
+            std::string bridgeOutput;
+            const std::string bridgeCheck =
+                std::string(kVadPcmBridgeCommand) +
+                " --check && systemctl is-active --quiet stackchan-vad-pcm-bridge.service";
+            const bool bridgeReady = sysBashExec(
+                "vad_bridge_ready", bridgeCheck, 15000, &bridgeOutput);
+            if (!bridgeReady ||
+                bridgeOutput.find("STACKCHAN_VAD_PCM_BRIDGE_READY") == std::string::npos) {
+                ESP_LOGE(TAG, "VAD PCM bridge unavailable: %s", bridgeOutput.c_str());
+                state_ = ModuleLLMState::Error;
+                return false;
+            }
+            ESP_LOGI(TAG, "VAD PCM bridge ready: %s", bridgeOutput.c_str());
+        }
     }
 
     // 4. LLM setup
@@ -736,6 +913,15 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         }
         melottsWorkId_ = wid;
         ESP_LOGI(TAG, "MeloTTS setup: work_id=%s", wid.c_str());
+    }
+
+    drainStackflowInput("pre bridge resume", 250);
+    if (vadEnabled_) {
+        if (!setVadPcmBridgePaused(false)) {
+            ESP_LOGE(TAG, "VAD PCM bridge setup resume failed");
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
     }
 
     state_ = ModuleLLMState::PipelineReady;
@@ -898,55 +1084,43 @@ bool ModuleLLMClient::sendToOpenJTalkTts(const std::string& requestId, const std
 }
 
 // Whisper を一時停止する（TTS 再生中に自分の声を拾わないため）
-void ModuleLLMClient::pauseWhisper()
+bool ModuleLLMClient::pauseWhisper()
 {
-    // VAD も同時に停止（推論・TTS 中は不要なのでリソース節約）
-    if (!vadWorkId_.empty()) {
-        cJSON* msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "request_id", "29");
-        cJSON_AddStringToObject(msg, "work_id",    vadWorkId_.c_str());
-        cJSON_AddStringToObject(msg, "action",     "pause");
-        char* s = cJSON_PrintUnformatted(msg);
-        stackflowSend(s);
-        free(s);
-        cJSON_Delete(msg);
+    // llm-vad 1.9 stops consuming sys.pcm after a pause/work cycle even
+    // though both actions return success. Keep VAD running and pause only
+    // Whisper while the local response is being generated and played.
+    if (whisperWorkId_.empty()) return false;
+    if (vadEnabled_) {
+        if (!setVadPcmBridgePaused(true)) {
+            ESP_LOGE(TAG, "VAD PCM bridge pause failed");
+            return false;
+        }
+        // The bridge is Whisper's only input in VAD mode. Keeping the unit in
+        // work state avoids a second asynchronous pause/work state machine.
+        return true;
     }
-    if (whisperWorkId_.empty()) return;
-    cJSON* msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "request_id", "30");
-    cJSON_AddStringToObject(msg, "work_id",    whisperWorkId_.c_str());
-    cJSON_AddStringToObject(msg, "action",     "pause");
-    char* s = cJSON_PrintUnformatted(msg);
-    ESP_LOGI("ModLLMClient", "whisper+vad pause");
-    stackflowSend(s);
-    free(s);
-    cJSON_Delete(msg);
+    const bool sent = sendAction(
+        runtimeRequestId("whisper_pause_"), whisperWorkId_, "pause");
+    ESP_LOGI(TAG, "whisper pause: %s", sent ? "sent" : "failed");
+    return sent;
 }
 
 // Whisper を再開する（TTS 完了後）
-void ModuleLLMClient::resumeWhisper()
+bool ModuleLLMClient::resumeWhisper()
 {
-    // VAD を先に再開してから Whisper を再開する
-    if (!vadWorkId_.empty()) {
-        cJSON* msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(msg, "request_id", "32");
-        cJSON_AddStringToObject(msg, "work_id",    vadWorkId_.c_str());
-        cJSON_AddStringToObject(msg, "action",     "work");
-        char* s = cJSON_PrintUnformatted(msg);
-        stackflowSend(s);
-        free(s);
-        cJSON_Delete(msg);
+    if (whisperWorkId_.empty()) return false;
+    if (vadEnabled_) {
+        if (!setVadPcmBridgePaused(false)) {
+            ESP_LOGE(TAG, "VAD PCM bridge resume failed");
+            return false;
+        }
+        return true;
     }
-    if (whisperWorkId_.empty()) return;
-    cJSON* msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "request_id", "31");
-    cJSON_AddStringToObject(msg, "work_id",    whisperWorkId_.c_str());
-    cJSON_AddStringToObject(msg, "action",     "work");
-    char* s = cJSON_PrintUnformatted(msg);
-    ESP_LOGI("ModLLMClient", "whisper+vad resume (caller task: %s)", pcTaskGetName(NULL));
-    stackflowSend(s);
-    free(s);
-    cJSON_Delete(msg);
+    const bool sent = sendAction(
+        runtimeRequestId("whisper_resume_"), whisperWorkId_, "work");
+    ESP_LOGI(TAG, "whisper resume: %s (caller task: %s)",
+             sent ? "sent" : "failed", pcTaskGetName(NULL));
+    return sent;
 }
 
 bool ModuleLLMClient::pauseLlm()
