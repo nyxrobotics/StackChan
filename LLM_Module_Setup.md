@@ -198,7 +198,16 @@ adb shell /opt/stackchan/stackchan_llm_sys_watchdog.py --check
 CoreS3はUARTの応答停止を検出するとStaticFallbackへ退避し、5秒後からModule
 LLMへの再接続を試します。Module側watchdogはローカルStackFlow pingの連続失敗
 またはUART RXだけが進む停止状態を検出し、`llm-sys`とPCM bridgeを復旧します。
-復旧後、CoreS3はModuleLLMバックエンドへ自動で戻ります。
+Qwen推論からOpen JTalk再生までの会話処理中はUART応答が長時間止まり得るため、
+専用のlocal-turnマーカーがある間はwatchdogのUART停止判定を保留します。
+セットアップ時のVAD停止とは区別され、保留時間にも上限があるため、マーカーが
+残留してもUART復旧が永久に抑止されることはありません。ローカル
+StackFlow ping自体が失敗した場合は保留せず復旧します。CoreS3は待受中にVAD、
+Whisper、LLM、TTSのwork IDを軽量な`taskinfo`で順番に確認します。VAD終端後の
+5秒間はASR結果の配送を優先し、検査コマンドを送信しません。サービス再起動で
+実行タスクが失われた場合は、
+`llm-sys`だけが応答していても異常として検出し、パイプライン全体を再構築して
+ModuleLLMバックエンドへ自動で戻ります。
 
 VAD bridgeの通常のPCM受け渡しはRAM内で完結します。診断用WAVが必要な場合だけ
 次を実行し、確認後に無効化してください。`/tmp`と`/run`はModule上のtmpfsです。

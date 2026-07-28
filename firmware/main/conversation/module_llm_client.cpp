@@ -62,6 +62,8 @@ static constexpr const char* kVadPcmBridgeCommand =
     "/opt/stackchan/stackchan_vad_pcm_bridge.py";
 static constexpr const char* kVadPcmBridgePauseFile =
     "/run/stackchan-vad-pcm-bridge.paused";
+static constexpr const char* kLocalConversationMarker =
+    "/run/stackchan-local-turn.active";
 static constexpr const char* kVadPcmWhisperInput = "whisper.vad.pcm.base64";
 static constexpr double kVadSpeechThreshold = 0.10;
 static constexpr double kVadMinSilenceSeconds = 1.0;
@@ -181,10 +183,30 @@ bool ModuleLLMClient::stackflowSend(const std::string& jsonMsg)
     return written == static_cast<int>(line.size());
 }
 
-bool ModuleLLMClient::sendHealthPing(const std::string& requestId)
+bool ModuleLLMClient::sendPipelineHealthCheck(const std::string& requestId,
+                                              std::string& expectedWorkId)
 {
     if (requestId.empty()) return false;
-    return sendAction(requestId, "sys", "ping");
+
+    const char* units[] = {"vad", "whisper", "llm", "melotts"};
+    const std::string* workIds[] = {
+        &vadWorkId_, &whisperWorkId_, &llmWorkId_, &melottsWorkId_
+    };
+    static constexpr size_t kTargetCount = sizeof(units) / sizeof(units[0]);
+
+    expectedWorkId.clear();
+    for (size_t attempt = 0; attempt < kTargetCount; ++attempt) {
+        const size_t index = pipelineHealthProbeIndex_++ % kTargetCount;
+        if (workIds[index]->empty()) continue;
+
+        expectedWorkId = *workIds[index];
+        if (sendAction(requestId, units[index], "taskinfo")) {
+            return true;
+        }
+        expectedWorkId.clear();
+        return false;
+    }
+    return false;
 }
 
 bool ModuleLLMClient::sendAction(const std::string& reqId,
@@ -268,14 +290,25 @@ bool ModuleLLMClient::sysBashExec(const std::string& reqId,
     return false;
 }
 
-bool ModuleLLMClient::setVadPcmBridgePaused(bool paused)
+bool ModuleLLMClient::setVadPcmBridgePaused(bool paused, bool localTurn)
 {
     const char* expected = paused
         ? "STACKCHAN_VAD_PCM_BRIDGE_PAUSED"
         : "STACKCHAN_VAD_PCM_BRIDGE_RUNNING";
-    const std::string command = std::string(kVadPcmBridgeCommand) +
-        (paused ? " --pause && test -f " : " --resume && test ! -f ") +
-        kVadPcmBridgePauseFile + " && echo " + expected;
+    std::string command;
+    if (paused) {
+        command = localTurn ? "" : std::string("rm -f ") + kLocalConversationMarker + " && ";
+        command += std::string(kVadPcmBridgeCommand) + " --pause && test -f " +
+            kVadPcmBridgePauseFile;
+        if (localTurn) {
+            command += std::string(" && touch ") + kLocalConversationMarker;
+        }
+    } else {
+        command = std::string("rm -f ") + kLocalConversationMarker + " && " +
+            kVadPcmBridgeCommand + " --resume && test ! -f " +
+            kVadPcmBridgePauseFile;
+    }
+    command += std::string(" && echo ") + expected;
 
     for (int attempt = 1; attempt <= 2; ++attempt) {
         std::string output;
@@ -1139,7 +1172,7 @@ bool ModuleLLMClient::pauseWhisper()
     // Whisper while the local response is being generated and played.
     if (whisperWorkId_.empty()) return false;
     if (vadEnabled_) {
-        if (!setVadPcmBridgePaused(true)) {
+        if (!setVadPcmBridgePaused(true, true)) {
             ESP_LOGE(TAG, "VAD PCM bridge pause failed");
             return false;
         }
@@ -1147,8 +1180,13 @@ bool ModuleLLMClient::pauseWhisper()
         // work state avoids a second asynchronous pause/work state machine.
         return true;
     }
+    if (!setVadPcmBridgePaused(true, true)) {
+        ESP_LOGE(TAG, "Local conversation marker setup failed");
+        return false;
+    }
     const bool sent = sendAction(
         runtimeRequestId("whisper_pause_"), whisperWorkId_, "pause");
+    if (!sent) setVadPcmBridgePaused(false);
     ESP_LOGI(TAG, "whisper pause: %s", sent ? "sent" : "failed");
     return sent;
 }
@@ -1166,9 +1204,10 @@ bool ModuleLLMClient::resumeWhisper()
     }
     const bool sent = sendAction(
         runtimeRequestId("whisper_resume_"), whisperWorkId_, "work");
+    const bool markerCleared = setVadPcmBridgePaused(false);
     ESP_LOGI(TAG, "whisper resume: %s (caller task: %s)",
              sent ? "sent" : "failed", pcTaskGetName(NULL));
-    return sent;
+    return sent && markerCleared;
 }
 
 bool ModuleLLMClient::pauseLlm()

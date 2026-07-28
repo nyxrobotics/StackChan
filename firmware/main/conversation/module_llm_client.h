@@ -109,7 +109,8 @@ public:
     // Public so ModuleLLMBackend polling loop can read UART messages
     std::string stackflowReceive(int timeoutMs = 5000);
     bool        stackflowSend(const std::string& jsonMsg);
-    bool        sendHealthPing(const std::string& requestId);
+    bool        sendPipelineHealthCheck(const std::string& requestId,
+                                        std::string& expectedWorkId);
 
     // Send filtered text to MeloTTS manually
     bool sendToTts(const std::string& text, bool finish = false);
@@ -158,6 +159,7 @@ private:
     bool vadEnabled_      = true;
     uint8_t ttsLang_      = 0;   // 0=ja 1=zh 2=en、NVS から復元
     int8_t openJTalkGainDb_ = -36;
+    uint8_t pipelineHealthProbeIndex_ = 0;
 
     // Send a StackFlow command and return response work_id (empty on error)
     std::string sfCommand(const std::string& reqId,
@@ -172,7 +174,7 @@ private:
                      const std::string& command,
                      int timeoutMs = 0,
                      std::string* output = nullptr);
-    bool setVadPcmBridgePaused(bool paused);
+    bool setVadPcmBridgePaused(bool paused, bool localTurn = false);
     bool applyModuleMicrophoneGain(const std::string& requestId);
     bool checkOpenJTalkTts();
 

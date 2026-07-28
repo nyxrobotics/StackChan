@@ -51,6 +51,16 @@ single diagnostic WAV under `/tmp` only when
 `/run/stackchan-vad-pcm-bridge.debug` is explicitly created. Both locations are
 tmpfs on the Module LLM, and disabling debug removes the diagnostic file.
 
+The watchdog uses a dedicated local-turn marker to treat Qwen inference and
+OpenJTalk playback as legitimate UART work without confusing pipeline setup
+with an active conversation. TCP control failures are still recovered
+immediately, and the UART timeout resumes after the turn ends. Deferral is
+bounded, so a stale local-turn marker cannot suppress UART recovery forever.
+The CoreS3 separately rotates lightweight `taskinfo` probes across the live
+VAD, Whisper, LLM, and TTS work IDs. A service restart that discards
+StackFlow tasks therefore causes a full pipeline rebuild without invoking a
+shell command in the ASR delivery path.
+
 ## Setup behavior
 
 - Every target is idempotent and can be rerun to repair its own feature.
@@ -84,5 +94,6 @@ For development, validate the source bundle before transferring it:
 ```bash
 bash -n scripts/provision_module_llm.sh scripts/module_llm/*.sh
 python3 -m py_compile scripts/module_llm/*.py
+python3 -m unittest discover -s scripts/module_llm/tests -v
 git diff --check
 ```

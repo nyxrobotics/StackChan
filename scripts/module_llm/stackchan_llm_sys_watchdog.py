@@ -2,8 +2,10 @@
 """Recover llm-sys when its TCP control path or CoreS3 UART path stalls."""
 
 import argparse
+import glob
 import json
 import logging
+import os
 import re
 import signal
 import socket
@@ -20,6 +22,13 @@ DEFAULT_PORT = 10001
 DEFAULT_UART_INDEX = 1
 MAX_RESPONSE_BYTES = 64 * 1024
 MIN_UNANSWERED_UART_BYTES = 32
+DEFAULT_LOCAL_TURN_GRACE = 60.0
+DEFAULT_OPENJTALK_GRACE = 300.0
+OPENJTALK_PROCESS_MARKERS = (
+    b"/opt/stackchan/openjtalk_tts.sh",
+    b"/tmp/stackchan-openjtalk/",
+)
+LOCAL_CONVERSATION_MARKER = "/run/stackchan-local-turn.active"
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,39 @@ def read_serial_counters(index: int) -> SerialCounters:
             if match:
                 return SerialCounters(tx=int(match.group(1)), rx=int(match.group(2)))
     raise RuntimeError(f"UART {index} counters were not found")
+
+
+def openjtalk_tts_active(proc_root: str = "/proc") -> bool:
+    """Return true while the synchronous OpenJTalk bashexec is expected to be quiet."""
+    pattern = os.path.join(proc_root, "[0-9]*", "cmdline")
+    for path in glob.iglob(pattern):
+        try:
+            with open(path, "rb") as command_line:
+                value = command_line.read(MAX_RESPONSE_BYTES)
+        except OSError:
+            continue
+        if any(marker in value for marker in OPENJTALK_PROCESS_MARKERS):
+            return True
+    return False
+
+
+def local_conversation_active(
+    activity_marker: str = LOCAL_CONVERSATION_MARKER,
+) -> bool:
+    """Return true while CoreS3 has deliberately gated microphone input."""
+    return os.path.exists(activity_marker)
+
+
+def stackchan_uart_activity(
+    proc_root: str = "/proc",
+    activity_marker: str = LOCAL_CONVERSATION_MARKER,
+) -> Optional[str]:
+    """Describe legitimate work that can delay a CoreS3 UART response."""
+    if openjtalk_tts_active(proc_root):
+        return "OpenJTalk"
+    if local_conversation_active(activity_marker):
+        return "local conversation turn"
+    return None
 
 
 def run_systemctl(*arguments: str, timeout: float = 20.0) -> bool:
@@ -165,6 +207,9 @@ class LlmSysWatchdog:
         next_ping = 0.0
         grace_until = time.monotonic() + self.args.startup_grace
         last_recovery = float("-inf")
+        recovery_deferred_for_activity = False
+        deferred_activity: Optional[str] = None
+        activity_deferred_since: Optional[float] = None
 
         logging.info(
             "watching llm-sys: ping=%ss/%s failures, UART%d timeout=%ss",
@@ -177,6 +222,7 @@ class LlmSysWatchdog:
         while self.running:
             now = time.monotonic()
             reason: Optional[str] = None
+            reason_is_uart_stall = False
 
             try:
                 current = read_serial_counters(self.args.uart_index)
@@ -189,6 +235,11 @@ class LlmSysWatchdog:
                 if counters_reset or current.tx > previous.tx:
                     unanswered_since = None
                     unanswered_bytes = 0
+                    if recovery_deferred_for_activity:
+                        logging.info("UART response resumed after deferred StackChan activity")
+                        recovery_deferred_for_activity = False
+                        deferred_activity = None
+                        activity_deferred_since = None
                 elif current.rx > previous.rx:
                     if unanswered_since is None:
                         unanswered_since = now
@@ -204,6 +255,7 @@ class LlmSysWatchdog:
                         f"UART{self.args.uart_index} received {unanswered_bytes} bytes "
                         f"without TX progress for {now - unanswered_since:.1f}s"
                     )
+                    reason_is_uart_stall = True
             previous = current
 
             if now >= next_ping:
@@ -225,6 +277,40 @@ class LlmSysWatchdog:
                     )
                     if now >= grace_until and ping_failures >= self.args.ping_failures:
                         reason = f"local StackFlow ping failed {ping_failures} times: {detail}"
+                        reason_is_uart_stall = False
+
+            activity = stackchan_uart_activity() if reason_is_uart_stall else None
+            if reason is not None and activity is not None:
+                if activity != deferred_activity or activity_deferred_since is None:
+                    deferred_activity = activity
+                    activity_deferred_since = now
+                grace = (
+                    self.args.openjtalk_grace
+                    if activity == "OpenJTalk"
+                    else self.args.local_turn_grace
+                )
+                if now - activity_deferred_since < grace:
+                    if not recovery_deferred_for_activity:
+                        logging.info(
+                            "llm-sys UART recovery deferred during %s: %s",
+                            activity,
+                            reason,
+                        )
+                    recovery_deferred_for_activity = True
+                    reason = None
+                    # Long-running inference and synchronous sys.bashexec
+                    # commands may not return a UART frame until the current
+                    # turn finishes. Restart the timeout window so a genuine
+                    # failure is recovered after the gate reopens.
+                    unanswered_since = now
+                    ping_failures = 0
+                else:
+                    logging.info(
+                        "llm-sys UART deferral expired during %s after %.1fs",
+                        activity,
+                        now - activity_deferred_since,
+                    )
+                    recovery_deferred_for_activity = False
 
             if reason is not None and now - last_recovery >= self.args.cooldown:
                 self.recover(reason)
@@ -235,6 +321,9 @@ class LlmSysWatchdog:
                 unanswered_since = None
                 unanswered_bytes = 0
                 ping_failures = 0
+                recovery_deferred_for_activity = False
+                deferred_activity = None
+                activity_deferred_since = None
 
             time.sleep(1)
 
@@ -261,6 +350,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--uart-timeout", type=positive_number, default=30.0)
     parser.add_argument("--startup-grace", type=positive_number, default=30.0)
     parser.add_argument("--cooldown", type=positive_number, default=60.0)
+    parser.add_argument(
+        "--local-turn-grace",
+        type=positive_number,
+        default=DEFAULT_LOCAL_TURN_GRACE,
+    )
+    parser.add_argument(
+        "--openjtalk-grace",
+        type=positive_number,
+        default=DEFAULT_OPENJTALK_GRACE,
+    )
     args = parser.parse_args()
     if args.port <= 0 or args.port > 65535:
         parser.error("--port must be between 1 and 65535")

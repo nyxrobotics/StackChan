@@ -43,4 +43,9 @@ install_file_atomic "$LLM_SYS_WATCHDOG_DROPIN_SOURCE" "$LLM_SYS_WATCHDOG_DROPIN_
 
 "$LLM_SYS_WATCHDOG_TARGET" --check || die "llm-sys watchdog check failed."
 ensure_services_active "${SERVICES_LLM_SYS_WATCHDOG[@]}"
+info "Restarting llm-sys watchdog to load the installed implementation..."
+systemctl restart "${SERVICES_LLM_SYS_WATCHDOG[@]}" \
+    || die "Failed to restart the llm-sys watchdog."
+systemctl is-active --quiet "${SERVICES_LLM_SYS_WATCHDOG[@]}" \
+    || die "llm-sys watchdog did not remain active after restart."
 ok "llm-sys automatic recovery installed"

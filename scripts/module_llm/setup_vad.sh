@@ -40,3 +40,8 @@ install_file_atomic "$VAD_PCM_BRIDGE_SERVICE_SOURCE" "$VAD_PCM_BRIDGE_SERVICE_TA
 "$VAD_PCM_BRIDGE_TARGET" --check || die "VAD PCM bridge check failed."
 ok "$VAD_PCM_BRIDGE_TARGET"
 ensure_services_active "${SERVICES_VAD[@]}"
+info "Restarting VAD PCM bridge to load the installed implementation..."
+systemctl restart stackchan-vad-pcm-bridge.service \
+    || die "Failed to restart the VAD PCM bridge."
+systemctl is-active --quiet stackchan-vad-pcm-bridge.service \
+    || die "VAD PCM bridge did not remain active after restart."

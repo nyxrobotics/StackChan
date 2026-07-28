@@ -342,12 +342,14 @@ void ModuleLLMBackend::pollLoop() {
     int64_t ttsDispatchedMs = 0;  // TTS 送信時刻
     int64_t ttsTimeoutMs = 10000; // 文字数に応じて動的に設定
     int64_t llmLastProgressMs = 0;
-    int64_t lastHealthPingMs = esp_timer_get_time() / 1000;
-    int64_t healthPingSentMs = 0;
-    std::string healthPingRequestId;
+    int64_t lastPipelineHealthCheckMs = esp_timer_get_time() / 1000;
+    int64_t pipelineHealthCheckSentMs = 0;
+    std::string pipelineHealthCheckRequestId;
+    std::string pipelineHealthExpectedWorkId;
     static constexpr int64_t kLlmStallTimeoutMs = 45000;
-    static constexpr int64_t kHealthPingIntervalMs = 10000;
-    static constexpr int64_t kHealthPingTimeoutMs = 8000;
+    static constexpr int64_t kPipelineHealthCheckIntervalMs = 10000;
+    static constexpr int64_t kPipelineHealthCheckTimeoutMs = 8000;
+    static constexpr int64_t kWhisperHealthCheckGraceMs = 5000;
 
     // 言語別タイムアウト係数
     // BASE: TTS 生成開始までの余裕
@@ -381,11 +383,12 @@ void ModuleLLMBackend::pollLoop() {
     while (taskRunning_.load()) {
         if (!active_.load()) {
             pollIdle_.store(true);
-            healthPingRequestId.clear();
-            healthPingSentMs = 0;
+            pipelineHealthCheckRequestId.clear();
+            pipelineHealthExpectedWorkId.clear();
+            pipelineHealthCheckSentMs = 0;
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             pollIdle_.store(false);
-            lastHealthPingMs = esp_timer_get_time() / 1000;
+            lastPipelineHealthCheckMs = esp_timer_get_time() / 1000;
             continue;
         }
 
@@ -395,25 +398,43 @@ void ModuleLLMBackend::pollLoop() {
         }
 
         const int64_t heartbeatNow = esp_timer_get_time() / 1000;
-        if (!healthPingRequestId.empty() &&
-            heartbeatNow - healthPingSentMs >= kHealthPingTimeoutMs) {
-            ESP_LOGE(TAG, "Module LLM UART health ping timed out after %d ms",
-                     logMs(heartbeatNow - healthPingSentMs));
-            healthPingRequestId.clear();
+        // A check sent while idle may complete after speech or ASR has started
+        // a turn. Its result is no longer a valid idle-pipeline verdict.
+        if ((micMuted_ || lastVadSpeech_ == 1) &&
+            !pipelineHealthCheckRequestId.empty()) {
+            ESP_LOGD(TAG, "Discarding in-flight pipeline health check during audio turn");
+            pipelineHealthCheckRequestId.clear();
+            pipelineHealthExpectedWorkId.clear();
+            pipelineHealthCheckSentMs = 0;
+        }
+        if (!pipelineHealthCheckRequestId.empty() &&
+            heartbeatNow - pipelineHealthCheckSentMs >= kPipelineHealthCheckTimeoutMs) {
+            ESP_LOGE(TAG,
+                     "Module LLM pipeline health check timed out after %d ms: work_id=%s",
+                     logMs(heartbeatNow - pipelineHealthCheckSentMs),
+                     pipelineHealthExpectedWorkId.c_str());
+            pipelineHealthCheckRequestId.clear();
+            pipelineHealthExpectedWorkId.clear();
             if (onFailure_) onFailure_(BackendKind::ModuleLLM);
             continue;
         }
-        if (healthPingRequestId.empty() && !micMuted_ && lastVadSpeech_ != 1 &&
-            heartbeatNow - lastHealthPingMs >= kHealthPingIntervalMs) {
-            healthPingRequestId = nextRequestId("health_");
-            if (!client_->sendHealthPing(healthPingRequestId)) {
-                ESP_LOGE(TAG, "Module LLM UART health ping send failed");
-                healthPingRequestId.clear();
+        const bool whisperMayStillBeReturning =
+            lastVadSpeechEndMs_ > 0 &&
+            heartbeatNow - lastVadSpeechEndMs_ < kWhisperHealthCheckGraceMs;
+        if (pipelineHealthCheckRequestId.empty() && !micMuted_ && lastVadSpeech_ != 1 &&
+            !whisperMayStillBeReturning &&
+            heartbeatNow - lastPipelineHealthCheckMs >= kPipelineHealthCheckIntervalMs) {
+            pipelineHealthCheckRequestId = nextRequestId("pipeline_health_");
+            if (!client_->sendPipelineHealthCheck(
+                    pipelineHealthCheckRequestId, pipelineHealthExpectedWorkId)) {
+                ESP_LOGE(TAG, "Module LLM pipeline health check send failed");
+                pipelineHealthCheckRequestId.clear();
+                pipelineHealthExpectedWorkId.clear();
                 if (onFailure_) onFailure_(BackendKind::ModuleLLM);
                 continue;
             }
-            healthPingSentMs = heartbeatNow;
-            lastHealthPingMs = heartbeatNow;
+            pipelineHealthCheckSentMs = heartbeatNow;
+            lastPipelineHealthCheckMs = heartbeatNow;
         }
 
         bool abortRequested = abortRequested_.exchange(false);
@@ -473,22 +494,39 @@ void ModuleLLMBackend::pollLoop() {
         cJSON* obj = cJSON_GetObjectItemCaseSensitive(root, "object");
         cJSON* err = cJSON_GetObjectItemCaseSensitive(root, "error");
 
-        if (cJSON_IsString(rid) && !healthPingRequestId.empty() &&
-            healthPingRequestId == rid->valuestring) {
+        if (cJSON_IsString(rid) && !pipelineHealthCheckRequestId.empty() &&
+            pipelineHealthCheckRequestId == rid->valuestring) {
+            const std::string checkedWorkId = pipelineHealthExpectedWorkId;
             bool healthy = false;
             if (cJSON_IsObject(err)) {
                 cJSON* code = cJSON_GetObjectItemCaseSensitive(err, "code");
-                healthy = cJSON_IsNumber(code) && code->valueint == 0;
+                cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+                healthy = cJSON_IsNumber(code) && code->valueint == 0 &&
+                    cJSON_IsArray(data) && !pipelineHealthExpectedWorkId.empty();
+                if (healthy) {
+                    healthy = false;
+                    cJSON* item = nullptr;
+                    cJSON_ArrayForEach(item, data) {
+                        if (cJSON_IsString(item) && item->valuestring &&
+                            pipelineHealthExpectedWorkId == item->valuestring) {
+                            healthy = true;
+                            break;
+                        }
+                    }
+                }
             }
-            healthPingRequestId.clear();
-            healthPingSentMs = 0;
+            pipelineHealthCheckRequestId.clear();
+            pipelineHealthExpectedWorkId.clear();
+            pipelineHealthCheckSentMs = 0;
             if (!healthy) {
-                ESP_LOGE(TAG, "Module LLM UART health ping returned an error");
+                ESP_LOGE(TAG, "Module LLM pipeline health check failed: work_id=%s",
+                         checkedWorkId.c_str());
                 cJSON_Delete(root);
                 if (onFailure_) onFailure_(BackendKind::ModuleLLM);
                 continue;
             }
-            ESP_LOGD(TAG, "Module LLM UART health ping ok");
+            ESP_LOGD(TAG, "Module LLM pipeline health check ok: work_id=%s",
+                     checkedWorkId.c_str());
             cJSON_Delete(root);
             continue;
         }

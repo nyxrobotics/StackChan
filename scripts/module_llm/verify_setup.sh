@@ -115,6 +115,26 @@ for executable in "${required_executables[@]}"; do
     ok "$executable"
 done
 
+installed_files=(
+    "$OPENJTALK_HELPER_SOURCE|$OPENJTALK_HELPER_TARGET"
+    "$PCM_READY_HELPER_SOURCE|$PCM_READY_HELPER_TARGET"
+    "$VAD_PCM_BRIDGE_SOURCE|$VAD_PCM_BRIDGE_TARGET"
+    "$VAD_PCM_BRIDGE_SERVICE_SOURCE|$VAD_PCM_BRIDGE_SERVICE_TARGET"
+    "$LLM_SYS_WATCHDOG_SOURCE|$LLM_SYS_WATCHDOG_TARGET"
+    "$LLM_SYS_WATCHDOG_SERVICE_SOURCE|$LLM_SYS_WATCHDOG_SERVICE_TARGET"
+    "$LLM_SYS_WATCHDOG_DROPIN_SOURCE|$LLM_SYS_WATCHDOG_DROPIN_TARGET"
+)
+
+for file_pair in "${installed_files[@]}"; do
+    source_file="${file_pair%%|*}"
+    installed_file="${file_pair#*|}"
+    [ -f "$source_file" ] || die "Verification source is missing: $source_file"
+    [ -f "$installed_file" ] || die "Installed file is missing: $installed_file"
+    cmp -s "$source_file" "$installed_file" \
+        || die "Installed file differs from the provisioning bundle: $installed_file"
+    ok "$installed_file matches the provisioning bundle"
+done
+
 openjtalk_status="$("$OPENJTALK_HELPER_TARGET" --check)" \
     || die "OpenJTalk helper check failed."
 printf '%s\n' "$openjtalk_status"
