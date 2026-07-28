@@ -218,6 +218,28 @@ adb shell touch /run/stackchan-vad-pcm-bridge.debug
 adb shell rm -f /run/stackchan-vad-pcm-bridge.debug
 ```
 
+### 無人の連続試験用ビルド
+
+通常ファームは顔操作または保存済みの起動設定に従います。ハードウェア連続試験で
+起動時の顔タッチだけを省略したい場合は、既定OFFの
+`CONFIG_STACKCHAN_TEST_AUTO_START_AI_AGENT`を有効にします。
+
+対話的に設定する場合は`idf.py menuconfig`の
+`StackChan Development > Auto-start AI Agent for unattended tests`を選びます。
+通常ビルドと設定を分離する場合は、次のローカルオーバーレイと専用build directoryを
+使います。`sdkconfig.defaults.local`はGit管理対象外です。
+
+```bash
+cd firmware
+printf '%s\n' 'CONFIG_STACKCHAN_TEST_AUTO_START_AI_AGENT=y' > sdkconfig.defaults.local
+idf.py -B build-unattended \
+  -D SDKCONFIG="$PWD/build-unattended/sdkconfig" build
+idf.py -B build-unattended -p /dev/ttyACM0 app-flash
+```
+
+このオプションはランチャーだけを省略します。VAD、Whisper、Qwen、TTSの構成や
+本番設定は変更しません。通常ファームでは無効のままにしてください。
+
 ## 9. セットアップに失敗する場合
 
 - `adb devices -l`でModuleが`device`状態か確認する

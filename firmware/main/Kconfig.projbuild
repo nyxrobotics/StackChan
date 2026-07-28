@@ -11,6 +11,19 @@ config STACKCHAN_SERVER_URL
 
 endmenu
 
+menu "StackChan Development"
+
+config STACKCHAN_TEST_AUTO_START_AI_AGENT
+    bool "Auto-start AI Agent for unattended tests"
+    default n
+    help
+        Skip the launcher and start AI Agent immediately after boot. This is
+        intended only for unattended hardware tests. Production builds should
+        leave it disabled so normal saved startup settings and face controls
+        remain authoritative.
+
+endmenu
+
 menu "Xiaozhi Assistant"
 
 config OTA_URL

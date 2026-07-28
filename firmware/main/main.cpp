@@ -26,8 +26,15 @@ extern "C" void app_main(void)
     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });
     ui_hal::on_get_tick([]() { return GetHAL().millis(); });
 
+#ifdef CONFIG_STACKCHAN_TEST_AUTO_START_AI_AGENT
+    constexpr bool forceAiAgentForUnattendedTest = true;
+#else
+    constexpr bool forceAiAgentForUnattendedTest = false;
+#endif
     const bool skip_mooncake =
-        GetHAL().getXiaozhiConfig().startAiAgentOnBoot && GetHAL().getWarmRebootTarget() < 0;
+        forceAiAgentForUnattendedTest ||
+        (GetHAL().getXiaozhiConfig().startAiAgentOnBoot &&
+         GetHAL().getWarmRebootTarget() < 0);
 
     if (!skip_mooncake) {
         // Install apps
