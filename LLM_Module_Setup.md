@@ -1,265 +1,222 @@
-# Module LLM セットアップ手順
+# Module LLMローカル会話環境の構築
 
-StackChan で Module LLM Kit を使うための初期セットアップ手順です。
+M5Stack CoreS3 + Module LLMで、音声認識、応答生成、日本語音声合成を
+インターネットなしで実行するための手順です。インターネット接続が必要なのは
+Module LLMへパッケージとモデルを導入する初回セットアップ時だけです。
 
----
+実行時の標準パイプラインは次の構成です。
 
-## 必要なもの
-
-- PC（Windows / macOS / Linux）
-- **データ転送対応の USB-C ケーブル**（充電専用不可）
-- 自動セットアップを使う場合: `adb`
-- 手動セットアップを使う場合: シリアルターミナル（例: [Tera Term](https://ttssh2.osdn.jp/)）
-- **LAN ケーブル**（Module LLM Kit の Ethernet ポートをインターネットに接続するため）
-
----
-
-## 推奨 — 自動セットアップ
-
-通常はこちらを使います。Module LLM の USB-C ポートをPCへ接続し、Ethernetでインターネットへ接続してから、リポジトリのルートで実行してください。
-
-```bash
-./scripts/provision_module_llm.sh
+```text
+Module microphone
+  -> Silero VAD
+  -> RAM上のVAD区間PCM bridge
+  -> Whisper tiny
+  -> Qwen3 0.6B
+  -> Open JTalk + tohoku-f01 neutral voice
 ```
 
-このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。StackFlow aptリポジトリ登録、必要パッケージ、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+VAD有効時、Whisperが受け取る音声はVADで確定した区間だけです。Whisperが
+`sys.pcm`を直接読む経路とは併用しません。MeloTTSは日本語Open JTalkが利用
+できない場合と、追加言語を選択した場合のフォールバックです。
 
-機能ごとに実行したい場合も、PC側から同じ入口を使えます。
+## 1. 必要なもの
+
+- M5Stack CoreS3とModule LLM
+- データ転送対応USB-Cケーブル
+- Module LLM初期構築用の有線インターネット接続
+- BashとADBを実行できるPC
+- CoreS3ファームウェア用ESP-IDF v5.5.4
+- Module LLMとCoreS3を安定して動かせる電源
+
+Ubuntu系LinuxでADBがない場合は、次のように導入できます。
 
 ```bash
-./scripts/provision_module_llm.sh qwen3 --no-reboot
-./scripts/provision_module_llm.sh openjtalk --no-reboot
+sudo apt update
+sudo apt install adb
+```
+
+macOSではHomebrewの`android-platform-tools`、WindowsではAndroid SDK
+Platform ToolsまたはWSLを利用できます。
+
+## 2. Module LLMを接続する
+
+1. Module LLMのEthernetポートをインターネットへ接続します。
+2. Module LLM側のUSB-CポートをPCへ接続します。
+3. Module LLMの電源スイッチがONであることを確認します。
+4. リポジトリルートでADB接続を確認します。
+
+```bash
+adb devices -l
+```
+
+`device`状態のModule LLMが1台表示されれば準備完了です。複数のADB機器が
+ある場合は`ANDROID_SERIAL=<serial>`を指定してください。
+
+Linuxで`no permissions`になる場合は、udevルールを設定するか、ADBサーバー
+の権限を直してから再実行します。セットアップスクリプトがsudoパスワードを
+保存することはありません。
+
+## 3. 初期環境を一括構築する
+
+リポジトリルートから、次の1コマンドを実行します。
+
+```bash
+./scripts/provision_module_llm.sh all --no-reboot
+```
+
+ホスト側スクリプトは、`scripts/module_llm/`を一時ディレクトリへ一式転送し、
+Module LLM上で機能別セットアップを依存順に実行します。
+
+1. StackFlow apt repository
+2. `lib-llm`, `llm-sys`, `llm-audio`
+3. Whisper tiny
+4. Qwen3 0.6Bとtokenizer互換リンク
+5. Silero VADとVAD PCM bridge
+6. MeloTTS日本語フォールバック
+7. Open JTalk、辞書、tohoku-f01 neutral voice
+8. `llm-sys`無応答監視サービス
+9. 全パッケージ、補助ファイル、systemdサービスの検証
+
+スクリプトは再実行可能です。既に正しいものは維持し、不足・旧版・壊れた
+補助ファイルだけを修復します。パッケージ更新はこのコマンドを明示的に実行
+したときだけ行われ、自動更新サービスは導入しません。
+
+`--upgrade`を付けた場合だけModule全体の`apt upgrade`も実行します。
+
+```bash
+./scripts/provision_module_llm.sh all --upgrade --no-reboot
+```
+
+## 4. 構築結果を検証する
+
+一括セットアップの最後にも実行されますが、いつでも独立して再検証できます。
+
+```bash
 ./scripts/provision_module_llm.sh verify --no-reboot
 ```
 
-内部では、Module LLM上に転送された以下の機能別スクリプトが実行されます。
+検証対象は次のとおりです。
 
-| スクリプト | 内容 |
+- 必須パッケージとモデルがインストール済みで、apt候補版と一致すること
+- Open JTalkがtohoku-f01 neutral voiceを選択していること
+- Qwen3 tokenizer互換リンクとSilero VAD設定が有効なこと
+- PCM probe、VAD PCM bridge、watchdogが実行可能なこと
+- 必須systemdサービスがすべて`enabled`かつ`active`であること
+
+通常はLinuxの再起動を必要としません。サービスはセットアップ中に有効化・
+起動されます。一部のModule LLMでは`reboot`や`adb reboot`を実行すると電源が
+切れたまま戻らないため、完全な電源再投入が必要な場合は本体の物理スイッチを
+OFF/ONしてください。
+
+## 5. CoreS3ファームウェアを書き込む
+
+CoreS3をPCへ接続し、ESP-IDF v5.5.4を有効にしてビルド・書き込みします。
+ポート名は環境に合わせて変更してください。
+
+```bash
+cd firmware
+source ~/esp/esp-idf-v5.5.4/export.sh
+idf.py build
+idf.py -p /dev/ttyACM0 flash
+```
+
+ファームウェアだけを更新する場合は`app-flash`も利用できます。
+
+```bash
+idf.py -p /dev/ttyACM0 -b 115200 app-flash
+```
+
+このファームウェアは、デバッグ目的でAI Agentを強制起動しません。通常は顔を
+タップしてAI Agentを開きます。SETUP内の`Start AI Agent on boot`をユーザーが
+有効にしている場合だけ、保存済み設定に従って自動起動します。
+
+ローカル会話を固定して確認する場合は、SETUPの`LLM Mode`で
+`Local Only (Module LLM)`を選び、`Module LLM Settings`でVADを有効にします。
+
+## 6. オフライン動作を確認する
+
+初期構築とファームウェア書き込みが終わったら、Module LLMのEthernetを外して
+構いません。Module LLMとCoreS3を起動し、顔をタップしてAI Agentを開きます。
+
+正常時の代表的なCoreS3ログは次のとおりです。
+
+```text
+ModLLMClient: Pipeline ready (... tts=openjtalk)
+ModLLMBackend: VAD: SPEECH
+ModLLMBackend: VAD: silence
+ModLLMBackend: ASR: ...
+ModLLMBackend: LLM raw response: ...
+ModLLMBackend: OpenJTalk TTS result: ... STACKCHAN_OPENJTALK_DONE
+ModLLMClient: VAD PCM bridge resume confirmed
+```
+
+VAD終端から口パクを開始し、Open JTalk再生完了後にマイク待受けへ戻ります。
+顔タップによる中断後も、次のターンでLLMとTTSを再開します。
+
+## 7. 機能単位で修復する
+
+すべてPC側の同じ入口から実行します。Module LLMへ個別スクリプトを手作業で
+コピーする必要はありません。
+
+| Target | 内容 |
 |---|---|
-| `setup_repo.sh` | StackFlow aptリポジトリ登録と `apt update` |
-| `setup_runtime.sh` | Module LLM共通ランタイム |
-| `setup_whisper.sh` | Whisper ASR機能とモデル |
-| `setup_qwen3.sh` | Qwen3 LLM機能とモデル |
-| `setup_vad.sh` | VAD機能とSileroモデル |
-| `setup_melotts.sh` | MeloTTS機能とフォールバック用モデル |
-| `setup_openjtalk.sh` | Open JTalk、tohoku voice、TTS helper |
-| `verify_setup.sh` | パッケージとOpen JTalk helperの確認 |
+| `repo` | StackFlow apt repositoryと`apt update` |
+| `runtime` | `llm-sys`, audio、PCM probe |
+| `whisper` | Whisper機能とtinyモデル |
+| `qwen3` | Qwen3機能、0.6Bモデル、tokenizerリンク |
+| `vad` | Silero VAD、設定補完、PCM bridge |
+| `melotts` | MeloTTSと追加言語モデル |
+| `openjtalk` | Open JTalk、辞書、tohoku voice、TTS helper |
+| `watchdog` | `llm-sys`監視と自動復旧 |
+| `verify` | 環境全体の読み取り検証 |
 
-以降のStep 1〜Step 12は、スクリプトを使わずに手動でセットアップする場合の手順です。
-
----
-
-## Step 1 — 接続
-
-1. Module LLM Kit の **Ethernet ポートに LAN ケーブル**を接続してインターネットに繋ぐ
-2. Module LLM 本体の **USB-C ポート**（CoreS3 側ではなく Module LLM 側）に USB-C ケーブルで PC と接続する
-3. デバイスマネージャーで **CH340** の COM ポート番号を確認する
-
----
-
-## Step 2 — Tera Term で接続
-
-1. Tera Term を起動
-2. **シリアル接続** を選択、COM ポートを先ほど確認した番号に設定
-3. ボーレート：**115200**、その他はデフォルトで接続
-4. Enter を押すとログインプロンプトが表示される
-5. 以下の認証情報でログイン
-
-| 項目 | 値 |
-|---|---|
-| ユーザー名 | `root` |
-| パスワード | `123456` |
-
-```
-root@m5stack-LLM:~#
-```
-
----
-
-## Step 3 — apt リポジトリを登録
-
-以下を **1行ずつ**貼り付けて実行してください。
-
-```bash
-wget -qO - https://repo.llm.m5stack.com/m5stack-apt-repo/key/StackFlow.gpg | gpg --dearmor -o /etc/apt/keyrings/StackFlow.gpg
-```
-
-```bash
-echo 'deb [arch=arm64 signed-by=/etc/apt/keyrings/StackFlow.gpg] https://repo.llm.m5stack.com/m5stack-apt-repo jammy ax630c' > /etc/apt/sources.list.d/StackFlow.list
-```
-
-```bash
-apt update
-```
-
-`Reading package lists... Done` が表示されれば成功です。
-
-> **オプション：システムを最新状態にする**  
-> 不要な警告を減らしたい場合や、OS パッケージを最新にしておきたい場合は以下を実行してください。時間がかかります。
-> ```bash
-> apt install -y apt-utils
-> apt upgrade -y
-> ```
-
----
-
-## Step 4 — Module LLM 共通ランタイム
-
-```bash
-apt install -y lib-llm llm-sys llm-audio
-```
-
-対応する自動セットアップ:
-
-```bash
-./scripts/provision_module_llm.sh runtime --no-reboot
-```
-
----
-
-## Step 5 — Whisper ASR
-
-音声認識に使います。
-
-```bash
-apt install -y llm-whisper llm-model-whisper-tiny
-```
-
-対応する自動セットアップ:
-
-```bash
-./scripts/provision_module_llm.sh whisper --no-reboot
-```
-
----
-
-## Step 6 — Qwen3 LLM
-
-ローカルLLMの応答生成に使います。
-
-```bash
-apt install -y llm-llm llm-model-qwen3-0.6b-ax630c
-```
-
-対応する自動セットアップ:
-
-```bash
-./scripts/provision_module_llm.sh qwen3 --no-reboot
-```
-
----
-
-## Step 7 — VAD
-
-音声区間検出に使います。設定画面で VAD を有効にする場合に必要です。
-
-```bash
-apt install -y llm-vad llm-model-silero-vad
-```
-
-対応する自動セットアップ:
+例:
 
 ```bash
 ./scripts/provision_module_llm.sh vad --no-reboot
-```
-
----
-
-## Step 8 — MeloTTS fallback
-
-Open JTalk が使えない場合のフォールバックTTSとして使います。
-
-```bash
-apt install -y llm-melotts llm-model-melotts-ja-jp
-```
-
-設定画面で TTS の言語を切り替える場合は、使用したい言語のモデルを追加インストールしてください。
-
-```bash
-# 中国語 TTS
-apt install -y llm-model-melotts-zh-cn
-
-# 英語 TTS
-apt install -y llm-model-melotts-en-default llm-model-melotts-en-us
-```
-
-対応する自動セットアップ:
-
-```bash
-./scripts/provision_module_llm.sh melotts --no-reboot
+./scripts/provision_module_llm.sh openjtalk --no-reboot
+./scripts/provision_module_llm.sh watchdog --no-reboot
 ./scripts/provision_module_llm.sh melotts --with-en-tts --no-reboot
 ```
 
----
+Module上の機能別スクリプト構成と配置先は
+[scripts/module_llm/README.md](scripts/module_llm/README.md)にまとめています。
 
-## Step 9 — Open JTalk / tohoku voice
-
-このブランチでは、日本語TTSにOpen JTalk + tohoku-f01 neutral voiceを優先して使います。
-初回セットアップ時だけインターネット接続が必要ですが、発話時はModule LLM内だけで完結します。
+## 8. 状態確認と復旧
 
 ```bash
-apt install -y open-jtalk open-jtalk-mecab-naist-jdic alsa-utils
-mkdir -p /opt/stackchan/voices
-wget -O /opt/stackchan/voices/tohoku-f01-neutral.htsvoice \
-  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/tohoku-f01-neutral.htsvoice
-wget -O /opt/stackchan/voices/tohoku-f01-COPYRIGHT.txt \
-  https://raw.githubusercontent.com/icn-lab/htsvoice-tohoku-f01/master/COPYRIGHT.txt
+adb shell systemctl status llm-sys.service
+adb shell systemctl status stackchan-vad-pcm-bridge.service
+adb shell systemctl status stackchan-llm-sys-watchdog.service
+adb shell journalctl -u stackchan-vad-pcm-bridge.service -n 100 --no-pager
+adb shell journalctl -u stackchan-llm-sys-watchdog.service -n 100 --no-pager
+adb shell /opt/stackchan/stackchan_llm_sys_watchdog.py --check
 ```
 
-対応する自動セットアップ:
+CoreS3はUARTの応答停止を検出するとStaticFallbackへ退避し、5秒後からModule
+LLMへの再接続を試します。Module側watchdogはローカルStackFlow pingの連続失敗
+またはUART RXだけが進む停止状態を検出し、`llm-sys`とPCM bridgeを復旧します。
+復旧後、CoreS3はModuleLLMバックエンドへ自動で戻ります。
+
+VAD bridgeの通常のPCM受け渡しはRAM内で完結します。診断用WAVが必要な場合だけ
+次を実行し、確認後に無効化してください。`/tmp`と`/run`はModule上のtmpfsです。
 
 ```bash
-./scripts/provision_module_llm.sh openjtalk --no-reboot
+adb shell touch /run/stackchan-vad-pcm-bridge.debug
+# 最新区間: /tmp/stackchan-vad-pcm-bridge/segment-latest.wav
+adb shell rm -f /run/stackchan-vad-pcm-bridge.debug
 ```
 
----
+## 9. セットアップに失敗する場合
 
-## Step 10 — インストール確認
+- `adb devices -l`でModuleが`device`状態か確認する
+- USBケーブルが充電専用でないか確認する
+- ModuleのEthernetとDNSが利用できるか確認する
+- `df -h /`で1GB以上の空き容量を確認する
+- 失敗したtargetだけを再実行する
+- `verify`の最初のエラーを直してから再検証する
+- Linux再起動後に戻らない場合は物理電源スイッチをOFF/ONする
 
-```bash
-# インストール済みパッケージを確認
-dpkg -s lib-llm llm-sys llm-audio \
-  llm-whisper llm-model-whisper-tiny \
-  llm-llm llm-model-qwen3-0.6b-ax630c \
-  llm-vad llm-model-silero-vad \
-  llm-melotts llm-model-melotts-ja-jp \
-  open-jtalk open-jtalk-mecab-naist-jdic alsa-utils
-
-# Open JTalk helperを確認
-/opt/stackchan/openjtalk_tts.sh --check
-```
-
-対応する自動セットアップ:
-
-```bash
-./scripts/provision_module_llm.sh verify --no-reboot
-```
-
----
-
-## Step 11 — 再起動
-
-```bash
-reboot
-```
-
----
-
-## Step 12 — CoreS3 に取り付けて起動
-
-再起動完了後、USB-C ケーブルを外してから Module LLM を CoreS3 に取り付け、電源を入れます。  
-起動時に Module LLM が自動で検出され、Whisper → Qwen3 → Open JTalk（未セットアップ時はMeloTTS）のパイプラインが構築されます。
-
----
-
-## 設定画面（Module LLM Settings）
-
-SETUP アプリ → **Module LLM** → **Settings** から以下の設定を変更できます。
-
-| 設定項目 | 内容 |
-|---|---|
-| Thinking | LLM の思考モード（ON にすると応答が遅くなる） |
-| VAD | 音声区間検出。ONにするとノイズを拾いにくくなる（要 `llm-vad` + `llm-model-silero-vad`）|
-| TTS Language | 音声合成の言語（Japanese / Chinese / English）。対応モデルのインストールが必要 |
-
-設定変更後は **Confirm** を押すと保存され、自動再起動で反映されます。
+セットアップ処理にはADB・ダウンロード・モデル導入それぞれのタイムアウトが
+あり、途中失敗時はエラーで停止します。Module上の一時転送ディレクトリは診断
+のため保持され、成功時は自動削除されます。

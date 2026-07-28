@@ -5,7 +5,7 @@
 > **仕様バージョン:** draft-1
 
 オンライン（Xiaozhi）とローカル（Module LLM）を自動切替するハイブリッド会話バックエンドです。  
-ネットワーク断時は自動でローカル推論（Whisper → Qwen3 → MeloTTS）にフォールバックします。
+ネットワーク断時は自動でローカル推論（VAD → Whisper → Qwen3 → Open JTalk）にフォールバックします。
 
 ```
 Xiaozhi Online  →  Module LLM Local  →  Static Fallback
@@ -73,6 +73,12 @@ Xiaozhi Online  →  Module LLM Local  →  Static Fallback
 > Module LLM は Linux (Ubuntu 22.04 arm64) で動いており、モデルと機能モジュールを **Module LLM 側の apt で個別にインストール** する必要があります。  
 > インストールされていないとファームウェア起動時のモデルロードが全て失敗します。
 
+現在の正規手順はリポジトリルートの
+[LLM_Module_Setup.md](../../../LLM_Module_Setup.md)です。通常はホストPCから
+`provision_module_llm.sh`を使ってください。この章の手動コマンドはStackFlow
+パッケージの参考情報であり、それだけではPCM bridge、Open JTalk helper、
+watchdogを含むStackChan環境を再構築できません。
+
 ---
 
 ### 2-1. 推奨: 自動セットアップ
@@ -83,13 +89,14 @@ Xiaozhi Online  →  Module LLM Local  →  Static Fallback
 ./scripts/provision_module_llm.sh
 ```
 
-このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、`/opt/stackchan/openjtalk_tts.sh` の配置まで行います。
+このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、補助スクリプト、`llm-sys` 自動復旧サービスの配置まで行います。
 
 個別に実行したい場合も、PC側から同じ入口を使います。
 
 ```bash
 ./scripts/provision_module_llm.sh qwen3 --no-reboot
 ./scripts/provision_module_llm.sh openjtalk --no-reboot
+./scripts/provision_module_llm.sh watchdog --no-reboot
 ./scripts/provision_module_llm.sh verify --no-reboot
 ```
 
@@ -104,7 +111,8 @@ Xiaozhi Online  →  Module LLM Local  →  Static Fallback
 | `setup_vad.sh` | VAD機能とSileroモデル |
 | `setup_melotts.sh` | MeloTTS機能とフォールバック用モデル |
 | `setup_openjtalk.sh` | Open JTalk、tohoku voice、TTS helper |
-| `verify_setup.sh` | パッケージとOpen JTalk helperの確認 |
+| `setup_llm_sys_watchdog.sh` | `llm-sys` のTCP/UART無応答監視と自動復旧 |
+| `verify_setup.sh` | 全パッケージ、補助ファイル、互換設定、systemdサービスの確認 |
 
 以降の手順は、スクリプトを使わず手動でセットアップする場合の代替手順です。
 
@@ -198,6 +206,19 @@ apt install llm-vad                # VAD 機能モジュール
 apt install llm-model-silero-vad   # VAD モデル
 ```
 
+StackChanは`vad.setup`時にSilero VADの発話閾値を`0.10`、無音確定時間を
+`1.0`秒へ設定します。この閾値はModule LLM同梱モデルで、実際の人声と
+外部スピーカーからの音声を使って調整した値です。Module全体のモデル設定は
+変更せず、ローカル会話パイプラインにだけ適用されます。PCMブリッジはVAD
+開始前の2秒も保持し、判定遅延で発話先頭が欠けないようにします。
+
+応答生成中はPCMブリッジだけを停止し、再開時はModule上の状態変更を同期的に
+確認します。VAD有効時のWhisperは常にwork状態を保ち、入力経路と推論ユニット
+という二つの非同期pause/work状態が食い違わないようにします。
+
+VADを無効にした場合、Whisperは`sys.pcm`を直接受け取り、5秒ごとに認識
+します。VAD終端がない構成でも、モデル既定の30秒を待たずに応答します。
+
 ---
 
 ### 2-8. MeloTTS fallback
@@ -258,13 +279,9 @@ dpkg -s lib-llm llm-sys llm-audio \
 
 ---
 
-### 2-11. Module LLM を再起動
+### 2-11. 必要な場合だけModule LLMを電源再投入
 
-インストール完了後、Module LLM を再起動してサービスを有効化します。
-
-```bash
-reboot
-```
+セットアップスクリプトは必要なサービスをその場で有効化・起動するため、通常は再起動不要です。Module LLM全体を再起動したい場合は、本体の電源スイッチをOFF/ONしてください。ハードウェアリビジョンによってはLinuxの `reboot` や `adb reboot` で電源断したまま戻らないため、自動セットアップでは再起動を必須にしていません。
 
 > ここまで完了したら、以下のファームウェアセットアップ手順に進んでください。
 
@@ -620,6 +637,16 @@ E (xxxx) AgentCfgStore: save failed: ESP_ERR_NVS_NOT_ENOUGH_SPACE
 Module LLM は接続済みだが `localPipelineReady=false` の可能性があります。  
 シリアルログで `Pipeline ready` が出ているか確認してください。  
 出ていない場合はモデルロードのエラーログを追ってください。
+
+ローカルモードでは、CoreS3がUARTの `sys.ping` を定期送信します。無応答を検出すると一旦StaticFallbackへ移り、5秒後からパイプライン再構築を試します。Module LLM側の `stackchan-llm-sys-watchdog.service` は、ローカルTCP pingの連続失敗、またはUART RXだけが進みTXが30秒以上止まった状態を検出して `llm-sys.service` を再起動します。CoreS3は再接続後にModuleLLMへ自動復帰します。
+
+監視状態はADBから確認できます。
+
+```bash
+adb shell systemctl status stackchan-llm-sys-watchdog.service
+adb shell journalctl -u stackchan-llm-sys-watchdog.service -n 100 --no-pager
+adb shell /opt/stackchan/stackchan_llm_sys_watchdog.py --check
+```
 
 ---
 

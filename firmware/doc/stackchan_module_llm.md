@@ -1,11 +1,16 @@
 # StackChan Hybrid Conversation Backend
 
+> **Current setup procedure:** Module LLMの環境構築・検証・復旧は、リポジトリ
+> ルートの[LLM_Module_Setup.md](../../LLM_Module_Setup.md)を参照してください。
+> この文書のパッケージコマンドは初期設計時の参考情報であり、現在必要なVAD
+> PCM bridge、Open JTalk helper、watchdogまでは構築しません。
+
 > **対象ハードウェア:** M5Stack CoreS3 + Module LLM  
 > **対象ファームウェア:** [StackChan](https://github.com/m5stack/StackChan) (official)  
 > **仕様バージョン:** draft-1
 
 オンライン（Xiaozhi）とローカル（Module LLM）を自動切替するハイブリッド会話バックエンドです。  
-ネットワーク断時は自動でローカル推論（Whisper → Qwen3 → MeloTTS）にフォールバックします。
+ネットワーク断時は自動でローカル推論（VAD → Whisper → Qwen3 → Open JTalk）にフォールバックします。
 
 ```
 Xiaozhi Online  →  Module LLM Local  →  Static Fallback

@@ -30,3 +30,11 @@ Thank you to the contributors of the StackChan community, especially:
 | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | [@stack_chan](https://x.com/stack_chan)                                          | [@mongonta555](https://x.com/mongonta555)                                   |
 | Shinya Ishikawa                                                                  | Takao Akaki                                                                 |
+
+## Offline Module LLM
+
+The CoreS3 can use an attached Module LLM for fully local speech recognition,
+Qwen3 response generation, and Open JTalk speech output. Initial package and
+model provisioning is automated over ADB; conversation works offline after
+setup. See [LLM_Module_Setup.md](LLM_Module_Setup.md) for the complete hardware,
+provisioning, firmware, verification, and recovery procedure.
