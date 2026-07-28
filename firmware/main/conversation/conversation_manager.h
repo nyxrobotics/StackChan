@@ -114,7 +114,7 @@ private:
     AgentConfigProvider     configProvider_;
     AgentConfigStore        configStore_;
 
-    // Module LLM initialization and recovery (prewarmed by Auto/LocalOnly).
+    // Module LLM initialization and recovery.
     void initModuleLLM();
 
     // Module LLM recovery runs outside backend callbacks because reconnecting
@@ -122,10 +122,12 @@ private:
     void startRecoveryTask();
     void stopRecoveryTask();
     void requestModuleRecovery(const char* reason);
+    void requestModulePrewarm(const char* reason);
     bool waitForRecoveryDelay(int delayMs);
     void recoveryLoop();
 
     std::atomic<bool> localRecoveryRequested_ {false};
+    std::atomic<bool> localPrewarmRequested_ {false};
     std::atomic<bool> recoveryTaskRunning_ {false};
     TaskHandle_t      recoveryTask_ = nullptr;
     SemaphoreHandle_t recoveryTaskDone_ = nullptr;

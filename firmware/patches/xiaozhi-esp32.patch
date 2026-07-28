@@ -846,6 +846,42 @@ index 99db546..97238f7 100644
 -#endif
 \ No newline at end of file
 +#endif
+diff --git a/main/audio/wake_words/afe_wake_word.cc b/main/audio/wake_words/afe_wake_word.cc
+index 8fc5fef..7f9216b 100644
+--- a/main/audio/wake_words/afe_wake_word.cc
++++ b/main/audio/wake_words/afe_wake_word.cc
+@@ -78,14 +78,29 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
+     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+     
+     afe_iface_ = esp_afe_handle_from_config(afe_config);
++    if (afe_iface_ == nullptr) {
++        ESP_LOGE(TAG, "Failed to create AFE interface");
++        return false;
++    }
+     afe_data_ = afe_iface_->create_from_config(afe_config);
++    if (afe_data_ == nullptr) {
++        ESP_LOGE(TAG, "Failed to create AFE instance");
++        return false;
++    }
+ 
+-    xTaskCreate([](void* arg) {
++    BaseType_t created = xTaskCreate([](void* arg) {
+         auto this_ = (AfeWakeWord*)arg;
+         this_->AudioDetectionTask();
+-        vTaskDelete(NULL);
++        vTaskDelete(nullptr);
+     }, "audio_detection", 4096, this, 3, nullptr);
+ 
++    if (created != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create audio detection task");
++        afe_iface_->destroy(afe_data_);
++        afe_data_ = nullptr;
++        return false;
++    }
++
+     return true;
+ }
+ 
 diff --git a/main/boards/common/board.h b/main/boards/common/board.h
 index 19d3f2f..158b701 100644
 --- a/main/boards/common/board.h
