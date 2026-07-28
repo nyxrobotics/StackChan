@@ -546,8 +546,11 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
 
     } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
         if (speaking_modifier_id_ < 0) {
+            avatar.mouth().setVisible(true);
+            avatar.mouth().setWeight(70);
             speaking_modifier_id_ = stackchan.addModifier(std::make_unique<SpeakingModifier>(0, 180, false));
-            ESP_LOGI(TAG, "Start speaking motion: modifier=%d", speaking_modifier_id_);
+            ESP_LOGI(TAG, "Start speaking motion: modifier=%d mouth_weight=%d",
+                     speaking_modifier_id_, avatar.mouth().getWeight());
         } else {
             ESP_LOGI(TAG, "Speaking motion already active: modifier=%d", speaking_modifier_id_);
         }

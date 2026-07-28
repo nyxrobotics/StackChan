@@ -30,8 +30,9 @@ public:
             _has_lifetime = true;
         }
 
-        // 嘴巴计时
-        _next_mouth_tick = now + _mouth_interval_ms;
+        // Start the first mouth tick on the next avatar update instead of
+        // waiting for a full interval after entering the speaking state.
+        _next_mouth_tick = now;
 
         // 动作计时
         if (_enable_motion) {
