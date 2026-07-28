@@ -11,6 +11,10 @@ static constexpr const char* kNvsNs         = "modllm_cfg";
 static constexpr const char* kThinkingKey   = "thinking";
 static constexpr const char* kVadEnabledKey = "vad_enabled";
 static constexpr const char* kTtsLangKey    = "tts_lang";  // 0=ja 1=zh 2=en
+static constexpr const char* kOpenJTalkGainKey = "ojt_gain_db";
+static constexpr int8_t kOpenJTalkGainMinDb = -60;
+static constexpr int8_t kOpenJTalkGainMaxDb = 0;
+static constexpr int8_t kOpenJTalkGainDefaultDb = -36;
 
 static std::unique_ptr<Container> make_row(Container* parent, int y, int h = 38) {
     auto row = std::make_unique<Container>(parent->get());
@@ -36,6 +40,11 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
         if (nvs_get_u8(h, kVadEnabledKey, &vad) == ESP_OK) _vad      = (vad != 0);
         uint8_t lang = 0;
         if (nvs_get_u8(h, kTtsLangKey,   &lang) == ESP_OK) _tts_lang = lang;
+        int8_t gain = kOpenJTalkGainDefaultDb;
+        if (nvs_get_i8(h, kOpenJTalkGainKey, &gain) == ESP_OK &&
+            gain >= kOpenJTalkGainMinDb && gain <= kOpenJTalkGainMaxDb) {
+            _openjtalk_gain_db = gain;
+        }
         nvs_close(h);
     }
 
@@ -106,10 +115,39 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
 
     update_lang_buttons();
 
+    // ---------- Open JTalk volume ----------
+    _panel_openjtalk_volume = make_row(_panel.get(), 184, 58);
+    _label_openjtalk_volume = std::make_unique<Label>(_panel_openjtalk_volume->get());
+    _label_openjtalk_volume->setText("Open JTalk volume");
+    _label_openjtalk_volume->setTextFont(&lv_font_montserrat_14);
+    _label_openjtalk_volume->setTextColor(lv_color_hex(0x26206A));
+    _label_openjtalk_volume->align(LV_ALIGN_TOP_LEFT, 12, 6);
+
+    _label_openjtalk_volume_value = std::make_unique<Label>(_panel_openjtalk_volume->get());
+    _label_openjtalk_volume_value->setText(
+        fmt::format("{} dB", static_cast<int>(_openjtalk_gain_db)));
+    _label_openjtalk_volume_value->setTextFont(&lv_font_montserrat_14);
+    _label_openjtalk_volume_value->setTextColor(lv_color_hex(0x26206A));
+    _label_openjtalk_volume_value->align(LV_ALIGN_TOP_RIGHT, -12, 6);
+
+    _slider_openjtalk_volume = std::make_unique<Slider>(_panel_openjtalk_volume->get());
+    _slider_openjtalk_volume->setRange(kOpenJTalkGainMinDb, kOpenJTalkGainMaxDb);
+    _slider_openjtalk_volume->setValue(_openjtalk_gain_db);
+    _slider_openjtalk_volume->setSize(260, 10);
+    _slider_openjtalk_volume->align(LV_ALIGN_BOTTOM_MID, 0, -8);
+    _slider_openjtalk_volume->setBgColor(lv_color_hex(0x615B9E), LV_PART_KNOB);
+    _slider_openjtalk_volume->setBgColor(lv_color_hex(0x615B9E), LV_PART_INDICATOR);
+    _slider_openjtalk_volume->setBgColor(lv_color_hex(0xB8D3FD), LV_PART_MAIN);
+    _slider_openjtalk_volume->setBgOpa(255);
+    _slider_openjtalk_volume->onValueChanged().connect([this](int32_t value) {
+        _openjtalk_gain_db = static_cast<int8_t>(value);
+        _label_openjtalk_volume_value->setText(fmt::format("{} dB", value));
+    });
+
     // ---------- Confirm button ----------
     _btn_confirm = std::make_unique<Button>(_panel->get());
     apply_button_common_style(*_btn_confirm);
-    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 185);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 252);
     _btn_confirm->setSize(290, 44);
     _btn_confirm->label().setText("Confirm");
     _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
@@ -127,12 +165,13 @@ void ModuleLLMSettingsWorker::update()
         nvs_set_u8(h, kThinkingKey,   _thinking  ? 1 : 0);
         nvs_set_u8(h, kVadEnabledKey, _vad       ? 1 : 0);
         nvs_set_u8(h, kTtsLangKey,    _tts_lang);
+        nvs_set_i8(h, kOpenJTalkGainKey, _openjtalk_gain_db);
         nvs_commit(h);
         nvs_close(h);
     }
 
-    mclog::info("ModLLMSettings: thinking={} vad={} tts_lang={}",
-                _thinking, _vad, (int)_tts_lang);
+    mclog::info("ModLLMSettings: thinking={} vad={} tts_lang={} openjtalk_gain_db={}",
+                _thinking, _vad, (int)_tts_lang, (int)_openjtalk_gain_db);
     _is_done = true;
 }
 

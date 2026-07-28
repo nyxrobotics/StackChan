@@ -54,6 +54,10 @@ static constexpr const char* kLlmNvsNamespace = "modllm_cfg";
 static constexpr const char* kThinkingKey     = "thinking";
 static constexpr const char* kVadEnabledKey   = "vad_enabled";
 static constexpr const char* kTtsLangKey      = "tts_lang";  // 0=ja 1=zh 2=en
+static constexpr const char* kOpenJTalkGainKey = "ojt_gain_db";
+static constexpr int8_t kOpenJTalkGainMinDb = -60;
+static constexpr int8_t kOpenJTalkGainMaxDb = 0;
+static constexpr int8_t kOpenJTalkGainDefaultDb = -36;
 static constexpr const char* kVadPcmBridgeCommand =
     "/opt/stackchan/stackchan_vad_pcm_bridge.py";
 static constexpr const char* kVadPcmBridgePauseFile =
@@ -102,11 +106,16 @@ ModuleLLMClient::ModuleLLMClient()
         if (nvs_get_u8(h, kVadEnabledKey, &vad) == ESP_OK) vadEnabled_ = (vad != 0);
         uint8_t lang = 0;
         if (nvs_get_u8(h, kTtsLangKey, &lang) == ESP_OK) ttsLang_ = lang;
+        int8_t gain = kOpenJTalkGainDefaultDb;
+        if (nvs_get_i8(h, kOpenJTalkGainKey, &gain) == ESP_OK &&
+            gain >= kOpenJTalkGainMinDb && gain <= kOpenJTalkGainMaxDb) {
+            openJTalkGainDb_ = gain;
+        }
         nvs_close(h);
     }
 
-    ESP_LOGI(TAG, "thinkingEnabled=%d vadEnabled=%d ttsLang=%d (from NVS)",
-             thinkingEnabled_, vadEnabled_, (int)ttsLang_);
+    ESP_LOGI(TAG, "thinkingEnabled=%d vadEnabled=%d ttsLang=%d openJTalkGainDb=%d (from NVS)",
+             thinkingEnabled_, vadEnabled_, (int)ttsLang_, (int)openJTalkGainDb_);
 }
 
 void ModuleLLMClient::setThinkingEnabled(bool enabled)
@@ -1112,9 +1121,13 @@ bool ModuleLLMClient::sendToOpenJTalkTts(const std::string& requestId, const std
         return false;
     }
 
-    std::string command = "/opt/stackchan/openjtalk_tts.sh --text " + shellQuote(text);
+    std::string command =
+        "STACKCHAN_OPENJTALK_VOLUME_GAIN=" +
+        std::to_string(static_cast<int>(openJTalkGainDb_)) +
+        " /opt/stackchan/openjtalk_tts.sh --text " + shellQuote(text);
     bool ok = sysBashExec(requestId, command, 0, nullptr);
-    ESP_LOGI(TAG, "openjtalk tts send: %s", ok ? "sent" : "failed");
+    ESP_LOGI(TAG, "openjtalk tts send: %s gain_db=%d",
+             ok ? "sent" : "failed", (int)openJTalkGainDb_);
     return ok;
 }
 

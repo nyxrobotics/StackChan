@@ -530,12 +530,19 @@ private:
     std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_zh;
     std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_en;
 
+    // Open JTalk output gain
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_openjtalk_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_openjtalk_volume;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_openjtalk_volume_value;
+    std::unique_ptr<uitk::lvgl_cpp::Slider>    _slider_openjtalk_volume;
+
     std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_confirm;
 
-    bool    _thinking     = false;
-    bool    _vad          = true;
-    uint8_t _tts_lang     = 0;  // 0=ja 1=zh 2=en
-    bool    _confirm_flag = false;
+    bool    _thinking            = false;
+    bool    _vad                 = true;
+    uint8_t _tts_lang            = 0;    // 0=ja 1=zh 2=en
+    int8_t  _openjtalk_gain_db   = -36;
+    bool    _confirm_flag        = false;
 };
 
 }  // namespace setup_workers

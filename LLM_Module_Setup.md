@@ -132,6 +132,8 @@ idf.py -p /dev/ttyACM0 -b 115200 app-flash
 
 ローカル会話を固定して確認する場合は、SETUPの`LLM Mode`で
 `Local Only (Module LLM)`を選び、`Module LLM Settings`でVADを有効にします。
+同じ画面の`Open JTalk volume`では、日本語音声の出力ゲインを`-60`から
+`0 dB`まで調整できます。既定値は静かな連続試験向けの`-36 dB`です。
 
 ## 6. オフライン動作を確認する
 

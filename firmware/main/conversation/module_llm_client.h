@@ -157,6 +157,7 @@ private:
     bool thinkingEnabled_ = false;
     bool vadEnabled_      = true;
     uint8_t ttsLang_      = 0;   // 0=ja 1=zh 2=en、NVS から復元
+    int8_t openJTalkGainDb_ = -36;
 
     // Send a StackFlow command and return response work_id (empty on error)
     std::string sfCommand(const std::string& reqId,
