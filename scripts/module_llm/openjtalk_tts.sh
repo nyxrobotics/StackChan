@@ -9,6 +9,7 @@ DICT_PATH="${STACKCHAN_OPENJTALK_DIC:-}"
 SPEED="${STACKCHAN_OPENJTALK_SPEED:-1.05}"
 PITCH_SHIFT="${STACKCHAN_OPENJTALK_PITCH_SHIFT:-0}"
 ALPHA="${STACKCHAN_OPENJTALK_ALPHA:-0.55}"
+VOLUME_GAIN="${STACKCHAN_OPENJTALK_VOLUME_GAIN:--36}"
 SYNTH_TIMEOUT="${STACKCHAN_OPENJTALK_SYNTH_TIMEOUT:-120}"
 PLAYBACK_TIMEOUT="${STACKCHAN_OPENJTALK_PLAYBACK_TIMEOUT:-300}"
 TMP_FILES=()
@@ -31,6 +32,7 @@ Usage: openjtalk_tts.sh --check | --text TEXT
 Environment:
   STACKCHAN_OPENJTALK_SYNTH_TIMEOUT     Synthesis timeout in seconds (default: 120).
   STACKCHAN_OPENJTALK_PLAYBACK_TIMEOUT  Playback timeout in seconds (default: 300).
+  STACKCHAN_OPENJTALK_VOLUME_GAIN       Open JTalk output gain in dB (default: -36).
 EOF
 }
 
@@ -140,6 +142,7 @@ speak_text() {
         -r "$SPEED" \
         -fm "$PITCH_SHIFT" \
         -a "$ALPHA" \
+        -g "$VOLUME_GAIN" \
         "$txt"
 
     set +e
