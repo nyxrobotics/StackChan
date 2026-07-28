@@ -936,9 +936,11 @@ void ModuleLLMBackend::runLlmTts(const std::string& userText) {
     cJSON_AddStringToObject(msg, "request_id", currentLlmRequestId_.c_str());
     cJSON_AddStringToObject(msg, "work_id",    llmWorkId.c_str());
     cJSON_AddStringToObject(msg, "action",     "inference");
-    cJSON_AddStringToObject(msg, "object",     "llm.utf-8");
-    // Non-streaming input: data is a plain string
-    cJSON_AddStringToObject(msg, "data", userText.c_str());
+    cJSON_AddStringToObject(msg, "object",     "llm.utf-8.stream");
+    cJSON* d = cJSON_AddObjectToObject(msg, "data");
+    cJSON_AddStringToObject(d, "delta",  userText.c_str());
+    cJSON_AddNumberToObject(d, "index",  0);
+    cJSON_AddBoolToObject(  d, "finish", true);
 
     char* s = cJSON_PrintUnformatted(msg);
     bool sent = s && client_->stackflowSend(s);

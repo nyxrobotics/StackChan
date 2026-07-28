@@ -665,8 +665,12 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "qwen3-0.6B-ax630c");
         cJSON_AddStringToObject(data, "response_format", "llm.utf-8.stream");
-        cJSON_AddStringToObject(data, "input",           "llm.utf-8");
+        // Match the official ApiLlm stream contract: setup input is
+        // llm.utf-8.stream and per-turn inference sends delta/index/finish.
+        cJSON* inputs = cJSON_AddArrayToObject(data, "input");
+        cJSON_AddItemToArray(inputs, cJSON_CreateString("llm.utf-8.stream"));
         cJSON_AddBoolToObject(data, "enoutput",        true);
+        cJSON_AddBoolToObject(data, "enkws",           false);
         cJSON_AddNumberToObject(data, "max_token_len",   512);
         cJSON_AddBoolToObject(data, "thinking",        thinkingEnabled_);
         // ttsLang_: 0=ja  1=zh  2=en-us  3=en-default
