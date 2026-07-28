@@ -396,9 +396,11 @@ private:
         }
 
         if (event == NetworkEvent::Connected) {
-            hal_bridge::notify_xiaozhi_connected();
-        } else if (event == NetworkEvent::Disconnected) {
-            hal_bridge::notify_xiaozhi_disconnected();
+            hal_bridge::notify_network_connected();
+        } else if (event == NetworkEvent::Disconnected ||
+                   event == NetworkEvent::Unavailable ||
+                   event == NetworkEvent::WifiConfigModeEnter) {
+            hal_bridge::notify_network_disconnected();
         }
     }
 
@@ -898,20 +900,6 @@ void hal_bridge::toggle_xiaozhi_chat_state()
 }
 
 // ---------------------------------------------------------------------------
-// [ADD] application.cc に追加が必要なフック（このファイルでは不要）
-//
-// notify_xiaozhi_connected / notify_xiaozhi_disconnected は上の
-// SetNetworkEventCallback ラッパーから呼ばれる。
-//
-// 残り3つ (error / turn_start / turn_end) は application.cc の
-// 該当箇所に以下を追記する:
-//
-//   [InitializeProtocol — OnNetworkError コールバック内]
-//       hal_bridge::notify_xiaozhi_error();
-//
-//   [HandleStateChangedEvent — case kDeviceStateListening:]
-//       hal_bridge::notify_turn_start();
-//
-//   [HandleStateChangedEvent — case kDeviceStateIdle:]
-//       hal_bridge::notify_turn_end();
+// Network events above report link state only. Xiaozhi protocol readiness,
+// errors, and turn transitions are reported by application.cc.
 // ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ namespace hal_bridge {
 // ConversationCallbacks
 // ---------------------------------------------------------------------------
 struct ConversationCallbacks {
+    std::function<void()>                         onNetworkConnected;
+    std::function<void()>                         onNetworkDisconnected;
     std::function<void()>                         onXiaozhiConnected;
     std::function<void()>                         onXiaozhiDisconnected;
     std::function<void()>                         onXiaozhiError;
@@ -36,6 +38,17 @@ static constexpr int kModeLocalOnly  = 2;
 void set_conversation_mode(int mode);
 int  get_conversation_mode();
 
+// Active backend values mirror BackendKind without exposing conversation headers.
+static constexpr int kBackendXiaozhiOnline = 0;
+static constexpr int kBackendModuleLLM     = 1;
+static constexpr int kBackendStatic        = 2;
+
+void set_active_conversation_backend(int backend);
+int  get_active_conversation_backend();
+bool is_module_llm_backend_active();
+
+void notify_network_connected();
+void notify_network_disconnected();
 void notify_xiaozhi_connected();
 void notify_xiaozhi_disconnected();
 void notify_xiaozhi_error();

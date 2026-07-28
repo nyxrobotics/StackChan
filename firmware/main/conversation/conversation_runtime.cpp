@@ -63,6 +63,12 @@ void setLocalResponseState(DeviceState target, const char* phase)
 void registerCallbacks()
 {
     hal_bridge::set_conversation_callbacks({
+        .onNetworkConnected = []() {
+            if (s_manager) s_manager->onNetworkConnected();
+        },
+        .onNetworkDisconnected = []() {
+            if (s_manager) s_manager->onNetworkDisconnected();
+        },
         .onXiaozhiConnected = []() {
             if (s_manager) s_manager->onXiaozhiConnected();
         },
@@ -126,13 +132,18 @@ void prepare()
     hal_bridge::set_conversation_mode(static_cast<int>(s_manager->mode()));
     registerCallbacks();
 
-    const bool localOnly = s_manager->mode() == ConversationMode::LocalOnly;
-    Application::GetInstance().SetNetworkRequired(!localOnly);
+    NetworkStartupPolicy networkPolicy = NetworkStartupPolicy::Optional;
+    if (s_manager->mode() == ConversationMode::LocalOnly) {
+        networkPolicy = NetworkStartupPolicy::Disabled;
+    } else if (s_manager->mode() == ConversationMode::OnlineOnly) {
+        networkPolicy = NetworkStartupPolicy::Required;
+    }
+    Application::GetInstance().SetNetworkStartupPolicy(networkPolicy);
     hal_bridge::set_conv_ready(false);
     s_prepared = true;
 
-    ESP_LOGI(TAG, "prepared conversation runtime: mode=%d network_required=%d",
-             static_cast<int>(s_manager->mode()), localOnly ? 0 : 1);
+    ESP_LOGI(TAG, "prepared conversation runtime: mode=%d network_policy=%d",
+             static_cast<int>(s_manager->mode()), static_cast<int>(networkPolicy));
 }
 
 void start()

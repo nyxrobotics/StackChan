@@ -114,7 +114,7 @@ private:
     AgentConfigProvider     configProvider_;
     AgentConfigStore        configStore_;
 
-    // Module LLM の初期化（LocalOnly 起動時 / Auto でネット失敗時に呼ぶ）
+    // Module LLM initialization and recovery (prewarmed by Auto/LocalOnly).
     void initModuleLLM();
 
     // Module LLM recovery runs outside backend callbacks because reconnecting

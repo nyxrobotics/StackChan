@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..63571aa 100644
+index d69d43d..fd7871f 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -8,7 +8,7 @@
@@ -11,27 +11,68 @@ index d69d43d..63571aa 100644
  
  #include <cstring>
  #include <esp_log.h>
-@@ -156,7 +156,13 @@ void Application::Initialize() {
+@@ -104,10 +104,12 @@ void Application::Initialize() {
+         
+         switch (event) {
+             case NetworkEvent::Scanning:
++                network_connected_.store(false);
+                 display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+-                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                 break;
+             case NetworkEvent::Connecting: {
++                network_connected_.store(false);
++                network_unavailable_.store(false);
+                 if (data.empty()) {
+                     // Cellular network - registering without carrier info yet
+                     display->SetStatus(Lang::Strings::REGISTERING_NETWORK);
+@@ -121,6 +123,8 @@ void Application::Initialize() {
+                 break;
+             }
+             case NetworkEvent::Connected: {
++                network_connected_.store(true);
++                network_unavailable_.store(false);
+                 std::string msg = Lang::Strings::CONNECTED_TO;
+                 msg += data;
+                 display->ShowNotification(msg.c_str(), 30000);
+@@ -128,10 +132,17 @@ void Application::Initialize() {
+                 break;
+             }
+             case NetworkEvent::Disconnected:
++                network_connected_.store(false);
++                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
++                break;
++            case NetworkEvent::Unavailable:
++                network_connected_.store(false);
++                network_unavailable_.store(true);
+                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                 break;
+             case NetworkEvent::WifiConfigModeEnter:
+-                // WiFi config mode enter is handled by WifiBoard internally
++                network_connected_.store(false);
++                xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
+                 break;
+             case NetworkEvent::WifiConfigModeExit:
+                 // WiFi config mode exit is handled by WifiBoard internally
+@@ -156,7 +167,13 @@ void Application::Initialize() {
      });
  
      // Start network asynchronously
 -    board.StartNetwork();
-+    if (network_required_) {
++    if (IsNetworkEnabled()) {
 +        board.StartNetwork();
 +    } else {
-+        ESP_LOGI(TAG, "network_required_=false: skipping Wi-Fi start");
-+        // Trigger activation directly so the main loop doesn't wait forever
-+        xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
++        ESP_LOGI(TAG, "network policy disabled: skipping Wi-Fi start");
++        network_unavailable_.store(true);
++        xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
 +    }
  
      // Update the status bar immediately to show the network state
      display->UpdateStatusBar(true);
-@@ -218,9 +224,19 @@ void Application::Run() {
+@@ -218,9 +235,18 @@ void Application::Run() {
          }
  
          if (bits & MAIN_EVENT_SEND_AUDIO) {
-+            const bool local_only =
-+                hal_bridge::get_conversation_mode() == hal_bridge::kModeLocalOnly;
++            const bool local_backend = hal_bridge::is_module_llm_backend_active();
              while (auto packet = audio_service_.PopPacketFromSendQueue()) {
 -                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
 -                    break;
@@ -40,15 +81,98 @@ index d69d43d..63571aa 100644
 +                    hal_bridge::notify_audio_chunk(
 +                        packet->payload.data(), packet->payload.size());
 +                }
-+                // [ADD] skip Xiaozhi in LocalOnly mode
-+                if (!local_only && protocol_) {
++                // Route each packet to only the backend that owns the turn.
++                if (!local_backend && protocol_) {
 +                    if (!protocol_->SendAudio(std::move(packet))) {
 +                        break;
 +                    }
                  }
              }
          }
-@@ -324,11 +340,29 @@ void Application::ActivationTask() {
+@@ -262,20 +288,10 @@ void Application::HandleNetworkConnectedEvent() {
+     ESP_LOGI(TAG, "Network connected");
+     auto state = GetDeviceState();
+ 
+-    if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
+-        // Network is ready, start activation
++    if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring ||
++        (state == kDeviceStateIdle && !IsNetworkRequired() && !protocol_)) {
+         SetDeviceState(kDeviceStateActivating);
+-        if (activation_task_handle_ != nullptr) {
+-            ESP_LOGW(TAG, "Activation task already running");
+-            return;
+-        }
+-
+-        xTaskCreate([](void* arg) {
+-            Application* app = static_cast<Application*>(arg);
+-            app->ActivationTask();
+-            app->activation_task_handle_ = nullptr;
+-            vTaskDelete(NULL);
+-        }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
++        StartActivationTask();
+     }
+ 
+     // Update the status bar immediately to show the network state
+@@ -286,16 +302,57 @@ void Application::HandleNetworkConnectedEvent() {
+ void Application::HandleNetworkDisconnectedEvent() {
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+-    if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
++    if (protocol_ && protocol_->IsAudioChannelOpened() &&
++        (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking)) {
+         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
+         protocol_->CloseAudioChannel();
+     }
+ 
++    if (!IsNetworkRequired() && network_unavailable_.load() &&
++        state == kDeviceStateStarting) {
++        ESP_LOGI(TAG, "Optional network unavailable; continuing with local conversation");
++        SetDeviceState(kDeviceStateActivating);
++        StartActivationTask();
++    }
++
+     // Update the status bar immediately to show the network state
+     auto display = Board::GetInstance().GetDisplay();
+     display->UpdateStatusBar(true);
+ }
+ 
++void Application::StartActivationTask() {
++    if (activation_task_handle_ != nullptr) {
++        ESP_LOGI(TAG, "Activation task already running");
++        return;
++    }
++
++    BaseType_t created = xTaskCreate([](void* arg) {
++        Application* app = static_cast<Application*>(arg);
++        app->ActivationTask();
++        app->activation_task_handle_ = nullptr;
++        vTaskDelete(nullptr);
++    }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
++
++    if (created != pdPASS) {
++        activation_task_handle_ = nullptr;
++        ESP_LOGE(TAG, "Failed to create activation task");
++        SetDeviceState(kDeviceStateIdle);
++    }
++}
++
++void Application::WaitForConversationRuntime() {
++    ESP_LOGI(TAG, "Waiting for local conversation runtime");
++    int wait_count = 0;
++    while (!hal_bridge::is_conv_ready() && wait_count++ < 1800) {
++        vTaskDelay(pdMS_TO_TICKS(100));
++    }
++    if (hal_bridge::is_conv_ready()) {
++        ESP_LOGI(TAG, "Local conversation runtime ready");
++    } else {
++        ESP_LOGW(TAG, "Local conversation runtime wait timed out");
++    }
++}
++
+ void Application::HandleActivationDoneEvent() {
+     ESP_LOGI(TAG, "Activation done");
+ 
+@@ -324,25 +381,44 @@ void Application::ActivationTask() {
      // Create OTA object for activation process
      ota_ = std::make_unique<Ota>();
  
@@ -57,32 +181,35 @@ index d69d43d..63571aa 100644
 +    // Apply the assets already present in flash. Startup never consumes a
 +    // download URL and never downloads or rewrites the assets partition.
 +    ApplyLocalAssets();
+ 
+-    // Check for new firmware version
+-    CheckNewVersion();
++    const bool use_local_startup = !IsNetworkEnabled() ||
++        (!IsNetworkRequired() && network_unavailable_.load());
++    if (use_local_startup) {
++        WaitForConversationRuntime();
++        if (!IsNetworkEnabled() || !network_connected_.load()) {
++            xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
++            return;
++        }
++        ESP_LOGI(TAG, "Network recovered while local runtime was starting; trying Xiaozhi");
++    }
 +
-+    // [ADD] LocalOnly: show face (activating state) until conv pipeline is ready
-+    if (!network_required_) {
-+        ESP_LOGI(TAG, "network_required_=false: waiting for conv pipeline...");
-+        int wait_count = 0;
-+        while (!hal_bridge::is_conv_ready() && wait_count++ < 1800) {
-+            vTaskDelay(pdMS_TO_TICKS(100));
-+        }
-+        if (hal_bridge::is_conv_ready()) {
-+            ESP_LOGI(TAG, "Conv pipeline ready, activation done");
-+        } else {
-+            ESP_LOGW(TAG, "Conv pipeline wait timed out, continuing activation");
-+        }
++    // Refresh activation and protocol settings without inspecting the firmware
++    // section returned by the bootstrap endpoint.
++    if (!FetchServerConfiguration()) {
++        WaitForConversationRuntime();
 +        xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
 +        return;
 +    }
  
--    // Check for new firmware version
--    CheckNewVersion();
-+    // Refresh activation and protocol settings without inspecting the firmware
-+    // section returned by the bootstrap endpoint.
-+    FetchServerConfiguration();
- 
      // Initialize the protocol
-     InitializeProtocol();
-@@ -337,12 +371,12 @@ void Application::ActivationTask() {
+-    InitializeProtocol();
++    if (!InitializeProtocol() && !IsNetworkRequired()) {
++        WaitForConversationRuntime();
++    }
+ 
+     // Signal completion to main loop
      xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
  }
  
@@ -99,7 +226,7 @@ index d69d43d..63571aa 100644
  
      auto& board = Board::GetInstance();
      auto display = board.GetDisplay();
-@@ -352,97 +386,50 @@ void Application::CheckAssetsVersion() {
+@@ -352,97 +428,56 @@ void Application::CheckAssetsVersion() {
          ESP_LOGW(TAG, "Assets partition is disabled for board %s", BOARD_NAME);
          return;
      }
@@ -107,7 +234,7 @@ index d69d43d..63571aa 100644
 -    Settings settings("assets", true);
 -    // Check if there is a new assets need to be downloaded
 -    std::string download_url = settings.GetString("download_url");
- 
+-
 -    if (!download_url.empty()) {
 -        settings.EraseKey("download_url");
 -
@@ -120,7 +247,7 @@ index d69d43d..63571aa 100644
 -        SetDeviceState(kDeviceStateUpgrading);
 -        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 -        display->SetChatMessage("system", Lang::Strings::PLEASE_WAIT);
--
+ 
 -        bool success = assets.Download(download_url, [this, display](int progress, size_t speed) -> void {
 -            char buffer[32];
 -            snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
@@ -148,7 +275,7 @@ index d69d43d..63571aa 100644
  }
  
 -void Application::CheckNewVersion() {
-+void Application::FetchServerConfiguration() {
++bool Application::FetchServerConfiguration() {
      const int MAX_RETRY = 10;
      int retry_count = 0;
 -    int retry_delay = 10; // Initial retry delay in seconds
@@ -165,12 +292,19 @@ index d69d43d..63571aa 100644
 +    while (true) {
 +        esp_err_t err = ota_->FetchServerConfig();
          if (err != ESP_OK) {
++            if (!IsNetworkRequired()) {
++                ESP_LOGW(TAG, "Server configuration unavailable; selecting local conversation");
++                hal_bridge::notify_xiaozhi_error();
++                return false;
++            }
++
              retry_count++;
              if (retry_count >= MAX_RETRY) {
 -                ESP_LOGE(TAG, "Too many retries, exit version check");
+-                return;
 +                ESP_LOGE(TAG, "Unable to fetch server configuration after %d attempts; using cached protocol settings",
 +                    retry_count);
-                 return;
++                return true;
              }
  
 -            char error_message[128];
@@ -214,33 +348,139 @@ index d69d43d..63571aa 100644
              break;
          }
  
-@@ -688,7 +675,11 @@ void Application::HandleToggleChatEvent() {
+@@ -468,9 +503,11 @@ void Application::CheckNewVersion() {
+             }
+         }
+     }
++
++    return true;
+ }
+ 
+-void Application::InitializeProtocol() {
++bool Application::InitializeProtocol() {
+     auto& board = Board::GetInstance();
+     auto display = board.GetDisplay();
+     auto codec = board.GetAudioCodec();
+@@ -487,12 +524,38 @@ void Application::InitializeProtocol() {
      }
  
-     if (!protocol_) {
--        ESP_LOGE(TAG, "Protocol not initialized");
-+        if (network_required_) {
-+            ESP_LOGE(TAG, "Protocol not initialized");
-+        } else if (state == kDeviceStateSpeaking) {
-+            AbortSpeaking(kAbortReasonNone);  // LocalOnly: abort TTS on touch
+     protocol_->OnConnected([this]() {
++        hal_bridge::notify_xiaozhi_connected();
+         DismissAlert();
+     });
+ 
++    protocol_->OnDisconnected([this]() {
++        hal_bridge::notify_xiaozhi_disconnected();
++        if (!IsNetworkRequired()) {
++            Schedule([this]() {
++                auto state = GetDeviceState();
++                if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
++                    state == kDeviceStateSpeaking) {
++                    SetDeviceState(kDeviceStateIdle);
++                }
++            });
 +        }
++    });
++
+     protocol_->OnNetworkError([this](const std::string& message) {
+         last_error_message_ = message;
+-        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
++        hal_bridge::notify_xiaozhi_error();
++        if (IsNetworkRequired()) {
++            xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
++        } else {
++            ESP_LOGW(TAG, "Online protocol failed; continuing with Module LLM: %s", message.c_str());
++            Schedule([this]() {
++                auto state = GetDeviceState();
++                if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
++                    state == kDeviceStateSpeaking) {
++                    SetDeviceState(kDeviceStateIdle);
++                }
++            });
++        }
+     });
+     
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+@@ -606,7 +669,13 @@ void Application::InitializeProtocol() {
+         }
+     });
+     
+-    protocol_->Start();
++    const bool started = protocol_->Start();
++    if (started) {
++        // WebSocket connects lazily on the first turn; successful protocol
++        // initialization is the earliest common online-ready boundary.
++        hal_bridge::notify_xiaozhi_connected();
++    }
++    return started;
+ }
+ 
+ void Application::ShowActivationCode(const std::string& code, const std::string& message) {
+@@ -687,8 +756,15 @@ void Application::HandleToggleChatEvent() {
          return;
      }
  
-@@ -738,7 +729,11 @@ void Application::HandleStartListeningEvent() {
-     }
- 
++    if (hal_bridge::is_module_llm_backend_active()) {
++        if (state == kDeviceStateSpeaking) {
++            AbortSpeaking(kAbortReasonNone);
++        }
++        return;
++    }
++
      if (!protocol_) {
 -        ESP_LOGE(TAG, "Protocol not initialized");
-+        if (network_required_) {
-+            ESP_LOGE(TAG, "Protocol not initialized");
-+        } else if (state == kDeviceStateSpeaking) {
-+            AbortSpeaking(kAbortReasonNone);  // LocalOnly: abort TTS on touch
++        ESP_LOGW(TAG, "No active conversation protocol");
+         return;
+     }
+ 
+@@ -715,6 +791,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+     if (GetDeviceState() != kDeviceStateConnecting) {
+         return;
+     }
++    if (hal_bridge::is_module_llm_backend_active() || !protocol_) {
++        SetDeviceState(kDeviceStateIdle);
++        return;
++    }
+ 
+     if (!protocol_->IsAudioChannelOpened()) {
+         if (!protocol_->OpenAudioChannel()) {
+@@ -737,8 +817,15 @@ void Application::HandleStartListeningEvent() {
+         return;
+     }
+ 
++    if (hal_bridge::is_module_llm_backend_active()) {
++        if (state == kDeviceStateSpeaking) {
++            AbortSpeaking(kAbortReasonNone);
 +        }
++        return;
++    }
++
+     if (!protocol_) {
+-        ESP_LOGE(TAG, "Protocol not initialized");
++        ESP_LOGW(TAG, "No active conversation protocol");
          return;
      }
      
-@@ -803,11 +798,13 @@ void Application::HandleWakeWordDetectedEvent() {
+@@ -766,6 +853,9 @@ void Application::HandleStopListeningEvent() {
+         SetDeviceState(kDeviceStateWifiConfiguring);
+         return;
+     } else if (state == kDeviceStateListening) {
++        if (hal_bridge::is_module_llm_backend_active()) {
++            return;
++        }
+         if (protocol_) {
+             protocol_->SendStopListening();
+         }
+@@ -774,7 +864,7 @@ void Application::HandleStopListeningEvent() {
+ }
+ 
+ void Application::HandleWakeWordDetectedEvent() {
+-    if (!protocol_) {
++    if (hal_bridge::is_module_llm_backend_active() || !protocol_) {
+         return;
+     }
+ 
+@@ -803,7 +893,9 @@ void Application::HandleWakeWordDetectedEvent() {
          while (audio_service_.PopPacketFromSendQueue());
  
          if (state == kDeviceStateListening) {
@@ -251,33 +491,38 @@ index d69d43d..63571aa 100644
              audio_service_.ResetDecoder();
              audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
              // Re-enable wake word detection as it was stopped by the detection itself
--            audio_service_.EnableWakeWordDetection(true);
-+            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
-         } else {
-             // Play popup sound and start listening again
-             play_popup_on_listening_ = true;
-@@ -827,7 +824,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+@@ -824,6 +916,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+     if (GetDeviceState() != kDeviceStateConnecting) {
+         return;
+     }
++    if (hal_bridge::is_module_llm_backend_active() || !protocol_) {
++        SetDeviceState(kDeviceStateIdle);
++        return;
++    }
  
      if (!protocol_->IsAudioChannelOpened()) {
          if (!protocol_->OpenAudioChannel()) {
--            audio_service_.EnableWakeWordDetection(true);
-+            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
-             return;
-         }
-     }
-@@ -867,8 +864,9 @@ void Application::HandleStateChangedEvent() {
+@@ -855,6 +951,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+ void Application::HandleStateChangedEvent() {
+     DeviceState new_state = state_machine_.GetState();
+     clock_ticks_ = 0;
++    const bool local_backend = hal_bridge::is_module_llm_backend_active();
+ 
+     auto& board = Board::GetInstance();
+     auto display = board.GetDisplay();
+@@ -867,8 +964,9 @@ void Application::HandleStateChangedEvent() {
              display->SetStatus(Lang::Strings::STANDBY);
              display->ClearChatMessages();  // Clear messages first
              display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
 -            audio_service_.EnableVoiceProcessing(false);
 -            audio_service_.EnableWakeWordDetection(true);
 +            if (audio_service_.IsAudioProcessorRunning()) { audio_service_.EnableVoiceProcessing(false); }
-+            if (network_required_) { audio_service_.EnableWakeWordDetection(true); }
++            if (!local_backend && protocol_) { audio_service_.EnableWakeWordDetection(true); }
 +            hal_bridge::notify_turn_end();  // [ADD] notify ConversationManager
              break;
          case kDeviceStateConnecting:
              display->SetStatus(Lang::Strings::CONNECTING);
-@@ -878,9 +876,13 @@ void Application::HandleStateChangedEvent() {
+@@ -878,9 +976,13 @@ void Application::HandleStateChangedEvent() {
          case kDeviceStateListening:
              display->SetStatus(Lang::Strings::LISTENING);
              display->SetEmotion("neutral");
@@ -285,14 +530,14 @@ index d69d43d..63571aa 100644
  
              // Make sure the audio processor is running
 -            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-+            // LocalOnly: Module LLM handles audio  skip AFE init to avoid freezing LVGL
-+            if (!network_required_) {
++            // Module LLM owns VAD/ASR locally, so the online AFE stays stopped.
++            if (local_backend) {
 +                play_popup_on_listening_ = false;
 +            } else if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
                  // For auto mode, wait for playback queue to be empty before enabling voice processing
                  // This prevents audio truncation when STOP arrives late due to network jitter
                  if (listening_mode_ == kListeningModeAutoStop) {
-@@ -888,13 +890,15 @@ void Application::HandleStateChangedEvent() {
+@@ -888,13 +990,17 @@ void Application::HandleStateChangedEvent() {
                  }
                  
                  // Send the start listening command
@@ -306,11 +551,13 @@ index d69d43d..63571aa 100644
  #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
              // Enable wake word detection in listening mode (configured via Kconfig)
 -            audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
-+            if (network_required_) { audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord()); }
++            if (!local_backend && protocol_) {
++                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++            }
  #else
              // Disable wake word detection in listening mode
              audio_service_.EnableWakeWordDetection(false);
-@@ -910,9 +914,9 @@ void Application::HandleStateChangedEvent() {
+@@ -910,9 +1016,11 @@ void Application::HandleStateChangedEvent() {
              display->SetStatus(Lang::Strings::SPEAKING);
  
              if (listening_mode_ != kListeningModeRealtime) {
@@ -318,58 +565,100 @@ index d69d43d..63571aa 100644
 +                if (audio_service_.IsAudioProcessorRunning()) { audio_service_.EnableVoiceProcessing(false); }
                  // Only AFE wake word can be detected in speaking mode
 -                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
-+                if (network_required_) { audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord()); }
++                if (!local_backend && protocol_) {
++                    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++                }
              }
              audio_service_.ResetDecoder();
              break;
-@@ -940,6 +944,10 @@ void Application::AbortSpeaking(AbortReason reason) {
-     if (protocol_) {
+@@ -937,7 +1045,9 @@ void Application::Schedule(std::function<void()>&& callback) {
+ void Application::AbortSpeaking(AbortReason reason) {
+     ESP_LOGI(TAG, "Abort speaking");
+     aborted_ = true;
+-    if (protocol_) {
++    if (hal_bridge::is_module_llm_backend_active()) {
++        hal_bridge::notify_local_abort();
++    } else if (protocol_) {
          protocol_->SendAbortSpeaking(reason);
      }
-+    // [ADD] LocalOnly  backend Whisper  resume
-+    if (!network_required_) {
-+        hal_bridge::notify_local_abort();
-+    }
  }
- 
- void Application::SetListeningMode(ListeningMode mode) {
+@@ -1116,4 +1226,3 @@ void Application::ResetProtocol() {
+         protocol_.reset();
+     });
+ }
+-
 diff --git a/main/application.h b/main/application.h
-index 7ca7af4..6432d2d 100644
+index 7ca7af4..2d6d02a 100644
 --- a/main/application.h
 +++ b/main/application.h
-@@ -56,6 +56,10 @@ public:
+@@ -7,6 +7,8 @@
+ #include <esp_timer.h>
+ 
+ #include <string>
++#include <atomic>
++#include <cstdint>
+ #include <mutex>
+ #include <deque>
+ #include <memory>
+@@ -39,6 +41,12 @@ enum AecMode {
+     kAecOnServerSide,
+ };
+ 
++enum class NetworkStartupPolicy : uint8_t {
++    Disabled,
++    Optional,
++    Required,
++};
++
+ class Application {
+ public:
+     static Application& GetInstance() {
+@@ -56,6 +64,12 @@ public:
       */
      void Initialize();
  
-+    // [ADD] Call before Initialize() to skip Wi-Fi and Xiaozhi protocol (LocalOnly mode).
-+    void SetNetworkRequired(bool required) { network_required_ = required; }
-+    bool IsNetworkRequired() const { return network_required_; }
++    // Set before Initialize(). Optional starts Wi-Fi but permits local fallback.
++    void SetNetworkStartupPolicy(NetworkStartupPolicy policy) { network_policy_ = policy; }
++    NetworkStartupPolicy GetNetworkStartupPolicy() const { return network_policy_; }
++    bool IsNetworkEnabled() const { return network_policy_ != NetworkStartupPolicy::Disabled; }
++    bool IsNetworkRequired() const { return network_policy_ == NetworkStartupPolicy::Required; }
 +
      /**
       * Run the main event loop
       * This function runs in the main task and never returns.
-@@ -138,8 +142,9 @@ private:
+@@ -138,8 +152,11 @@ private:
  
      bool has_server_time_ = false;
      bool aborted_ = false;
 -    bool assets_version_checked_ = false;
 +    bool assets_applied_ = false;
      bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
-+    bool network_required_ = true;          // [ADD] set false to skip Wi-Fi + Xiaozhi (LocalOnly mode)
++    NetworkStartupPolicy network_policy_ = NetworkStartupPolicy::Required;
++    std::atomic<bool> network_connected_ {false};
++    std::atomic<bool> network_unavailable_ {false};
      int clock_ticks_ = 0;
      TaskHandle_t activation_task_handle_ = nullptr;
  
-@@ -160,8 +165,8 @@ private:
+@@ -155,14 +172,16 @@ private:
+     void HandleWakeWordDetectedEvent();
+     void ContinueOpenAudioChannel(ListeningMode mode);
+     void ContinueWakeWordInvoke(const std::string& wake_word);
++    void StartActivationTask();
++    void WaitForConversationRuntime();
+ 
+     // Activation task (runs in background)
      void ActivationTask();
  
      // Helper methods
 -    void CheckAssetsVersion();
 -    void CheckNewVersion();
+-    void InitializeProtocol();
 +    void ApplyLocalAssets();
-+    void FetchServerConfiguration();
-     void InitializeProtocol();
++    bool FetchServerConfiguration();
++    bool InitializeProtocol();
      void ShowActivationCode(const std::string& code, const std::string& message);
      void SetListeningMode(ListeningMode mode);
+     ListeningMode GetDefaultListeningMode() const;
 diff --git a/main/assets.cc b/main/assets.cc
 index ad61944..3e3f47d 100644
 --- a/main/assets.cc
@@ -557,6 +846,82 @@ index 99db546..97238f7 100644
 -#endif
 \ No newline at end of file
 +#endif
+diff --git a/main/boards/common/board.h b/main/boards/common/board.h
+index 19d3f2f..158b701 100644
+--- a/main/boards/common/board.h
++++ b/main/boards/common/board.h
+@@ -22,6 +22,7 @@ enum class NetworkEvent {
+     Connecting,            // Network is connecting (data: SSID/network name)
+     Connected,             // Network connected successfully (data: SSID/network name)
+     Disconnected,          // Network disconnected
++    Unavailable,           // Initial connection cannot be established
+     WifiConfigModeEnter,   // Entered WiFi configuration mode
+     WifiConfigModeExit,    // Exited WiFi configuration mode
+     // Cellular modem specific events
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 377685b..617e240 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -25,6 +25,7 @@ static const char *TAG = "WifiBoard";
+ 
+ // Connection timeout in seconds
+ static constexpr int CONNECT_TIMEOUT_SEC = 60;
++static constexpr int OPTIONAL_CONNECT_TIMEOUT_SEC = 15;
+ 
+ WifiBoard::WifiBoard() {
+     // Create connection timeout timer
+@@ -93,13 +94,20 @@ void WifiBoard::TryWifiConnect() {
+     if (have_ssid) {
+         // Start connection attempt with timeout
+         ESP_LOGI(TAG, "Starting WiFi connection attempt");
+-        esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
++        const int timeout_sec = Application::GetInstance().IsNetworkRequired()
++            ? CONNECT_TIMEOUT_SEC
++            : OPTIONAL_CONNECT_TIMEOUT_SEC;
++        esp_timer_start_once(connect_timer_, timeout_sec * 1000000ULL);
+         WifiManager::GetInstance().StartStation();
+     } else {
+-        // No SSID configured, enter config mode
+-        // Wait for the board version to be shown
++        // Wait for the board version to be shown before deciding how to proceed.
+         vTaskDelay(pdMS_TO_TICKS(1500));
+-        StartWifiConfigMode();
++        if (Application::GetInstance().IsNetworkRequired()) {
++            StartWifiConfigMode();
++        } else {
++            ESP_LOGW(TAG, "No WiFi credentials; optional network will use local conversation");
++            OnNetworkEvent(NetworkEvent::Unavailable);
++        }
+     }
+ }
+ 
+@@ -124,6 +132,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
+         case NetworkEvent::Disconnected:
+             ESP_LOGW(TAG, "WiFi disconnected");
+             break;
++        case NetworkEvent::Unavailable:
++            ESP_LOGW(TAG, "WiFi unavailable");
++            break;
+         case NetworkEvent::WifiConfigModeEnter:
+             ESP_LOGI(TAG, "WiFi config mode entered");
+             in_config_mode_ = true;
+@@ -150,8 +161,15 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
+ 
+ void WifiBoard::OnWifiConnectTimeout(void* arg) {
+     auto* board = static_cast<WifiBoard*>(arg);
+-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
++    auto& app = Application::GetInstance();
+ 
++    if (!app.IsNetworkRequired()) {
++        ESP_LOGW(TAG, "WiFi connection timeout; optional network will use local conversation");
++        board->OnNetworkEvent(NetworkEvent::Unavailable);
++        return;
++    }
++
++    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
+     WifiManager::GetInstance().StopStation();
+     board->StartWifiConfigMode();
+ }
 diff --git a/main/mcp_server.cc b/main/mcp_server.cc
 index 7cd7ba0..e6cbc09 100644
 --- a/main/mcp_server.cc

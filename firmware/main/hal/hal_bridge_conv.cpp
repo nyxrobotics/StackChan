@@ -12,6 +12,7 @@ namespace hal_bridge {
 static std::mutex            s_mutex;
 static ConversationCallbacks s_cbs;
 static int                   s_mode = kModeAuto;
+static std::atomic<int>      s_activeBackend{kBackendStatic};
 static std::atomic<bool>     s_localTtsActive{false};  // TTS再生中フラグ（タッチ中断判定用）
 static std::atomic<bool>     s_convReady{false};        // conv 初期化完了フラグ
 
@@ -31,6 +32,37 @@ void set_conversation_mode(int mode) {
 int get_conversation_mode() {
     std::lock_guard<std::mutex> lock(s_mutex);
     return s_mode;
+}
+
+void set_active_conversation_backend(int backend) {
+    s_activeBackend.store(backend);
+    ESP_LOGI(TAG, "active conversation backend = %d", backend);
+}
+
+int get_active_conversation_backend() {
+    return s_activeBackend.load();
+}
+
+bool is_module_llm_backend_active() {
+    return s_activeBackend.load() == kBackendModuleLLM;
+}
+
+void notify_network_connected() {
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onNetworkConnected;
+    }
+    if (cb) cb();
+}
+
+void notify_network_disconnected() {
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onNetworkDisconnected;
+    }
+    if (cb) cb();
 }
 
 void notify_xiaozhi_connected() {

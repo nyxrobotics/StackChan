@@ -3,11 +3,16 @@
 #include "module_llm_backend.h"
 #include "module_llm_client.h"
 #include "static_fallback_backend.h"
+#include "hal/hal_bridge_conv.h"
 
 #include <esp_log.h>
 #include <settings.h>   // xiaozhi-esp32 NVS wrapper
 
 static const char* TAG = "ConvMgr";
+
+static_assert(static_cast<int>(BackendKind::XiaozhiOnline) == hal_bridge::kBackendXiaozhiOnline);
+static_assert(static_cast<int>(BackendKind::ModuleLLM) == hal_bridge::kBackendModuleLLM);
+static_assert(static_cast<int>(BackendKind::StaticFallback) == hal_bridge::kBackendStatic);
 
 // NVS namespace / key
 static constexpr const char* kNvsNs  = "conv_mgr";
@@ -264,14 +269,12 @@ void ConversationManager::start() {
 
     const ConversationMode mode = loadModeFromNvs();
 
-    // LocalOnly: 起動時すぐに Module LLM を初期化
-    // Auto: ネット失敗時に initModuleLLM() を呼ぶ（onXiaozhiError 等で）
-    // OnlineOnly: Module LLM を使わない
-    if (mode == ConversationMode::LocalOnly) {
+    // Auto prewarms the local pipeline so a network failure can fall back
+    // without leaving the application in its network setup state.
+    if (mode != ConversationMode::OnlineOnly) {
         initModuleLLM();
     } else {
-        ESP_LOGI(TAG, "mode=%d: skipping Module LLM init (will init on network failure if Auto)",
-                 static_cast<int>(mode));
+        ESP_LOGI(TAG, "OnlineOnly: skipping Module LLM init");
     }
 
     // Step 4 — select initial backend and start it
@@ -280,7 +283,7 @@ void ConversationManager::start() {
 
     startRecoveryTask();
 
-    if (mode == ConversationMode::LocalOnly && !llmInitialized_) {
+    if (mode != ConversationMode::OnlineOnly && !llmInitialized_) {
         requestModuleRecovery("startup connection failed");
     }
 
@@ -345,6 +348,9 @@ void ConversationManager::onNetworkDisconnected() {
 void ConversationManager::onXiaozhiConnected() {
     health_.onlineReady = true;
     ESP_LOGI(TAG, "Xiaozhi connected → onlineReady=true");
+    if (loadModeFromNvs() != ConversationMode::LocalOnly && !turnInProgress_) {
+        activateBackend(selectBackendFast());
+    }
 }
 
 void ConversationManager::onXiaozhiDisconnected() {
@@ -390,6 +396,11 @@ void ConversationManager::onTurnEnd() {
         activeBackend_->endTurn();
     }
     turnInProgress_ = false;
+
+    BackendKind chosen = selectBackendFast();
+    if (activeBackend_ == nullptr || activeBackend_->kind() != chosen) {
+        activateBackend(chosen);
+    }
 
     ESP_LOGD(TAG, "Turn ended");
 }
@@ -455,12 +466,18 @@ void ConversationManager::activateBackend(BackendKind kind) {
             break;
     }
 
-    if (activeBackend_ && activeBackend_ != next) {
+    if (activeBackend_ == next) {
+        hal_bridge::set_active_conversation_backend(static_cast<int>(kind));
+        return;
+    }
+
+    if (activeBackend_) {
         activeBackend_->stop();
     }
 
     activeBackend_ = next;
     activeBackend_->start();
+    hal_bridge::set_active_conversation_backend(static_cast<int>(kind));
 
     ESP_LOGI(TAG, "Activated backend: %d", static_cast<int>(kind));
 }

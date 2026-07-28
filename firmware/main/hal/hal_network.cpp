@@ -77,6 +77,7 @@ struct NetworkWaitState {
             case NetworkEvent::ModemErrorRegDenied:
             case NetworkEvent::ModemErrorInitFailed:
             case NetworkEvent::ModemErrorTimeout:
+            case NetworkEvent::Unavailable:
                 xEventGroupSetBits(events, kNetworkUnavailableBit);
                 break;
             case NetworkEvent::Disconnected:
@@ -109,9 +110,11 @@ static void time_sync_notification_cb(struct timeval* tv)
 
 void Hal::startSntp()
 {
-    // Wi-Fi が無効な場合（LocalOnly モード等）は lwIP が未初期化なので SNTP をスキップする
-    if (!Application::GetInstance().IsNetworkRequired()) {
-        mclog::tagInfo(_tag, "SNTP skipped (network not required)");
+    // Auto can become ready through its local fallback before Wi-Fi/lwIP has
+    // been initialized. Calling SNTP in that state asserts inside tcpip_callback.
+    if (!Application::GetInstance().IsNetworkEnabled() ||
+        !WifiManager::GetInstance().IsConnected()) {
+        mclog::tagInfo(_tag, "SNTP skipped (network not connected)");
         return;
     }
 
