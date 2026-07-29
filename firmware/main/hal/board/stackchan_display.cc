@@ -382,6 +382,8 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
         avatar.setEmotion(Emotion::Dizzy);
     } else if (strcmp(emotion, "wink") == 0 || strcmp(emotion, "winking") == 0) {
         avatar.setEmotion(Emotion::Wink);
+    } else if (strcmp(emotion, "eyes_closed") == 0) {
+        avatar.setEmotion(Emotion::EyesClosed);
     } else {
         ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
         avatar.setEmotion(Emotion::Neutral);

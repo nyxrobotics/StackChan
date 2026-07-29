@@ -45,6 +45,7 @@ constexpr int kFaceBottom         = kFaceTop + kFaceHeight - 1;
 constexpr float kFaceScale        = 1.24f;
 constexpr Point kFaceSourceCenter = {157, 119};
 constexpr Point kFaceTargetCenter = {160, 120};
+constexpr int kSleepyRestingMouthWeight = 32;
 static_assert(kFaceScale > 0.0f);
 
 Point apply_face_layout(float x, float y)
@@ -118,42 +119,6 @@ void draw_polyline(const DrawContext& context, const Point (&points)[PointCount]
     }
 }
 
-template <size_t PointCount>
-void draw_smooth_polyline(const DrawContext& context, const Point (&points)[PointCount], int width,
-                          const FeaturePose& pose, Point pivot, lv_color_t color = lv_color_white(),
-                          int subdivisions = 3)
-{
-    static_assert(PointCount >= 2);
-    subdivisions = std::max(1, subdivisions);
-
-    Point previous = points[0];
-    for (size_t index = 0; index + 1 < PointCount; ++index) {
-        const Point& p0 = points[index == 0 ? index : index - 1];
-        const Point& p1 = points[index];
-        const Point& p2 = points[index + 1];
-        const Point& p3 = points[index + 2 < PointCount ? index + 2 : index + 1];
-
-        for (int step = 1; step <= subdivisions; ++step) {
-            const float t          = static_cast<float>(step) / static_cast<float>(subdivisions);
-            const float t2         = t * t;
-            const float t3         = t2 * t;
-            const auto interpolate = [t, t2, t3](int v0, int v1, int v2, int v3) {
-                return static_cast<int>(
-                    std::lround(0.5f * (2.0f * v1 + (-v0 + v2) * t + (2.0f * v0 - 5.0f * v1 + 4.0f * v2 - v3) * t2 +
-                                        (-v0 + 3.0f * v1 - 3.0f * v2 + v3) * t3)));
-            };
-            const Point current = {
-                interpolate(p0.x, p1.x, p2.x, p3.x),
-                interpolate(p0.y, p1.y, p2.y, p3.y),
-            };
-            if (current.x != previous.x || current.y != previous.y) {
-                draw_line(context, previous, current, width, pose, pivot, color);
-            }
-            previous = current;
-        }
-    }
-}
-
 int normalize_angle(int angle)
 {
     angle %= 360;
@@ -197,7 +162,8 @@ void draw_ring(const DrawContext& context, Point center, int outer_radius, int w
     lv_draw_arc(context.layer, &descriptor);
 }
 
-void draw_filled_circle(const DrawContext& context, Point center, int diameter, lv_color_t color = lv_color_white())
+void draw_filled_circle(const DrawContext& context, Point center, int diameter, lv_color_t color = lv_color_white(),
+                        lv_opa_t opacity = LV_OPA_COVER)
 {
     const int half       = diameter / 2;
     const lv_area_t area = {
@@ -210,15 +176,15 @@ void draw_filled_circle(const DrawContext& context, Point center, int diameter, 
     lv_draw_rect_dsc_t descriptor;
     lv_draw_rect_dsc_init(&descriptor);
     descriptor.bg_color = color;
-    descriptor.bg_opa   = LV_OPA_COVER;
+    descriptor.bg_opa   = opacity;
     descriptor.radius   = LV_RADIUS_CIRCLE;
     lv_draw_rect(context.layer, &descriptor, &area);
 }
 
 void draw_filled_circle(const DrawContext& context, Point center, int diameter, const FeaturePose& pose, Point pivot,
-                        lv_color_t color = lv_color_white())
+                        lv_color_t color = lv_color_white(), lv_opa_t opacity = LV_OPA_COVER)
 {
-    draw_filled_circle(context, transform_point(center, pivot, pose), transform_width(diameter, pose), color);
+    draw_filled_circle(context, transform_point(center, pivot, pose), transform_width(diameter, pose), color, opacity);
 }
 
 FeaturePose without_position(FeaturePose pose)
@@ -341,7 +307,55 @@ CircularArc make_tangent_arc(Point from, Point to, float start_tangent)
         arc.start_angle = to_angle;
         arc.end_angle   = from_angle;
     }
-    arc.use_line = arc.centerline_radius > 128.0f || arc_span < 3;
+    // At this scale an arc flatter than this is sub-pixel and a straight
+    // segment is its stable, infinite-radius equivalent.
+    arc.use_line = !std::isfinite(arc.centerline_radius) || arc.centerline_radius > 512.0f || arc_span < 2;
+    return arc;
+}
+
+CircularArc make_circular_arc_through(Point from, Point through, Point to)
+{
+    const float from_squared    = static_cast<float>(from.x * from.x + from.y * from.y);
+    const float through_squared = static_cast<float>(through.x * through.x + through.y * through.y);
+    const float to_squared      = static_cast<float>(to.x * to.x + to.y * to.y);
+    const float determinant     = 2.0f * static_cast<float>(
+                                          from.x * (through.y - to.y) + through.x * (to.y - from.y) +
+                                          to.x * (from.y - through.y));
+
+    CircularArc arc = {from, to, from, 0.0f, 0, 0, true};
+    if (std::fabs(determinant) < 0.001f) {
+        return arc;
+    }
+
+    const float center_x =
+        (from_squared * static_cast<float>(through.y - to.y) +
+         through_squared * static_cast<float>(to.y - from.y) +
+         to_squared * static_cast<float>(from.y - through.y)) /
+        determinant;
+    const float center_y =
+        (from_squared * static_cast<float>(to.x - through.x) +
+         through_squared * static_cast<float>(from.x - to.x) +
+         to_squared * static_cast<float>(through.x - from.x)) /
+        determinant;
+    arc.center = {static_cast<int>(std::lround(center_x)), static_cast<int>(std::lround(center_y))};
+
+    const float radius_x  = static_cast<float>(from.x) - center_x;
+    const float radius_y  = static_cast<float>(from.y) - center_y;
+    arc.centerline_radius = std::sqrt(radius_x * radius_x + radius_y * radius_y);
+
+    const int from_angle    = angle_to_point(arc.center, from);
+    const int through_angle = angle_to_point(arc.center, through);
+    const int to_angle      = angle_to_point(arc.center, to);
+    const int endpoint_span = normalize_angle(to_angle - from_angle);
+    const int through_span  = normalize_angle(through_angle - from_angle);
+    if (through_span <= endpoint_span) {
+        arc.start_angle = from_angle;
+        arc.end_angle   = to_angle;
+    } else {
+        arc.start_angle = to_angle;
+        arc.end_angle   = from_angle;
+    }
+    arc.use_line = !std::isfinite(arc.centerline_radius) || arc.centerline_radius > 512.0f;
     return arc;
 }
 
@@ -361,17 +375,151 @@ CircularArc mirror_arc(const CircularArc& arc, int axis_x)
 }
 
 void draw_circular_arc(const DrawContext& context, const CircularArc& arc, int width, const FeaturePose& pose,
-                       Point pivot)
+                       Point pivot, lv_color_t color = lv_color_white())
 {
     if (arc.use_line) {
-        draw_line(context, arc.from, arc.to, width, pose, pivot, lv_color_white(), false);
+        draw_line(context, arc.from, arc.to, width, pose, pivot, color, false);
         return;
     }
 
     const int outer_radius =
         std::max(1, static_cast<int>(std::lround(arc.centerline_radius + static_cast<float>(width) * 0.5f)));
-    draw_arc(context, arc.center, outer_radius, arc.start_angle, arc.end_angle, width, pose, pivot, lv_color_white(),
-             false);
+    draw_arc(context, arc.center, outer_radius, arc.start_angle, arc.end_angle, width, pose, pivot, color, false);
+}
+
+void draw_rounded_arc_through(const DrawContext& context, Point from, Point through, Point to, int width,
+                              const FeaturePose& pose, Point pivot, lv_color_t color = lv_color_white())
+{
+    draw_circular_arc(context, make_circular_arc_through(from, through, to), width, pose, pivot, color);
+    draw_filled_circle(context, from, width, pose, pivot, color);
+    draw_filled_circle(context, to, width, pose, pivot, color);
+}
+
+void draw_curved_chevron_eye(const DrawContext& context, Point vertex, int direction, const FeaturePose& pose,
+                             Point pivot)
+{
+    constexpr int width = 14;
+    const auto offset    = [vertex, direction](int x, int y) {
+        return Point{vertex.x + direction * x, vertex.y + y};
+    };
+
+    draw_rounded_arc_through(context, vertex, offset(24, -21), offset(47, -31), width, pose, pivot);
+    draw_rounded_arc_through(context, vertex, offset(24, 1), offset(47, 6), width, pose, pivot);
+}
+
+struct Direction {
+    float x;
+    float y;
+};
+
+Direction direction_between(Point from, Point to)
+{
+    const float x      = static_cast<float>(to.x - from.x);
+    const float y      = static_cast<float>(to.y - from.y);
+    const float length = std::sqrt(x * x + y * y);
+    if (length < 0.001f) {
+        return {1.0f, 0.0f};
+    }
+    return {x / length, y / length};
+}
+
+Direction tangent_between(Direction incoming, Direction outgoing)
+{
+    const float x      = incoming.x + outgoing.x;
+    const float y      = incoming.y + outgoing.y;
+    const float length = std::sqrt(x * x + y * y);
+    if (length < 0.001f) {
+        return outgoing;
+    }
+    return {x / length, y / length};
+}
+
+struct Biarc {
+    CircularArc first;
+    CircularArc second;
+    Point join;
+};
+
+bool make_biarc(Point from, Point to, Direction start_tangent, Direction end_tangent, Biarc& biarc)
+{
+    const float chord_x        = static_cast<float>(to.x - from.x);
+    const float chord_y        = static_cast<float>(to.y - from.y);
+    const float chord_squared  = chord_x * chord_x + chord_y * chord_y;
+    const float tangent_dot    = start_tangent.x * end_tangent.x + start_tangent.y * end_tangent.y;
+    const float a              = 2.0f * (1.0f - tangent_dot);
+    const float b              = 2.0f * (chord_x * (start_tangent.x + end_tangent.x) +
+                                         chord_y * (start_tangent.y + end_tangent.y));
+    constexpr float epsilon    = 0.001f;
+
+    if (chord_squared < epsilon) {
+        return false;
+    }
+
+    float tangent_distance = 0.0f;
+    if (std::fabs(a) < epsilon) {
+        if (std::fabs(b) < epsilon) {
+            return false;
+        }
+        tangent_distance = chord_squared / b;
+    } else {
+        const float discriminant = b * b + 4.0f * a * chord_squared;
+        if (discriminant < 0.0f) {
+            return false;
+        }
+        tangent_distance = (-b + std::sqrt(discriminant)) / (2.0f * a);
+    }
+
+    const float chord_length = std::sqrt(chord_squared);
+    if (!std::isfinite(tangent_distance) || tangent_distance <= epsilon || tangent_distance > chord_length * 4.0f) {
+        return false;
+    }
+
+    const float join_x = 0.5f * (static_cast<float>(from.x + to.x) +
+                                 tangent_distance * (start_tangent.x - end_tangent.x));
+    const float join_y = 0.5f * (static_cast<float>(from.y + to.y) +
+                                 tangent_distance * (start_tangent.y - end_tangent.y));
+    biarc.join          = {static_cast<int>(std::lround(join_x)), static_cast<int>(std::lround(join_y))};
+    if ((biarc.join.x == from.x && biarc.join.y == from.y) ||
+        (biarc.join.x == to.x && biarc.join.y == to.y)) {
+        return false;
+    }
+
+    biarc.first = make_tangent_arc(from, biarc.join, std::atan2(start_tangent.y, start_tangent.x));
+    biarc.second =
+        make_tangent_arc(to, biarc.join, std::atan2(-end_tangent.y, -end_tangent.x));
+    return true;
+}
+
+template <size_t PointCount>
+void draw_tangent_arc_spline(const DrawContext& context, const Point (&points)[PointCount], int width,
+                             const FeaturePose& pose, Point pivot, lv_color_t color = lv_color_white())
+{
+    static_assert(PointCount >= 2);
+
+    Direction tangents[PointCount];
+    tangents[0] = direction_between(points[0], points[1]);
+    for (size_t index = 1; index + 1 < PointCount; ++index) {
+        tangents[index] = tangent_between(direction_between(points[index - 1], points[index]),
+                                          direction_between(points[index], points[index + 1]));
+    }
+    tangents[PointCount - 1] = direction_between(points[PointCount - 2], points[PointCount - 1]);
+
+    for (size_t index = 0; index + 1 < PointCount; ++index) {
+        Biarc biarc;
+        if (make_biarc(points[index], points[index + 1], tangents[index], tangents[index + 1], biarc)) {
+            draw_circular_arc(context, biarc.first, width, pose, pivot, color);
+            draw_circular_arc(context, biarc.second, width, pose, pivot, color);
+            draw_filled_circle(context, biarc.join, width, pose, pivot, color);
+        } else {
+            draw_line(context, points[index], points[index + 1], width, pose, pivot, color, false);
+        }
+    }
+
+    // LVGL rasterizes each arc independently. A stroke-width disc at every
+    // shared endpoint gives the same round join/cap as one continuous path.
+    for (const Point point : points) {
+        draw_filled_circle(context, point, width, pose, pivot, color);
+    }
 }
 
 struct ArcBoundary {
@@ -410,6 +558,17 @@ void draw_whiskers(const DrawContext& context, Point left_top_from, Point left_t
 void draw_nose(const DrawContext& context, Point center, const FeaturePose& pose, Point pivot)
 {
     draw_line(context, {center.x - 2, center.y}, {center.x + 2, center.y}, 7, pose, pivot);
+}
+
+void draw_sleep_z(const DrawContext& context, Point top_left, int glyph_width, int glyph_height, int stroke_width,
+                  const FeaturePose& pose, Point pivot)
+{
+    const Point top_right    = {top_left.x + glyph_width, top_left.y};
+    const Point bottom_left  = {top_left.x, top_left.y + glyph_height};
+    const Point bottom_right = {top_left.x + glyph_width, top_left.y + glyph_height};
+    draw_line(context, top_left, top_right, stroke_width, pose, pivot, lv_color_white(), false);
+    draw_line(context, top_right, bottom_left, stroke_width, pose, pivot, lv_color_white(), false);
+    draw_line(context, bottom_left, bottom_right, stroke_width, pose, pivot, lv_color_white(), false);
 }
 
 void draw_cat_smile(const DrawContext& context, Point center, int half_width, const FeaturePose& pose, Point pivot)
@@ -551,7 +710,9 @@ public:
 
         _state->emotion = emotion;
         if (emotion == Emotion::Sleepy) {
-            Feature::setWeight(35);
+            Feature::setWeight(20);
+        } else if (emotion == Emotion::EyesClosed) {
+            Feature::setWeight(20);
         } else if (emotion == Emotion::Wink && !_left) {
             Feature::setWeight(25);
         } else {
@@ -621,8 +782,10 @@ public:
         }
 
         _state->emotion = emotion;
-        if (emotion == Emotion::Happy || emotion == Emotion::Cute || emotion == Emotion::Sleepy) {
+        if (emotion == Emotion::Happy || emotion == Emotion::Cute) {
             Feature::setWeight(65);
+        } else if (emotion == Emotion::Sleepy) {
+            Feature::setWeight(kSleepyRestingMouthWeight);
         } else {
             Feature::setWeight(0);
         }
@@ -729,17 +892,14 @@ void draw_squeezed_eyes(const DrawContext& context, const CatFaceState& state)
 {
     constexpr Point left_center  = {99, 122};
     constexpr Point right_center = {218, 122};
-    constexpr int width          = 13;
 
     if (state.left_eye.visible) {
         draw_line(context, {125, 68}, {135, 68}, 9, state.left_eye, left_center);
-        draw_line(context, {64, 92}, {132, 122}, width, state.left_eye, left_center);
-        draw_line(context, {68, 151}, {132, 122}, width, state.left_eye, left_center);
+        draw_curved_chevron_eye(context, {128, 122}, -1, state.left_eye, left_center);
     }
     if (state.right_eye.visible) {
         draw_line(context, {178, 68}, {188, 68}, 9, state.right_eye, right_center);
-        draw_line(context, {185, 122}, {253, 92}, width, state.right_eye, right_center);
-        draw_line(context, {185, 122}, {249, 151}, width, state.right_eye, right_center);
+        draw_curved_chevron_eye(context, {190, 122}, 1, state.right_eye, right_center);
     }
 }
 
@@ -825,28 +985,104 @@ void draw_cute_eyes(const DrawContext& context, const CatFaceState& state)
     }
 }
 
+void draw_sad_eyes(const DrawContext& context, const CatFaceState& state)
+{
+    constexpr Point left_center   = {105, 110};
+    constexpr Point right_center  = {214, 110};
+    const FeaturePose left_frame  = without_position(state.left_eye);
+    const FeaturePose right_frame = without_position(state.right_eye);
+
+    if (state.left_eye.visible) {
+        draw_line(context, {128, 68}, {137, 66}, 9, left_frame, left_center);
+        if (is_blinking(state.left_eye)) {
+            draw_closed_blink(context, left_center, left_frame);
+        } else {
+            draw_cute_eye_contents(context, left_center, {94, 98}, {122, 126}, state.left_eye);
+        }
+    }
+    if (state.right_eye.visible) {
+        draw_line(context, {181, 66}, {190, 68}, 9, right_frame, right_center);
+        if (is_blinking(state.right_eye)) {
+            draw_closed_blink(context, right_center, right_frame);
+        } else {
+            draw_cute_eye_contents(context, right_center, {203, 98}, {231, 126}, state.right_eye);
+        }
+    }
+}
+
+void draw_suspicious_eye(const DrawContext& context, Point center, int pupil_offset, const FeaturePose& pose)
+{
+    constexpr int eye_radius   = 40;
+    constexpr int eye_width    = 7;
+    constexpr int lid_width    = 15;
+    constexpr int lid_offset_y = -6;
+    constexpr int pupil_radius = 17;
+
+    draw_arc(context, center, eye_radius, 0, 180, eye_width, pose, center);
+    draw_arc(context, {center.x + pupil_offset, center.y}, pupil_radius, 0, 180, pupil_radius, pose, center,
+             lv_color_white(), false);
+    draw_line(context, {center.x - eye_radius - 3, center.y + lid_offset_y},
+              {center.x + eye_radius + 3, center.y + lid_offset_y}, lid_width, pose, center);
+}
+
+void draw_suspicious_eyes(const DrawContext& context, const CatFaceState& state)
+{
+    constexpr Point left_center  = {104, 105};
+    constexpr Point right_center = {214, 105};
+
+    if (state.left_eye.visible) {
+        draw_arc(context, {104, 77}, 15, 205, 335, 9, state.left_eye, left_center);
+        if (is_blinking(state.left_eye)) {
+            draw_closed_blink(context, left_center, state.left_eye);
+        } else {
+            draw_suspicious_eye(context, left_center, 16, state.left_eye);
+        }
+    }
+    if (state.right_eye.visible) {
+        draw_arc(context, {214, 77}, 15, 205, 335, 9, state.right_eye, right_center);
+        if (is_blinking(state.right_eye)) {
+            draw_closed_blink(context, right_center, state.right_eye);
+        } else {
+            draw_suspicious_eye(context, right_center, 16, state.right_eye);
+        }
+    }
+}
+
+void draw_dizzy_eye_contents(const DrawContext& context, Point center, const FeaturePose& pose)
+{
+    constexpr Point spiral_arc_centers[] = {
+        {1, 6},
+        {-1, 0},
+        {2, 5},
+    };
+    constexpr int spiral_radii[]      = {6, 12, 18};
+    constexpr int spiral_start_angles[] = {259, 73, 248};
+    constexpr int spiral_end_angles[]   = {73, 248, 14};
+
+    draw_ring(context, center, 37, 5, pose, center);
+    for (size_t index = 0; index < std::size(spiral_arc_centers); ++index) {
+        const Point arc_center = {
+            center.x + spiral_arc_centers[index].x,
+            center.y + spiral_arc_centers[index].y,
+        };
+        draw_arc(context, arc_center, spiral_radii[index], spiral_start_angles[index], spiral_end_angles[index], 5,
+                 pose, center);
+    }
+
+    draw_line(context, {center.x - 20, center.y - 16}, {center.x - 13, center.y - 21}, 9, pose, center);
+}
+
 void draw_dizzy_eyes(const DrawContext& context, const CatFaceState& state)
 {
     constexpr Point left_center  = {104, 120};
     constexpr Point right_center = {214, 120};
-    const Point left_spiral[]    = {
-        {104, 120}, {108, 117}, {112, 119}, {113, 124}, {110, 129}, {104, 132}, {97, 130},
-        {92, 125},  {91, 117},  {94, 109},  {101, 104}, {111, 104}, {120, 110}, {124, 120},
-        {122, 131}, {114, 140}, {102, 143}, {89, 138},  {81, 128},  {79, 115},  {84, 102},
-    };
-    const Point right_spiral[] = {
-        {214, 120}, {210, 123}, {206, 121}, {205, 116}, {208, 111}, {214, 108}, {221, 110},
-        {226, 115}, {227, 123}, {224, 131}, {217, 136}, {207, 136}, {198, 130}, {194, 120},
-        {196, 109}, {204, 100}, {216, 97},  {229, 102}, {237, 112}, {239, 125}, {234, 138},
-    };
 
     if (state.left_eye.visible) {
         draw_line(context, {128, 68}, {137, 66}, 9, state.left_eye, left_center);
         if (is_blinking(state.left_eye)) {
             draw_closed_blink(context, left_center, state.left_eye);
         } else {
-            draw_ring(context, left_center, 37, 5, state.left_eye, left_center);
-            draw_smooth_polyline(context, left_spiral, 5, state.left_eye, left_center, lv_color_white(), 3);
+            draw_dizzy_eye_contents(context, left_center, state.left_eye);
         }
     }
     if (state.right_eye.visible) {
@@ -854,26 +1090,30 @@ void draw_dizzy_eyes(const DrawContext& context, const CatFaceState& state)
         if (is_blinking(state.right_eye)) {
             draw_closed_blink(context, right_center, state.right_eye);
         } else {
-            draw_ring(context, right_center, 37, 5, state.right_eye, right_center);
-            draw_smooth_polyline(context, right_spiral, 5, state.right_eye, right_center, lv_color_white(), 3);
+            draw_dizzy_eye_contents(context, right_center, state.right_eye);
         }
     }
 }
 
 void draw_sleepy_eyes(const DrawContext& context, const CatFaceState& state)
 {
-    constexpr Point left_center  = {101, 116};
-    constexpr Point right_center = {211, 116};
+    constexpr Point left_center      = {101, 116};
+    constexpr Point right_center     = {212, 116};
+    constexpr int lid_width          = 16;
+    constexpr int lid_outer_radius   = 225;
+    constexpr Point left_arc_center  = {72, -97};
+    constexpr Point right_arc_center = {240, -97};
+
     if (state.left_eye.visible) {
-        draw_arc(context, {129, 88}, 16, 243, 297, 9, state.left_eye, left_center);
-        draw_line(context, {72, 120}, {129, 112}, 16, state.left_eye, left_center);
+        draw_line(context, {125, 68}, {135, 68}, 9, state.left_eye, left_center);
+        draw_arc(context, left_arc_center, lid_outer_radius, 74, 90, lid_width, state.left_eye, left_center);
     }
     if (state.right_eye.visible) {
-        draw_arc(context, {182, 87}, 16, 243, 297, 9, state.right_eye, right_center);
-        draw_line(context, {182, 113}, {239, 120}, 16, state.right_eye, right_center);
+        draw_line(context, {178, 68}, {188, 68}, 9, state.right_eye, right_center);
+        draw_arc(context, right_arc_center, lid_outer_radius, 90, 106, lid_width, state.right_eye, right_center);
 
-        const Point zed[] = {{225, 74}, {238, 76}, {227, 82}, {237, 87}, {224, 88}};
-        draw_polyline(context, zed, 4, state.right_eye, right_center);
+        const FeaturePose decoration_pose = without_position(state.right_eye);
+        draw_sleep_z(context, {225, 74}, 14, 11, 3, decoration_pose, right_center);
     }
 }
 
@@ -891,8 +1131,7 @@ void draw_wink_eyes(const DrawContext& context, const CatFaceState& state)
     }
     if (state.right_eye.visible) {
         draw_arc(context, {172, 67}, 11, 213, 303, 9, state.right_eye, right_center);
-        draw_line(context, {177, 120}, {224, 89}, 14, state.right_eye, right_center);
-        draw_line(context, {177, 120}, {224, 126}, 14, state.right_eye, right_center);
+        draw_curved_chevron_eye(context, {177, 120}, 1, state.right_eye, right_center);
     }
 }
 
@@ -949,15 +1188,14 @@ void draw_sad_mouth(const DrawContext& context, const CatFaceState& state)
     if (!state.mouth.visible) {
         return;
     }
-    constexpr Point mouth_pivot = {159, 139};
-    draw_nose(context, {159, 126}, state.mouth, mouth_pivot);
+    constexpr Point mouth_pivot = {159, 153};
+    draw_nose(context, {159, 130}, state.mouth, mouth_pivot);
     if (state.mouth.weight > 25) {
         draw_open_mouth(context, {159, 139}, 20, 175, state.mouth, mouth_pivot);
     } else {
-        const Point frown[] = {{146, 146}, {159, 138}, {172, 146}};
-        draw_polyline(context, frown, 4, state.mouth, mouth_pivot);
+        draw_arc(context, {159, 158}, 13, 210, 330, 4, state.mouth, mouth_pivot);
     }
-    draw_whiskers(context, {59, 136}, {67, 136}, {59, 147}, {67, 145}, {253, 136}, {261, 136}, {253, 145}, {261, 147},
+    draw_whiskers(context, {57, 140}, {68, 140}, {58, 151}, {68, 148}, {250, 140}, {261, 140}, {250, 148}, {260, 151},
                   state.mouth, mouth_pivot);
 }
 
@@ -996,10 +1234,10 @@ void draw_dizzy_mouth(const DrawContext& context, const CatFaceState& state)
     const Point left_bottom[]  = {{57, 162}, {59, 160}, {62, 163}, {65, 161}};
     const Point right_top[]    = {{252, 150}, {255, 152}, {258, 149}, {260, 151}};
     const Point right_bottom[] = {{252, 161}, {255, 163}, {258, 160}, {260, 162}};
-    draw_smooth_polyline(context, left_top, 3, state.mouth, mouth_pivot);
-    draw_smooth_polyline(context, left_bottom, 3, state.mouth, mouth_pivot);
-    draw_smooth_polyline(context, right_top, 3, state.mouth, mouth_pivot);
-    draw_smooth_polyline(context, right_bottom, 3, state.mouth, mouth_pivot);
+    draw_tangent_arc_spline(context, left_top, 3, state.mouth, mouth_pivot);
+    draw_tangent_arc_spline(context, left_bottom, 3, state.mouth, mouth_pivot);
+    draw_tangent_arc_spline(context, right_top, 3, state.mouth, mouth_pivot);
+    draw_tangent_arc_spline(context, right_bottom, 3, state.mouth, mouth_pivot);
 }
 
 void draw_sleepy_mouth(const DrawContext& context, const CatFaceState& state)
@@ -1009,20 +1247,20 @@ void draw_sleepy_mouth(const DrawContext& context, const CatFaceState& state)
     }
     constexpr Point mouth_pivot = {155, 134};
     draw_nose(context, {155, 126}, state.mouth, mouth_pivot);
-    if (state.mouth.weight > 25) {
+    if (state.mouth.weight == kSleepyRestingMouthWeight) {
+        draw_open_mouth(context, {155, 134}, 18, 160, state.mouth, mouth_pivot);
+    } else if (state.mouth.weight > 25) {
         draw_open_mouth(context, {155, 134}, 22, 172, state.mouth, mouth_pivot);
     } else {
         draw_cat_smile(context, {155, 134}, 16, state.mouth, mouth_pivot);
     }
-    draw_whiskers(context, {53, 147}, {61, 147}, {56, 156}, {63, 158}, {250, 147}, {258, 147}, {248, 156}, {255, 158},
+    draw_whiskers(context, {53, 147}, {61, 147}, {56, 158}, {63, 156}, {250, 147}, {258, 147}, {248, 156}, {255, 158},
                   state.mouth, mouth_pivot);
 
-    const lv_color_t bubble_fill  = LV_COLOR_MAKE(9, 47, 76);
-    const lv_color_t bubble_glint = LV_COLOR_MAKE(140, 179, 207);
-    draw_filled_circle(context, {139, 135}, 30, state.mouth, mouth_pivot, bubble_fill);
-    draw_ring(context, {139, 135}, 15, 2, state.mouth, mouth_pivot, bubble_glint);
-    draw_arc(context, {135, 129}, 8, 189, 314, 2, state.mouth, mouth_pivot, bubble_glint);
-    draw_arc(context, {138, 129}, 14, 36, 139, 2, state.mouth, mouth_pivot, bubble_glint);
+    if (state.mouth.weight == kSleepyRestingMouthWeight) {
+        draw_filled_circle(context, {139, 135}, 24, state.mouth, mouth_pivot, LV_COLOR_MAKE(105, 205, 242),
+                           LV_OPA_50);
+    }
 }
 
 void draw_wink_mouth(const DrawContext& context, const CatFaceState& state)
@@ -1067,11 +1305,11 @@ void draw_face(lv_event_t* event)
             draw_cute_mouth(context, *state);
             break;
         case Emotion::Sad:
-            draw_cute_eyes(context, *state);
+            draw_sad_eyes(context, *state);
             draw_sad_mouth(context, *state);
             break;
         case Emotion::Doubt:
-            draw_squeezed_eyes(context, *state);
+            draw_suspicious_eyes(context, *state);
             draw_default_mouth(context, *state);
             break;
         case Emotion::Dizzy:
@@ -1085,6 +1323,10 @@ void draw_face(lv_event_t* event)
         case Emotion::Wink:
             draw_wink_eyes(context, *state);
             draw_wink_mouth(context, *state);
+            break;
+        case Emotion::EyesClosed:
+            draw_squeezed_eyes(context, *state);
+            draw_default_mouth(context, *state);
             break;
         case Emotion::Neutral:
         default:

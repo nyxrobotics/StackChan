@@ -65,6 +65,44 @@ void DefaultMouth::setRotation(int rotation)
     _mouth->setRotation(_rotation);
 }
 
+void DefaultMouth::setEmotion(const Emotion& emotion)
+{
+    if (getIgnoreEmotion()) {
+        return;
+    }
+
+    setPosition({0, 0});
+
+    switch (emotion) {
+        case Emotion::Happy:
+        case Emotion::Cute:
+            setWeight(30);
+            setRotation(0);
+            break;
+        case Emotion::Doubt:
+            setWeight(0);
+            setRotation(100);
+            break;
+        case Emotion::Dizzy:
+            setWeight(45);
+            setRotation(120);
+            break;
+        case Emotion::Wink:
+            setWeight(15);
+            setRotation(0);
+            break;
+        case Emotion::Neutral:
+        case Emotion::Angry:
+        case Emotion::Sad:
+        case Emotion::Sleepy:
+        case Emotion::EyesClosed:
+        default:
+            setWeight(0);
+            setRotation(0);
+            break;
+    }
+}
+
 void DefaultMouth::setVisible(bool visible)
 {
     Element::setVisible(visible);

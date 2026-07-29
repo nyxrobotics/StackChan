@@ -90,8 +90,9 @@ void DefaultEyes::setEmotion(const Emotion& emotion)
         return;
     }
 
-    auto apply_style = [this](int weight, int rotation) {
+    auto apply_style = [this](int weight, int rotation, int size = 0) {
         setWeight(weight);
+        setSize(size);
         if (_is_left_eye) {
             setRotation(rotation);
         } else {
@@ -113,19 +114,22 @@ void DefaultEyes::setEmotion(const Emotion& emotion)
             apply_style(70, -400);
             break;
         case Emotion::Doubt:
-            apply_style(75, 0);
+            apply_style(_is_left_eye ? 100 : 50, 0);
             break;
         case Emotion::Sleepy:
             apply_style(35, -50);
             break;
         case Emotion::Cute:
-            apply_style(85, 0);
+            apply_style(100, 0, 35);
             break;
         case Emotion::Dizzy:
-            apply_style(75, 0);
+            apply_style(_is_left_eye ? 40 : 70, 450);
             break;
         case Emotion::Wink:
             apply_style(_is_left_eye ? 100 : 25, 0);
+            break;
+        case Emotion::EyesClosed:
+            apply_style(20, 0);
             break;
         default:
             break;

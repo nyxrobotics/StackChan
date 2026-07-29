@@ -62,6 +62,7 @@ public:
     void setPosition(const uitk::Vector2i& position) override;
     void setWeight(int weight) override;
     void setRotation(int rotation) override;
+    void setEmotion(const Emotion& emotion) override;
     void setVisible(bool visible) override;
 
 private:
