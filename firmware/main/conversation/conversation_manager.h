@@ -123,12 +123,18 @@ private:
     void stopRecoveryTask();
     void requestModuleRecovery(const char* reason);
     void requestModulePrewarm(const char* reason);
+    void requestModuleStop(const char* reason);
+    bool stopModuleRuntime();
     bool waitForRecoveryDelay(int delayMs);
     void recoveryLoop();
 
     std::atomic<bool> localRecoveryRequested_ {false};
     std::atomic<bool> localPrewarmRequested_ {false};
+    std::atomic<bool> localStopRequested_ {false};
+    std::atomic<bool> localStopInProgress_ {false};
+    std::atomic<bool> localRuntimeStopConfirmed_ {false};
     std::atomic<bool> recoveryTaskRunning_ {false};
+    bool              autoPrewarmEnabled_ = false;
     TaskHandle_t      recoveryTask_ = nullptr;
     SemaphoreHandle_t recoveryTaskDone_ = nullptr;
 };

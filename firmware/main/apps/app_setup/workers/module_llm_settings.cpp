@@ -10,6 +10,7 @@ using namespace uitk::lvgl_cpp;
 static constexpr const char* kNvsNs         = "modllm_cfg";
 static constexpr const char* kThinkingKey   = "thinking";
 static constexpr const char* kVadEnabledKey = "vad_enabled";
+static constexpr const char* kAutoPrewarmKey = "auto_prewarm";
 static constexpr const char* kTtsLangKey    = "tts_lang";  // 0=ja 1=zh 2=en
 static constexpr const char* kOpenJTalkGainKey = "ojt_gain_db";
 static constexpr int8_t kOpenJTalkGainMinDb = -60;
@@ -38,6 +39,10 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
         if (nvs_get_u8(h, kThinkingKey,   &v)  == ESP_OK) _thinking  = (v != 0);
         uint8_t vad = 1;
         if (nvs_get_u8(h, kVadEnabledKey, &vad) == ESP_OK) _vad      = (vad != 0);
+        int32_t prewarm = 0;
+        if (nvs_get_i32(h, kAutoPrewarmKey, &prewarm) == ESP_OK) {
+            _auto_prewarm = (prewarm != 0);
+        }
         uint8_t lang = 0;
         if (nvs_get_u8(h, kTtsLangKey,   &lang) == ESP_OK) _tts_lang = lang;
         int8_t gain = kOpenJTalkGainDefaultDb;
@@ -90,8 +95,21 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
     if (_vad) lv_obj_add_state(_switch_vad->get(), LV_STATE_CHECKED);
     _switch_vad->onValueChanged().connect([this](bool v) { _vad = v; });
 
+    // ---------- Auto standby policy ----------
+    _panel_auto_prewarm = make_row(_panel.get(), 124);
+    _label_auto_prewarm = std::make_unique<Label>(_panel_auto_prewarm->get());
+    _label_auto_prewarm->setText("Auto: fast fallback");
+    _label_auto_prewarm->setTextFont(&lv_font_montserrat_14);
+    _label_auto_prewarm->setTextColor(lv_color_hex(0x26206A));
+    _label_auto_prewarm->align(LV_ALIGN_LEFT_MID, 12, 0);
+    _switch_auto_prewarm = std::make_unique<Switch>(_panel_auto_prewarm->get());
+    _switch_auto_prewarm->align(LV_ALIGN_RIGHT_MID, -12, 0);
+    if (_auto_prewarm) lv_obj_add_state(_switch_auto_prewarm->get(), LV_STATE_CHECKED);
+    _switch_auto_prewarm->onValueChanged().connect(
+        [this](bool v) { _auto_prewarm = v; });
+
     // ---------- TTS Language ----------
-    _panel_lang = make_row(_panel.get(), 124, 52);
+    _panel_lang = make_row(_panel.get(), 170, 52);
 
     auto make_lang_btn = [&](const char* label, int xOffset) {
         auto btn = std::make_unique<Button>(_panel_lang->get());
@@ -116,7 +134,7 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
     update_lang_buttons();
 
     // ---------- Open JTalk volume ----------
-    _panel_openjtalk_volume = make_row(_panel.get(), 184, 58);
+    _panel_openjtalk_volume = make_row(_panel.get(), 230, 58);
     _label_openjtalk_volume = std::make_unique<Label>(_panel_openjtalk_volume->get());
     _label_openjtalk_volume->setText("Open JTalk volume");
     _label_openjtalk_volume->setTextFont(&lv_font_montserrat_14);
@@ -147,7 +165,7 @@ ModuleLLMSettingsWorker::ModuleLLMSettingsWorker()
     // ---------- Confirm button ----------
     _btn_confirm = std::make_unique<Button>(_panel->get());
     apply_button_common_style(*_btn_confirm);
-    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 252);
+    _btn_confirm->align(LV_ALIGN_TOP_MID, 0, 298);
     _btn_confirm->setSize(290, 44);
     _btn_confirm->label().setText("Confirm");
     _btn_confirm->onClick().connect([this]() { _confirm_flag = true; });
@@ -164,14 +182,16 @@ void ModuleLLMSettingsWorker::update()
     if (nvs_open(kNvsNs, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, kThinkingKey,   _thinking  ? 1 : 0);
         nvs_set_u8(h, kVadEnabledKey, _vad       ? 1 : 0);
+        nvs_set_i32(h, kAutoPrewarmKey, _auto_prewarm ? 1 : 0);
         nvs_set_u8(h, kTtsLangKey,    _tts_lang);
         nvs_set_i8(h, kOpenJTalkGainKey, _openjtalk_gain_db);
         nvs_commit(h);
         nvs_close(h);
     }
 
-    mclog::info("ModLLMSettings: thinking={} vad={} tts_lang={} openjtalk_gain_db={}",
-                _thinking, _vad, (int)_tts_lang, (int)_openjtalk_gain_db);
+    mclog::info(
+        "ModLLMSettings: thinking={} vad={} auto_prewarm={} tts_lang={} openjtalk_gain_db={}",
+        _thinking, _vad, _auto_prewarm, (int)_tts_lang, (int)_openjtalk_gain_db);
     _is_done = true;
 }
 

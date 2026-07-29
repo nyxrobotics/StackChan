@@ -17,6 +17,14 @@ static_assert(static_cast<int>(BackendKind::StaticFallback) == hal_bridge::kBack
 // NVS namespace / key
 static constexpr const char* kNvsNs  = "conv_mgr";
 static constexpr const char* kNvsKey = "mode";
+static constexpr const char* kModuleLlmNvsNs = "modllm_cfg";
+static constexpr const char* kAutoPrewarmKey = "auto_prewarm";
+
+static bool loadAutoPrewarmFromNvs()
+{
+    Settings s(kModuleLlmNvsNs, false);
+    return s.GetInt(kAutoPrewarmKey, 0) != 0;
+}
 
 // ---------------------------------------------------------------------------
 // NVS helpers
@@ -50,14 +58,15 @@ void ConversationManager::setMode(ConversationMode mode)
     activateBackend(chosen);
 
     if (mode == ConversationMode::OnlineOnly) {
-        localRecoveryRequested_.store(false);
-        localPrewarmRequested_.store(false);
-        if (recoveryTask_ != nullptr) xTaskNotifyGive(recoveryTask_);
-    } else if (!health_.canUseLocal() &&
-               (mode == ConversationMode::LocalOnly || !health_.canUseOnline())) {
-        requestModuleRecovery("conversation mode changed");
-    } else if (mode == ConversationMode::Auto && !health_.canUseLocal()) {
-        requestModulePrewarm("conversation mode changed");
+        requestModuleStop("online-only mode selected");
+    } else if (mode == ConversationMode::LocalOnly) {
+        requestModuleRecovery("local-only mode selected");
+    } else if (!health_.canUseOnline()) {
+        requestModuleRecovery("Auto mode needs local fallback");
+    } else if (autoPrewarmEnabled_) {
+        requestModulePrewarm("Auto fast fallback selected");
+    } else {
+        requestModuleStop("Auto power-save selected");
     }
 }
 
@@ -66,7 +75,7 @@ void ConversationManager::setMode(ConversationMode mode)
 // ---------------------------------------------------------------------------
 
 ConversationManager::ConversationManager(ConversationMode mode)
-    : mode_(mode)
+    : mode_(mode), autoPrewarmEnabled_(loadAutoPrewarmFromNvs())
 {
     llmClient_ = std::make_shared<ModuleLLMClient>();
 
@@ -97,6 +106,16 @@ ConversationManager::~ConversationManager() {
 void ConversationManager::initModuleLLM() {
     if (llmInitialized_) return;
 
+    const ConversationMode mode = mode_;
+    if (mode == ConversationMode::OnlineOnly ||
+        (mode == ConversationMode::Auto && health_.canUseOnline() &&
+         !autoPrewarmEnabled_)) {
+        ESP_LOGI(TAG, "Module LLM initialization skipped by power policy");
+        return;
+    }
+
+    localStopRequested_.store(false);
+
     health_.localLLMConnected  = false;
     health_.localLLMReady      = false;
     health_.localPipelineReady = false;
@@ -108,6 +127,7 @@ void ConversationManager::initModuleLLM() {
     }
 
     ESP_LOGI(TAG, "Module LLM connected, loading models...");
+    localRuntimeStopConfirmed_.store(false);
     bool pipelineOk = llmClient_->loadModelsAndPipeline();
     if (!pipelineOk) {
         ESP_LOGW(TAG, "Module LLM pipeline NOT ready");
@@ -159,7 +179,7 @@ void ConversationManager::startRecoveryTask() {
         return;
     }
 
-    if (localRecoveryRequested_.load()) {
+    if (localRecoveryRequested_.load() || localStopRequested_.load()) {
         xTaskNotifyGive(recoveryTask_);
     }
 }
@@ -170,6 +190,7 @@ void ConversationManager::stopRecoveryTask() {
     recoveryTaskRunning_.store(false);
     localRecoveryRequested_.store(false);
     localPrewarmRequested_.store(false);
+    localStopRequested_.store(false);
     xTaskNotifyGive(recoveryTask_);
 
     if (recoveryTaskDone_ != nullptr &&
@@ -184,13 +205,17 @@ void ConversationManager::stopRecoveryTask() {
         vSemaphoreDelete(recoveryTaskDone_);
         recoveryTaskDone_ = nullptr;
     }
+    localStopInProgress_.store(false);
 }
 
 void ConversationManager::requestModuleRecovery(const char* reason) {
-    const ConversationMode mode = loadModeFromNvs();
+    const ConversationMode mode = mode_;
     if (mode == ConversationMode::OnlineOnly) return;
 
+    localStopRequested_.store(false);
     localPrewarmRequested_.store(false);
+    if (llmInitialized_) return;
+
     const bool alreadyRequested = localRecoveryRequested_.exchange(true);
     if (!alreadyRequested) {
         ESP_LOGW(TAG, "Module LLM recovery requested: %s", reason ? reason : "unknown");
@@ -201,8 +226,11 @@ void ConversationManager::requestModuleRecovery(const char* reason) {
 }
 
 void ConversationManager::requestModulePrewarm(const char* reason) {
-    if (loadModeFromNvs() != ConversationMode::Auto || llmInitialized_) return;
+    if (mode_ != ConversationMode::Auto || !autoPrewarmEnabled_ || llmInitialized_) {
+        return;
+    }
 
+    localStopRequested_.store(false);
     localPrewarmRequested_.store(true);
     const bool alreadyRequested = localRecoveryRequested_.exchange(true);
     if (!alreadyRequested) {
@@ -211,6 +239,61 @@ void ConversationManager::requestModulePrewarm(const char* reason) {
     if (recoveryTask_ != nullptr) {
         xTaskNotifyGive(recoveryTask_);
     }
+}
+
+void ConversationManager::requestModuleStop(const char* reason) {
+    localRecoveryRequested_.store(false);
+    localPrewarmRequested_.store(false);
+    if (localStopInProgress_.load() ||
+        (localRuntimeStopConfirmed_.load() && !llmInitialized_)) {
+        return;
+    }
+
+    const bool alreadyRequested = localStopRequested_.exchange(true);
+    if (!alreadyRequested) {
+        ESP_LOGI(TAG, "Module LLM stop requested: %s", reason ? reason : "unknown");
+    }
+    if (recoveryTask_ != nullptr) {
+        xTaskNotifyGive(recoveryTask_);
+    }
+}
+
+bool ConversationManager::stopModuleRuntime() {
+    ESP_LOGI(TAG, "Stopping Module LLM inference services");
+    moduleLLMBackend_->stop();
+    if (!moduleLLMBackend_->waitUntilIdle(12000)) {
+        ESP_LOGE(TAG, "Module LLM UART reader did not become idle; stop deferred");
+        return false;
+    }
+
+    bool stopped = false;
+    for (int attempt = 1; attempt <= 3 && recoveryTaskRunning_.load(); ++attempt) {
+        if (llmClient_->state() == ModuleLLMState::NotConnected &&
+            !llmClient_->connect()) {
+            ESP_LOGI(TAG, "Module LLM control plane unavailable for stop attempt %d", attempt);
+        } else if (llmClient_->stopLocalRuntime()) {
+            stopped = true;
+            break;
+        }
+
+        llmClient_->disconnect();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    llmClient_->disconnect();
+    llmInitialized_ = false;
+    health_.localLLMConnected = false;
+    health_.localLLMReady = false;
+    health_.localPipelineReady = false;
+
+    if (stopped) {
+        localRuntimeStopConfirmed_.store(true);
+        ESP_LOGI(TAG, "Module LLM inference services stopped");
+    } else {
+        localRuntimeStopConfirmed_.store(false);
+        ESP_LOGW(TAG, "Unable to confirm Module LLM inference service stop");
+    }
+    return stopped;
 }
 
 bool ConversationManager::waitForRecoveryDelay(int delayMs) {
@@ -235,9 +318,17 @@ void ConversationManager::recoveryLoop() {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (!recoveryTaskRunning_.load()) break;
 
+        if (localStopRequested_.load()) {
+            localStopInProgress_.store(true);
+            stopModuleRuntime();
+            localStopRequested_.store(false);
+            localStopInProgress_.store(false);
+            continue;
+        }
+
         int attempt = 0;
         while (recoveryTaskRunning_.load() && localRecoveryRequested_.load()) {
-            const ConversationMode mode = loadModeFromNvs();
+            const ConversationMode mode = mode_;
             if (mode == ConversationMode::OnlineOnly ||
                 (mode == ConversationMode::Auto && health_.onlineReady &&
                  !localPrewarmRequested_.load())) {
@@ -253,7 +344,7 @@ void ConversationManager::recoveryLoop() {
             ESP_LOGI(TAG, "Module LLM recovery attempt %d in %d ms", attempt, delayMs);
             if (!waitForRecoveryDelay(delayMs)) break;
 
-            const ConversationMode currentMode = loadModeFromNvs();
+            const ConversationMode currentMode = mode_;
             if (currentMode == ConversationMode::OnlineOnly ||
                 (currentMode == ConversationMode::Auto && health_.onlineReady &&
                  !localPrewarmRequested_.load())) {
@@ -277,7 +368,9 @@ void ConversationManager::recoveryLoop() {
             if (llmInitialized_) {
                 ESP_LOGI(TAG, "Module LLM automatic recovery succeeded on attempt %d", attempt);
                 localRecoveryRequested_.store(false);
-                activateBackend(selectBackendFast());
+                if (!localStopRequested_.load()) {
+                    activateBackend(selectBackendFast());
+                }
                 break;
             }
 
@@ -297,12 +390,14 @@ void ConversationManager::recoveryLoop() {
 void ConversationManager::start() {
     ESP_LOGI(TAG, "ConversationManager::start()");
 
-    const ConversationMode mode = loadModeFromNvs();
+    const ConversationMode mode = mode_;
+    autoPrewarmEnabled_ = loadAutoPrewarmFromNvs();
+    ESP_LOGI(TAG, "Auto local standby policy: %s",
+             autoPrewarmEnabled_ ? "fast fallback" : "power save");
     startRecoveryTask();
 
     // LocalOnly needs the local pipeline before it can select a backend. Auto
-    // starts quickly and schedules standby prewarm only after Xiaozhi and its
-    // hotword detector are up, avoiding simultaneous high-memory startup.
+    // waits for an online failure unless fast fallback was explicitly enabled.
     if (mode == ConversationMode::LocalOnly) {
         initModuleLLM();
     } else {
@@ -315,6 +410,14 @@ void ConversationManager::start() {
 
     if (mode == ConversationMode::LocalOnly && !llmInitialized_) {
         requestModuleRecovery("startup connection failed");
+    } else if (mode == ConversationMode::OnlineOnly) {
+        requestModuleStop("online-only startup");
+    } else if (mode == ConversationMode::Auto && health_.canUseOnline()) {
+        if (autoPrewarmEnabled_) {
+            requestModulePrewarm("Auto startup fast fallback");
+        } else {
+            requestModuleStop("Auto startup power save");
+        }
     }
 
     ESP_LOGI(TAG, "Initial backend: %d", static_cast<int>(initial));
@@ -369,8 +472,8 @@ void ConversationManager::onNetworkDisconnected() {
     health_.onlineReady      = false;
     ESP_LOGW(TAG, "Network disconnected → onlineReady=false");
     // Auto モードでネット断 → Module LLM にフォールバック
-    if (loadModeFromNvs() == ConversationMode::Auto) {
-        if (!llmInitialized_) requestModuleRecovery("network disconnected");
+    if (mode_ == ConversationMode::Auto) {
+        requestModuleRecovery("network disconnected");
         activateBackend(selectBackendFast());
     }
 }
@@ -378,12 +481,18 @@ void ConversationManager::onNetworkDisconnected() {
 void ConversationManager::onXiaozhiConnected() {
     health_.onlineReady = true;
     ESP_LOGI(TAG, "Xiaozhi connected → onlineReady=true");
-    const ConversationMode mode = loadModeFromNvs();
+    const ConversationMode mode = mode_;
     if (mode != ConversationMode::LocalOnly && !turnInProgress_) {
         activateBackend(selectBackendFast());
     }
-    if (mode == ConversationMode::Auto && !llmInitialized_) {
-        requestModulePrewarm("online backend ready");
+    if (mode == ConversationMode::OnlineOnly) {
+        requestModuleStop("online backend ready");
+    } else if (mode == ConversationMode::Auto) {
+        if (autoPrewarmEnabled_) {
+            requestModulePrewarm("online backend ready");
+        } else if (!turnInProgress_) {
+            requestModuleStop("online backend recovered");
+        }
     }
 }
 
@@ -391,8 +500,8 @@ void ConversationManager::onXiaozhiDisconnected() {
     health_.onlineReady = false;
     ESP_LOGW(TAG, "Xiaozhi disconnected → onlineReady=false");
     // Auto モードで Xiaozhi 切断 → Module LLM にフォールバック
-    if (loadModeFromNvs() == ConversationMode::Auto) {
-        if (!llmInitialized_) requestModuleRecovery("online backend disconnected");
+    if (mode_ == ConversationMode::Auto) {
+        requestModuleRecovery("online backend disconnected");
         activateBackend(selectBackendFast());
     }
 }
@@ -401,8 +510,8 @@ void ConversationManager::onXiaozhiError() {
     health_.onlineReady = false;
     ESP_LOGW(TAG, "Xiaozhi error → onlineReady=false");
     // Auto モードで Xiaozhi エラー → Module LLM にフォールバック
-    if (loadModeFromNvs() == ConversationMode::Auto) {
-        if (!llmInitialized_) requestModuleRecovery("online backend error");
+    if (mode_ == ConversationMode::Auto) {
+        requestModuleRecovery("online backend error");
         activateBackend(selectBackendFast());
     }
 }
@@ -434,6 +543,12 @@ void ConversationManager::onTurnEnd() {
     BackendKind chosen = selectBackendFast();
     if (activeBackend_ == nullptr || activeBackend_->kind() != chosen) {
         activateBackend(chosen);
+    }
+
+    if (mode_ == ConversationMode::OnlineOnly ||
+        (mode_ == ConversationMode::Auto && health_.canUseOnline() &&
+         !autoPrewarmEnabled_)) {
+        requestModuleStop("online turn boundary");
     }
 
     ESP_LOGD(TAG, "Turn ended");
@@ -527,12 +642,18 @@ void ConversationManager::onBackendFailure(BackendKind failed) {
         case BackendKind::XiaozhiOnline:
             // Section 8.1 — retry same request via ModuleLLM
             health_.onlineReady = false;
-            if (health_.canUseLocal()) {
+            if (mode_ == ConversationMode::Auto) {
+                requestModuleRecovery("online backend failure");
+            }
+            if (mode_ == ConversationMode::Auto && health_.canUseLocal()) {
                 ESP_LOGI(TAG, "Xiaozhi failed → retrying with ModuleLLM");
                 activateBackend(BackendKind::ModuleLLM);
             } else {
-                ESP_LOGW(TAG, "Xiaozhi failed, ModuleLLM unavailable → StaticFallback");
+                ESP_LOGW(TAG, "Xiaozhi failed, selecting StaticFallback");
                 activateBackend(BackendKind::StaticFallback);
+            }
+            if (mode_ == ConversationMode::OnlineOnly) {
+                requestModuleStop("online backend failure in online-only mode");
             }
             break;
 
@@ -542,9 +663,16 @@ void ConversationManager::onBackendFailure(BackendKind failed) {
             health_.localLLMReady      = false;
             health_.localPipelineReady = false;
             llmInitialized_ = false;
-            ESP_LOGW(TAG, "ModuleLLM failed → StaticFallback");
-            activateBackend(BackendKind::StaticFallback);
-            requestModuleRecovery("local backend failure");
+            ESP_LOGW(TAG, "ModuleLLM failed");
+            activateBackend(selectBackendFast());
+            if (mode_ == ConversationMode::LocalOnly ||
+                (mode_ == ConversationMode::Auto && !health_.canUseOnline())) {
+                requestModuleRecovery("local backend failure");
+            } else if (mode_ == ConversationMode::Auto && autoPrewarmEnabled_) {
+                requestModulePrewarm("local standby failure");
+            } else {
+                requestModuleStop("local backend no longer needed");
+            }
             break;
 
         case BackendKind::StaticFallback:

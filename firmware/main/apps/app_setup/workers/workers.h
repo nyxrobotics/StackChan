@@ -524,6 +524,11 @@ private:
     std::unique_ptr<uitk::lvgl_cpp::Label>     _label_vad;
     std::unique_ptr<uitk::lvgl_cpp::Switch>    _switch_vad;
 
+    // Auto-mode standby policy
+    std::unique_ptr<uitk::lvgl_cpp::Container> _panel_auto_prewarm;
+    std::unique_ptr<uitk::lvgl_cpp::Label>     _label_auto_prewarm;
+    std::unique_ptr<uitk::lvgl_cpp::Switch>    _switch_auto_prewarm;
+
     // TTS Language selection
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel_lang;
     std::unique_ptr<uitk::lvgl_cpp::Button>    _btn_ja;
@@ -540,6 +545,7 @@ private:
 
     bool    _thinking            = false;
     bool    _vad                 = true;
+    bool    _auto_prewarm        = false;
     uint8_t _tts_lang            = 0;    // 0=ja 1=zh 2=en
     int8_t  _openjtalk_gain_db   = -36;
     bool    _confirm_flag        = false;
