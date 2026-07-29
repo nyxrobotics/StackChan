@@ -116,6 +116,11 @@ void ConversationManager::initModuleLLM() {
 
     localStopRequested_.store(false);
 
+    const bool showModelState = mode == ConversationMode::LocalOnly || !health_.canUseOnline();
+    if (showModelState) {
+        hal_bridge::notify_local_model_state(hal_bridge::LocalModelVisualState::Loading);
+    }
+
     health_.localLLMConnected  = false;
     health_.localLLMReady      = false;
     health_.localPipelineReady = false;
@@ -123,6 +128,9 @@ void ConversationManager::initModuleLLM() {
     bool llmConnected = llmClient_->connect();
     if (!llmConnected) {
         ESP_LOGI(TAG, "Module LLM not connected — local backend disabled");
+        if (showModelState) {
+            hal_bridge::notify_local_model_state(hal_bridge::LocalModelVisualState::Unavailable);
+        }
         return;
     }
 
@@ -132,6 +140,9 @@ void ConversationManager::initModuleLLM() {
     if (!pipelineOk) {
         ESP_LOGW(TAG, "Module LLM pipeline NOT ready");
         llmClient_->disconnect();
+        if (showModelState) {
+            hal_bridge::notify_local_model_state(hal_bridge::LocalModelVisualState::Unavailable);
+        }
         return;
     }
 
@@ -145,6 +156,9 @@ void ConversationManager::initModuleLLM() {
     ESP_LOGI(TAG, "Module LLM pipeline ready");
     // NVS から config を読んで適用（オンライン時に保存済みのものを使う）
     runAgentConfigSequence();
+    if (showModelState) {
+        hal_bridge::notify_local_model_state(hal_bridge::LocalModelVisualState::Ready);
+    }
 }
 
 // ---------------------------------------------------------------------------

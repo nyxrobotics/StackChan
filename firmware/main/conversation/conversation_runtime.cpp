@@ -60,6 +60,28 @@ void setLocalResponseState(DeviceState target, const char* phase)
     }
 }
 
+void showLocalModelState(hal_bridge::LocalModelVisualState state)
+{
+    auto display = Board::GetInstance().GetDisplay();
+    if (!display) {
+        ESP_LOGW(TAG, "local model state: display unavailable");
+        return;
+    }
+
+    switch (state) {
+        case hal_bridge::LocalModelVisualState::Loading:
+            display->SetEmotion("sleepy");
+            break;
+        case hal_bridge::LocalModelVisualState::Ready:
+        case hal_bridge::LocalModelVisualState::Unavailable:
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                display->SetStatus(Lang::Strings::STANDBY);
+            }
+            display->SetEmotion("neutral");
+            break;
+    }
+}
+
 void registerCallbacks()
 {
     hal_bridge::set_conversation_callbacks({
@@ -102,6 +124,9 @@ void registerCallbacks()
             if (!s_manager) return;
             auto* backend = s_manager->getModuleLLMBackend();
             if (backend) backend->abortSpeaking();
+        },
+        .onLocalModelStateChanged = [](hal_bridge::LocalModelVisualState state) {
+            showLocalModelState(state);
         },
     });
 }

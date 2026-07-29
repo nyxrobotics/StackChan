@@ -18,6 +18,7 @@
 #include <stackchan/stackchan.h>
 #include <assets/lang_config.h>
 #include <hal/hal.h>
+#include <hal/hal_bridge_conv.h>
 
 using namespace stackchan;
 using namespace stackchan::avatar;
@@ -330,11 +331,25 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
         return;
     }
 
+    const bool local_loading_owns_face =
+        hal_bridge::is_local_model_loading() &&
+        hal_bridge::get_active_conversation_backend() != hal_bridge::kBackendXiaozhiOnline &&
+        hal_bridge::get_conversation_mode() != hal_bridge::kModeOnlineOnly;
+    if (local_loading_owns_face && strcmp(emotion, "sleepy") != 0) {
+        ESP_LOGI(TAG, "Ignoring emotion '%s' while the local model is loading", emotion);
+        return;
+    }
+
     DisplayLockGuard lock(this);
 
     // ESP_LOGE(TAG, "SetEmotion: %s", emotion);
 
     auto& avatar = stackchan.avatar();
+
+    if (strcmp(emotion, "sleepy") != 0 && is_sleeping_) {
+        avatar.clearSpeech();
+        is_sleeping_ = false;
+    }
 
     // Map emotion string to stackchan::Emotion
     if (strcmp(emotion, "neutral") == 0) {

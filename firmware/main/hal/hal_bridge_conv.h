@@ -8,6 +8,12 @@
 
 namespace hal_bridge {
 
+enum class LocalModelVisualState : uint8_t {
+    Loading,
+    Ready,
+    Unavailable,
+};
+
 // ---------------------------------------------------------------------------
 // ConversationCallbacks
 // ---------------------------------------------------------------------------
@@ -25,6 +31,7 @@ struct ConversationCallbacks {
     std::function<void()>                         onLocalTtsEnd;
     // Local mode: 顔タッチによる中断通知
     std::function<void()>                         onLocalAbort;
+    std::function<void(LocalModelVisualState)>    onLocalModelStateChanged;
 };
 
 void set_conversation_callbacks(ConversationCallbacks cbs);
@@ -62,5 +69,7 @@ bool is_local_tts_active();  // タッチ中断判定用
 void set_conv_ready(bool ready);  // conv 初期化完了通知
 bool is_conv_ready();             // popup 音のタイミング制御用
 void notify_local_abort();
+void notify_local_model_state(LocalModelVisualState state);
+bool is_local_model_loading();
 
 } // namespace hal_bridge

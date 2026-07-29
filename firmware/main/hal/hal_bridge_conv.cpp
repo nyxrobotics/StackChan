@@ -15,6 +15,7 @@ static int                   s_mode = kModeAuto;
 static std::atomic<int>      s_activeBackend{kBackendStatic};
 static std::atomic<bool>     s_localTtsActive{false};  // TTS再生中フラグ（タッチ中断判定用）
 static std::atomic<bool>     s_convReady{false};        // conv 初期化完了フラグ
+static std::atomic<bool>     s_localModelLoading{false};
 
 void set_conversation_callbacks(ConversationCallbacks cbs) {
     std::lock_guard<std::mutex> lock(s_mutex);
@@ -158,6 +159,21 @@ void notify_local_abort() {
         cb = s_cbs.onLocalAbort;
     }
     if (cb) cb();
+}
+
+void notify_local_model_state(LocalModelVisualState state) {
+    s_localModelLoading.store(state == LocalModelVisualState::Loading, std::memory_order_relaxed);
+
+    std::function<void(LocalModelVisualState)> cb;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        cb = s_cbs.onLocalModelStateChanged;
+    }
+    if (cb) cb(state);
+}
+
+bool is_local_model_loading() {
+    return s_localModelLoading.load(std::memory_order_relaxed);
 }
 
 } // namespace hal_bridge
