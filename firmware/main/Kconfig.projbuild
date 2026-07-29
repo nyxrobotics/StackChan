@@ -22,6 +22,14 @@ config STACKCHAN_TEST_AUTO_START_AI_AGENT
         leave it disabled so normal saved startup settings and face controls
         remain authoritative.
 
+config STACKCHAN_TEST_CYCLE_AVATAR_EMOTIONS
+    bool "Cycle avatar emotions for visual tests"
+    depends on STACKCHAN_TEST_AUTO_START_AI_AGENT
+    default n
+    help
+        Cycle through every avatar emotion on the device display. This is a
+        visual test aid only and must remain disabled in production builds.
+
 endmenu
 
 menu "Xiaozhi Assistant"

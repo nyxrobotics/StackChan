@@ -9,6 +9,8 @@
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
 #include <esp_psram.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <vector>
 #include <cstring>
 #include <src/misc/cache/lv_cache.h>
@@ -286,6 +288,42 @@ void StackChanAvatarDisplay::SetupUI()
 
     auto config        = hal_bridge::get_xiaozhi_config();
     idle_motion_level_ = config.idleRandomMovementLevel;
+
+#ifdef CONFIG_STACKCHAN_TEST_CYCLE_AVATAR_EMOTIONS
+    const BaseType_t preview_task_created = xTaskCreate(
+        [](void* argument) {
+            auto* display = static_cast<StackChanAvatarDisplay*>(argument);
+            struct PreviewFrame {
+                const char* name;
+                Emotion emotion;
+            };
+            constexpr PreviewFrame frames[] = {
+                {"neutral", Emotion::Neutral},       {"wink", Emotion::Wink},
+                {"cute", Emotion::Cute},             {"sad", Emotion::Sad},
+                {"dizzy", Emotion::Dizzy},           {"doubtful", Emotion::Doubt},
+                {"happy", Emotion::Happy},           {"eyes_closed", Emotion::EyesClosed},
+                {"sleepy", Emotion::Sleepy},         {"angry", Emotion::Angry},
+            };
+
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            while (true) {
+                for (const auto& frame : frames) {
+                    display->LvglLock();
+                    auto& stackchan = GetStackChan();
+                    if (stackchan.hasAvatar()) {
+                        stackchan.avatar().setEmotion(frame.emotion);
+                    }
+                    display->LvglUnlock();
+                    ESP_LOGI(TAG, "Emotion preview: %s", frame.name);
+                    vTaskDelay(pdMS_TO_TICKS(2500));
+                }
+            }
+        },
+        "emotion_preview", 3072, this, 1, nullptr);
+    if (preview_task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start emotion preview task");
+    }
+#endif
 
     ESP_LOGI(TAG, "Avatar created and started");
 }
