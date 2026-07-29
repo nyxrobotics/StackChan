@@ -1764,26 +1764,74 @@ index 1e5d687..1d25efc 100644
      std::unique_ptr<Http> SetupHttp();
  };
 diff --git a/main/protocols/mqtt_protocol.cc b/main/protocols/mqtt_protocol.cc
-index 94d9d12..140535c 100644
+index 94d9d12..3512bee 100644
 --- a/main/protocols/mqtt_protocol.cc
 +++ b/main/protocols/mqtt_protocol.cc
-@@ -31,6 +31,7 @@ MqttProtocol::MqttProtocol() {
+@@ -31,6 +31,14 @@ MqttProtocol::MqttProtocol() {
          .arg = this,
      };
      esp_timer_create(&reconnect_timer_args, &reconnect_timer_);
 +
++    esp_timer_create_args_t udp_keepalive_timer_args = {
++        .callback = [](void* arg) {
++            static_cast<MqttProtocol*>(arg)->SendUdpKeepalive();
++        },
++        .arg = this,
++    };
++    esp_timer_create(&udp_keepalive_timer_args, &udp_keepalive_timer_);
  }
  
  MqttProtocol::~MqttProtocol() {
-@@ -43,7 +44,6 @@ MqttProtocol::~MqttProtocol() {
+@@ -43,7 +51,11 @@ MqttProtocol::~MqttProtocol() {
          esp_timer_stop(reconnect_timer_);
          esp_timer_delete(reconnect_timer_);
      }
 -
++    if (udp_keepalive_timer_ != nullptr) {
++        esp_timer_stop(udp_keepalive_timer_);
++        esp_timer_delete(udp_keepalive_timer_);
++        udp_keepalive_timer_ = nullptr;
++    }
      udp_.reset();
      mqtt_.reset();
      
-@@ -256,13 +256,6 @@ bool MqttProtocol::OpenAudioChannel() {
+@@ -189,7 +201,35 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+     return udp_->Send(encrypted) > 0;
+ }
+ 
++void MqttProtocol::SendUdpKeepalive() {
++    std::lock_guard<std::mutex> lock(channel_mutex_);
++    if (udp_ == nullptr || aes_nonce_.size() < 16) {
++        return;
++    }
++
++    // A valid zero-payload frame refreshes the NAT mapping and lets the MQTT
++    // gateway learn a changed source port without injecting audio into ASR.
++    std::string keepalive(aes_nonce_);
++    const uint16_t payload_size = 0;
++    const uint32_t timestamp = 0;
++    const uint32_t sequence = ++local_sequence_;
++    const uint16_t network_payload_size = htons(payload_size);
++    const uint32_t network_timestamp = htonl(timestamp);
++    const uint32_t network_sequence = htonl(sequence);
++    memcpy(keepalive.data() + 2, &network_payload_size, sizeof(network_payload_size));
++    memcpy(keepalive.data() + 8, &network_timestamp, sizeof(network_timestamp));
++    memcpy(keepalive.data() + 12, &network_sequence, sizeof(network_sequence));
++
++    if (udp_->Send(keepalive) > 0) {
++        ESP_LOGD(TAG, "UDP audio keepalive sent (sequence=%lu)",
++                 static_cast<unsigned long>(sequence));
++    }
++}
++
+ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
++    if (udp_keepalive_timer_ != nullptr) {
++        esp_timer_stop(udp_keepalive_timer_);
++    }
+     {
+         std::lock_guard<std::mutex> lock(channel_mutex_);
+         udp_.reset();
+@@ -256,13 +296,6 @@ bool MqttProtocol::OpenAudioChannel() {
          }
          uint32_t timestamp = ntohl(*(uint32_t*)&data[8]);
          uint32_t sequence = ntohl(*(uint32_t*)&data[12]);
@@ -1797,7 +1845,7 @@ index 94d9d12..140535c 100644
  
          size_t decrypted_size = data.size() - aes_nonce_.size();
          size_t nc_off = 0;
-@@ -273,6 +266,9 @@ bool MqttProtocol::OpenAudioChannel() {
+@@ -273,6 +306,9 @@ bool MqttProtocol::OpenAudioChannel() {
          packet->sample_rate = server_sample_rate_;
          packet->frame_duration = server_frame_duration_;
          packet->timestamp = timestamp;
@@ -1807,7 +1855,7 @@ index 94d9d12..140535c 100644
          packet->payload.resize(decrypted_size);
          int ret = mbedtls_aes_crypt_ctr(&aes_ctx_, decrypted_size, &nc_off, nonce, stream_block, encrypted, (uint8_t*)packet->payload.data());
          if (ret != 0) {
-@@ -282,7 +278,6 @@ bool MqttProtocol::OpenAudioChannel() {
+@@ -282,11 +318,19 @@ bool MqttProtocol::OpenAudioChannel() {
          if (on_incoming_audio_ != nullptr) {
              on_incoming_audio_(std::move(packet));
          }
@@ -1815,7 +1863,21 @@ index 94d9d12..140535c 100644
          last_incoming_time_ = std::chrono::steady_clock::now();
      });
  
-@@ -361,7 +356,6 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
+-    udp_->Connect(udp_server_, udp_port_);
++    if (!udp_->Connect(udp_server_, udp_port_)) {
++        ESP_LOGE(TAG, "Failed to connect UDP audio channel");
++        udp_.reset();
++        return false;
++    }
++    if (udp_keepalive_timer_ != nullptr) {
++        esp_timer_stop(udp_keepalive_timer_);
++        esp_timer_start_periodic(udp_keepalive_timer_,
++            MQTT_UDP_KEEPALIVE_INTERVAL_SECONDS * 1000000ULL);
++    }
+ 
+     if (on_audio_channel_opened_ != nullptr) {
+         on_audio_channel_opened_();
+@@ -361,7 +405,6 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
      mbedtls_aes_init(&aes_ctx_);
      mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)DecodeHexString(key).c_str(), 128);
      local_sequence_ = 0;
@@ -1824,17 +1886,30 @@ index 94d9d12..140535c 100644
  }
  
 diff --git a/main/protocols/mqtt_protocol.h b/main/protocols/mqtt_protocol.h
-index 90963db..e7a00b9 100644
+index 90963db..4a94d5c 100644
 --- a/main/protocols/mqtt_protocol.h
 +++ b/main/protocols/mqtt_protocol.h
-@@ -50,7 +50,6 @@ private:
+@@ -20,6 +20,7 @@
+ 
+ #define MQTT_PING_INTERVAL_SECONDS 90
+ #define MQTT_RECONNECT_INTERVAL_MS 60000
++#define MQTT_UDP_KEEPALIVE_INTERVAL_SECONDS 10
+ 
+ #define MQTT_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
+ 
+@@ -50,10 +51,11 @@ private:
      std::string udp_server_;
      int udp_port_;
      uint32_t local_sequence_;
 -    uint32_t remote_sequence_;
      esp_timer_handle_t reconnect_timer_;
++    esp_timer_handle_t udp_keepalive_timer_ = nullptr;
  
      bool StartMqttClient(bool report_error=false);
++    void SendUdpKeepalive();
+     void ParseServerHello(const cJSON* root);
+     std::string DecodeHexString(const std::string& hex_string);
+ 
 diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
 index 28ef604..cf548cc 100644
 --- a/main/protocols/protocol.h
