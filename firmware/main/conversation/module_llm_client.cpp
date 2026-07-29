@@ -64,6 +64,16 @@ static constexpr const char* kVadPcmBridgePauseFile =
     "/run/stackchan-vad-pcm-bridge.paused";
 static constexpr const char* kLocalConversationMarker =
     "/run/stackchan-local-turn.active";
+static constexpr const char* kLocalRuntimeCommand =
+    "/opt/stackchan/stackchan_local_runtime.sh";
+static constexpr const char* kLocalRuntimeRunningMarker =
+    "STACKCHAN_LOCAL_RUNTIME_RUNNING";
+static constexpr const char* kLocalRuntimeStartedMarker =
+    "STACKCHAN_LOCAL_RUNTIME_STARTED";
+static constexpr const char* kLocalRuntimeStoppedMarker =
+    "STACKCHAN_LOCAL_RUNTIME_STOPPED";
+static constexpr int kLocalRuntimeCommandTimeoutMs = 45000;
+static constexpr int kStackFlowServiceRegistrationDelayMs = 1000;
 static constexpr const char* kVadPcmWhisperInput = "whisper.vad.pcm.base64";
 static constexpr double kVadSpeechThreshold = 0.10;
 static constexpr double kVadMinSilenceSeconds = 1.0;
@@ -288,6 +298,65 @@ bool ModuleLLMClient::sysBashExec(const std::string& reqId,
 
     ESP_LOGW(TAG, "sys.bashexec timeout: %s", command.c_str());
     return false;
+}
+
+bool ModuleLLMClient::setLocalRuntimeRunning(bool running)
+{
+    if (uartFd_ < 0) {
+        ESP_LOGE(TAG, "cannot %s local runtime without a Module LLM connection",
+                 running ? "start" : "stop");
+        return false;
+    }
+
+    const char* action = running ? "start" : "stop";
+    const char* expected = running
+        ? kLocalRuntimeRunningMarker
+        : kLocalRuntimeStoppedMarker;
+    const std::string command = std::string(kLocalRuntimeCommand) + " " + action;
+
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        std::string output;
+        const bool ok = sysBashExec(
+            runtimeRequestId(running ? "runtime_start_" : "runtime_stop_"),
+            command,
+            kLocalRuntimeCommandTimeoutMs,
+            &output);
+        if (ok && output.find(expected) != std::string::npos) {
+            if (running) {
+                localRuntimeColdStarted_ =
+                    output.find(kLocalRuntimeStartedMarker) != std::string::npos;
+            } else {
+                localRuntimeColdStarted_ = false;
+            }
+            ESP_LOGI(TAG, "Module LLM local runtime %s confirmed", action);
+            return true;
+        }
+
+        ESP_LOGW(TAG, "Module LLM local runtime %s attempt %d failed: %s",
+                 action, attempt, output.c_str());
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    return false;
+}
+
+bool ModuleLLMClient::startLocalRuntime()
+{
+    return setLocalRuntimeRunning(true);
+}
+
+bool ModuleLLMClient::stopLocalRuntime()
+{
+    const bool stopped = setLocalRuntimeRunning(false);
+    if (!stopped) return false;
+
+    audioWorkId_.clear();
+    vadWorkId_.clear();
+    whisperWorkId_.clear();
+    llmWorkId_.clear();
+    melottsWorkId_.clear();
+    openJTalkTtsReady_ = false;
+    state_ = ModuleLLMState::Connected;
+    return true;
 }
 
 bool ModuleLLMClient::setVadPcmBridgePaused(bool paused, bool localTurn)
@@ -633,6 +702,16 @@ bool ModuleLLMClient::connect()
 bool ModuleLLMClient::loadModelsAndPipeline()
 {
     state_ = ModuleLLMState::ModelLoading;
+    ESP_LOGI(TAG, "Starting Module LLM inference services...");
+    if (!startLocalRuntime()) {
+        ESP_LOGE(TAG, "Module LLM inference services did not start");
+        state_ = ModuleLLMState::Error;
+        return false;
+    }
+
+    // systemd considers a service active as soon as its process is running;
+    // allow the StackFlow units a short interval to register with llm-sys.
+    vTaskDelay(pdMS_TO_TICKS(kStackFlowServiceRegistrationDelayMs));
     ESP_LOGI(TAG, "Setting up StackFlow units...");
 
     const bool bridgePaused = setVadPcmBridgePaused(true);
@@ -781,8 +860,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         return true;
     };
 
-    // 2. Audio setup
-    {
+    auto setupAudio = [this]() {
         ESP_LOGI(TAG, "audio.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddNumberToObject(data, "capcard",   0);
@@ -791,10 +869,10 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         cJSON_AddNumberToObject(data, "playcard",  0);
         cJSON_AddNumberToObject(data, "playdevice", 1);
         cJSON_AddNumberToObject(data, "playVolume", 0.05);
-        std::string wid = sfCommand("3", "audio", "setup", data, 30000);
+        std::string wid = sfCommand(
+            runtimeRequestId("audio_setup_"), "audio", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "audio.setup failed");
-            state_ = ModuleLLMState::Error;
             return false;
         }
         audioWorkId_ = wid;
@@ -804,13 +882,18 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         // preamp remains near 0 dB after audio.setup. Set the codec RX path to
         // the level validated against the onboard MSM421A microphone.
         if (!applyModuleMicrophoneGain("capture_gain_setup")) {
-            state_ = ModuleLLMState::Error;
             return false;
         }
+        return true;
+    };
+
+    // 2. Audio setup
+    if (!setupAudio()) {
+        state_ = ModuleLLMState::Error;
+        return false;
     }
 
-    // 3. VAD setup (Silero VAD — vadEnabled_ が true の場合のみ)
-    if (vadEnabled_) {
+    auto setupVad = [this]() {
         ESP_LOGI(TAG, "vad.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "silero-vad");
@@ -833,14 +916,36 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         ESP_LOGI(TAG, "vad.setup data: %.300s", vadSetupPreview ? vadSetupPreview : "(null)");
         if (vadSetupPreview) free(vadSetupPreview);
 
-        std::string wid = sfCommand("4", "vad", "setup", data, 30000);
+        std::string wid = sfCommand(
+            runtimeRequestId("vad_setup_"), "vad", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "vad.setup failed");
-            state_ = ModuleLLMState::Error;
             return false;
         }
         vadWorkId_ = wid;
         ESP_LOGI(TAG, "VAD setup: work_id=%s", wid.c_str());
+        return true;
+    };
+
+    // 3. VAD setup (Silero VAD — vadEnabled_ が true の場合のみ)
+    if (vadEnabled_) {
+        if (!setupVad()) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
+
+        if (localRuntimeColdStarted_) {
+            // llm-audio/vad 1.9 acknowledge their first works immediately
+            // after service startup, but that pair does not publish sys.pcm on
+            // the tested module. Recreate only this capture path before loading
+            // Whisper and the larger models.
+            ESP_LOGI(TAG, "Recreating audio/VAD path after cold service start");
+            if (!releaseTasks("vad") || !setupAudio() || !setupVad()) {
+                state_ = ModuleLLMState::Error;
+                return false;
+            }
+            localRuntimeColdStarted_ = false;
+        }
 
         // Audio capture is demand-driven: sys.pcm starts only after a consumer
         // such as VAD subscribes. Verify the real frame flow at that point.
@@ -853,8 +958,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         ESP_LOGI(TAG, "VAD disabled — skipping vad.setup");
     }
 
-    // 4. Whisper ASR setup
-    {
+    auto setupWhisper = [this]() {
         ESP_LOGI(TAG, "whisper.setup starting");
         cJSON* data = cJSON_CreateObject();
         cJSON_AddStringToObject(data, "model",           "whisper-tiny");
@@ -876,10 +980,10 @@ bool ModuleLLMClient::loadModelsAndPipeline()
                 data, "whisper_chunk_size", kWhisperRawChunkSeconds);
         }
 
-        std::string wid = sfCommand("5", "whisper", "setup", data, 30000);
+        std::string wid = sfCommand(
+            runtimeRequestId("whisper_setup_"), "whisper", "setup", data, 30000);
         if (wid.empty()) {
             ESP_LOGE(TAG, "whisper.setup failed");
-            state_ = ModuleLLMState::Error;
             return false;
         }
         whisperWorkId_ = wid;
@@ -889,6 +993,24 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         } else {
             ESP_LOGI(TAG, "Whisper setup: work_id=%s input=%s",
                      wid.c_str(), kVadPcmWhisperInput);
+        }
+        return true;
+    };
+
+    // 4. Whisper ASR setup
+    {
+        if (!setupWhisper()) {
+            state_ = ModuleLLMState::Error;
+            return false;
+        }
+
+        if (!vadEnabled_ && localRuntimeColdStarted_) {
+            ESP_LOGI(TAG, "Recreating audio/Whisper path after cold service start");
+            if (!releaseTasks("whisper") || !setupAudio() || !setupWhisper()) {
+                state_ = ModuleLLMState::Error;
+                return false;
+            }
+            localRuntimeColdStarted_ = false;
         }
 
         if (!vadEnabled_ && !waitForPcmFrame()) {
@@ -913,7 +1035,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         }
     }
 
-    // 4. LLM setup
+    // 5. LLM setup
     {
         ESP_LOGI(TAG, "llm.setup starting");
         cJSON* data = cJSON_CreateObject();
@@ -962,7 +1084,7 @@ bool ModuleLLMClient::loadModelsAndPipeline()
         ESP_LOGI(TAG, "Using OpenJTalk/tohoku voice for Japanese TTS");
     }
 
-    // 5. MeloTTS setup (fallback and non-Japanese languages)
+    // 6. MeloTTS setup (fallback and non-Japanese languages)
     if (!openJTalkTtsReady_) {
         // ttsLang_: 0=ja-jp  1=zh-cn  2=en-us  3=en-default
         const char* ttsModel =

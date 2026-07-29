@@ -66,9 +66,14 @@ public:
     void disconnect();
 
     // Load Whisper + Qwen3 + MeloTTS and verify pipeline.
-    // Blocking — call once at startup to avoid first-turn latency (Section 9.3).
+    // Blocking; call when the local backend is requested.
     // Returns true if all models are loaded and pipeline is confirmed.
     bool loadModelsAndPipeline();
+
+    // Start/stop the Module-side inference services through the llm-sys
+    // control plane. llm-sys itself remains available for later commands.
+    bool startLocalRuntime();
+    bool stopLocalRuntime();
 
     // Apply AgentConfig settings (language, TTS params, system prompt)
     void applyConfig(const CachedAgentConfig& cfg);
@@ -160,6 +165,7 @@ private:
     uint8_t ttsLang_      = 0;   // 0=ja 1=zh 2=en、NVS から復元
     int8_t openJTalkGainDb_ = -36;
     uint8_t pipelineHealthProbeIndex_ = 0;
+    bool localRuntimeColdStarted_ = false;
 
     // Send a StackFlow command and return response work_id (empty on error)
     std::string sfCommand(const std::string& reqId,
@@ -174,6 +180,7 @@ private:
                      const std::string& command,
                      int timeoutMs = 0,
                      std::string* output = nullptr);
+    bool setLocalRuntimeRunning(bool running);
     bool setVadPcmBridgePaused(bool paused, bool localTurn = false);
     bool applyModuleMicrophoneGain(const std::string& requestId);
     bool checkOpenJTalkTts();
