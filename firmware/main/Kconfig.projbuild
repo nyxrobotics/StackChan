@@ -11,6 +11,19 @@ config STACKCHAN_SERVER_URL
 
 endmenu
 
+menu "StackChan Audio"
+
+config STACKCHAN_ONLINE_AUDIO_JITTER_BUFFER
+    bool "Enable online audio jitter buffer"
+    default y
+    help
+        Buffer and reorder online Opus audio before playback to reduce dropouts
+        caused by UDP jitter and packet reordering. On a 24 kHz stream, the
+        default ten-frame buffer uses up to about 29 KB, primarily in PSRAM;
+        disabling it reduces playback buffering to two frames.
+
+endmenu
+
 menu "StackChan Development"
 
 config STACKCHAN_TEST_AUTO_START_AI_AGENT
