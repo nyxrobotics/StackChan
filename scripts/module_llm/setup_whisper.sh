@@ -31,4 +31,4 @@ done
 require_root
 require_stackflow_repo
 install_package_group "Whisper ASR" "${PACKAGES_WHISPER[@]}"
-ensure_services_active "${SERVICES_WHISPER[@]}"
+ensure_services_on_demand "${SERVICES_WHISPER[@]}"

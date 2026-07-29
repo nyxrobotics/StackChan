@@ -70,7 +70,7 @@ maybe_reboot() {
             reboot
             ;;
         no)
-            ok "Reboot skipped. Installed services are already active."
+            ok "Reboot skipped. Control services are active; inference services wait for CoreS3."
             ;;
     esac
 }
@@ -106,6 +106,7 @@ main() {
     "${SCRIPT_DIR}/setup_melotts.sh" "${model_args[@]}"
     "${SCRIPT_DIR}/setup_openjtalk.sh"
     "${SCRIPT_DIR}/setup_llm_sys_watchdog.sh"
+    "${LOCAL_RUNTIME_TARGET}" stop
     "${SCRIPT_DIR}/verify_setup.sh" "${model_args[@]}"
     maybe_reboot
 }

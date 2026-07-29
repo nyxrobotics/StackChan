@@ -108,6 +108,7 @@ required_executables=(
     "$PCM_READY_HELPER_TARGET"
     "$VAD_PCM_BRIDGE_TARGET"
     "$LLM_SYS_WATCHDOG_TARGET"
+    "$LOCAL_RUNTIME_TARGET"
 )
 
 for executable in "${required_executables[@]}"; do
@@ -123,6 +124,7 @@ installed_files=(
     "$LLM_SYS_WATCHDOG_SOURCE|$LLM_SYS_WATCHDOG_TARGET"
     "$LLM_SYS_WATCHDOG_SERVICE_SOURCE|$LLM_SYS_WATCHDOG_SERVICE_TARGET"
     "$LLM_SYS_WATCHDOG_DROPIN_SOURCE|$LLM_SYS_WATCHDOG_DROPIN_TARGET"
+    "$LOCAL_RUNTIME_SOURCE|$LOCAL_RUNTIME_TARGET"
 )
 
 for file_pair in "${installed_files[@]}"; do
@@ -149,6 +151,8 @@ printf '%s\n' "$openjtalk_status"
     || die "VAD PCM bridge check failed."
 "$LLM_SYS_WATCHDOG_TARGET" --check \
     || die "llm-sys watchdog check failed."
+"$LOCAL_RUNTIME_TARGET" --check \
+    || die "Local runtime helper check failed."
 
 verify_qwen3_tokenizer_compat
 verify_silero_vad_mode_config
@@ -156,16 +160,12 @@ verify_silero_vad_mode_config
 command -v systemctl >/dev/null 2>&1 \
     || die "systemd is required to verify Module LLM services."
 
-services=(
+control_services=(
     "${SERVICES_RUNTIME[@]}"
-    "${SERVICES_WHISPER[@]}"
-    "${SERVICES_QWEN3[@]}"
-    "${SERVICES_VAD[@]}"
-    "${SERVICES_MELOTTS[@]}"
     "${SERVICES_LLM_SYS_WATCHDOG[@]}"
 )
 failed_services=()
-for service in "${services[@]}"; do
+for service in "${control_services[@]}"; do
     if systemctl is-enabled --quiet "$service" &&
         systemctl is-active --quiet "$service"; then
         ok "$service enabled and active"
@@ -175,11 +175,26 @@ for service in "${services[@]}"; do
     fi
 done
 
+for service in "${SERVICES_LOCAL_ON_DEMAND[@]}"; do
+    if ! systemctl cat "$service" >/dev/null 2>&1; then
+        error "$service is not installed"
+        failed_services+=("$service")
+    elif systemctl is-enabled --quiet "$service"; then
+        error "$service must be disabled at boot"
+        failed_services+=("$service")
+    else
+        ok "$service disabled at boot (S3-controlled)"
+    fi
+done
+
 if [ "${#failed_services[@]}" -gt 0 ]; then
     echo ""
     error "Service verification failed:"
     printf '  - %s\n' "${failed_services[@]}"
     exit 1
 fi
+
+"$LOCAL_RUNTIME_TARGET" status \
+    || die "Local runtime services are in a partial state."
 
 ok "Module LLM environment verification completed"

@@ -29,6 +29,8 @@ LLM_SYS_WATCHDOG_SERVICE_SOURCE="${STACKCHAN_LLM_SYS_WATCHDOG_SERVICE:-${SCRIPT_
 LLM_SYS_WATCHDOG_SERVICE_TARGET="/etc/systemd/system/stackchan-llm-sys-watchdog.service"
 LLM_SYS_WATCHDOG_DROPIN_SOURCE="${STACKCHAN_LLM_SYS_WATCHDOG_DROPIN:-${SCRIPT_DIR}/llm-sys-stackchan-watchdog.conf}"
 LLM_SYS_WATCHDOG_DROPIN_TARGET="/etc/systemd/system/llm-sys.service.d/stackchan-watchdog.conf"
+LOCAL_RUNTIME_SOURCE="${STACKCHAN_LOCAL_RUNTIME:-${SCRIPT_DIR}/stackchan_local_runtime.sh}"
+LOCAL_RUNTIME_TARGET="/opt/stackchan/stackchan_local_runtime.sh"
 QWEN3_MODEL_ID="qwen3-0.6B-ax630c"
 QWEN3_TOKENIZER_SCRIPT="/opt/m5stack/scripts/tokenizer_${QWEN3_MODEL_ID}.py"
 QWEN3_TOKENIZER_COMPAT="/opt/m5stack/scripts/${QWEN3_MODEL_ID}_tokenizer.py"
@@ -81,6 +83,9 @@ PACKAGES_EN_TTS=(
 
 SERVICES_RUNTIME=(
     llm-sys.service
+)
+
+SERVICES_AUDIO=(
     llm-audio.service
 )
 
@@ -103,6 +108,14 @@ SERVICES_VAD=(
 
 SERVICES_LLM_SYS_WATCHDOG=(
     stackchan-llm-sys-watchdog.service
+)
+
+SERVICES_LOCAL_ON_DEMAND=(
+    "${SERVICES_AUDIO[@]}"
+    "${SERVICES_WHISPER[@]}"
+    "${SERVICES_QWEN3[@]}"
+    "${SERVICES_VAD[@]}"
+    "${SERVICES_MELOTTS[@]}"
 )
 
 RED='\033[0;31m'
@@ -374,6 +387,41 @@ ensure_services_active() {
     if [ "${#failed[@]}" -gt 0 ]; then
         return 1
     fi
+}
+
+ensure_services_on_demand() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl is not available; skipping on-demand service configuration."
+        return 0
+    fi
+
+    local services=("$@")
+    if [ "${#services[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    info "Disabling automatic startup for on-demand services: ${services[*]}"
+    if ! systemctl daemon-reload; then
+        error "systemd daemon reload failed"
+        return 1
+    fi
+    systemctl disable --now "${services[@]}"
+
+    local service
+    local failed=()
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            error "$service is still active"
+            failed+=("$service")
+        elif systemctl is-enabled --quiet "$service"; then
+            error "$service is still enabled at boot"
+            failed+=("$service")
+        else
+            ok "$service configured for on-demand startup"
+        fi
+    done
+
+    [ "${#failed[@]}" -eq 0 ]
 }
 
 ensure_qwen3_tokenizer_compat() (

@@ -461,6 +461,7 @@ push_module_scripts() {
         stackchan_llm_sys_watchdog.py
         stackchan-llm-sys-watchdog.service
         llm-sys-stackchan-watchdog.conf
+        stackchan_local_runtime.sh
     )
     local required_file
     for required_file in "${required_files[@]}"; do
@@ -525,7 +526,7 @@ maybe_reboot() {
             fi
             ;;
         no)
-            ok "Reboot skipped. Installed services are already active."
+            ok "Reboot skipped. Control services are active; inference services wait for CoreS3."
             ;;
     esac
 }
@@ -552,7 +553,7 @@ main() {
     echo " Setup complete"
     echo "======================================================"
     echo ""
-    echo "The ${TARGET} target is active now."
+    echo "The ${TARGET} target completed successfully."
     echo "Next steps for a full setup:"
     echo "  1. Disconnect the Module LLM USB cable and attach the module to the CoreS3."
     echo "  2. Flash the StackChan firmware."
