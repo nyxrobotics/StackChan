@@ -74,5 +74,56 @@ class LocalConversationActivityTest(unittest.TestCase):
             )
 
 
+class LocalRuntimeRecoveryTest(unittest.TestCase):
+    def test_keeps_inference_stopped_without_s3_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "local-runtime.active"
+            helper = Path(directory) / "missing-helper"
+            self.assertTrue(
+                WATCHDOG.restore_local_runtime_if_requested(
+                    str(marker), str(helper)
+                )
+            )
+
+    def test_restores_inference_when_s3_request_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "local-runtime.active"
+            marker.write_text("running\n", encoding="ascii")
+            result = Path(directory) / "runtime-command"
+            helper = Path(directory) / "runtime-helper.sh"
+            helper.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$STACKCHAN_TEST_RESULT\"\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o755)
+
+            previous = WATCHDOG.os.environ.get("STACKCHAN_TEST_RESULT")
+            WATCHDOG.os.environ["STACKCHAN_TEST_RESULT"] = str(result)
+            try:
+                self.assertTrue(
+                    WATCHDOG.restore_local_runtime_if_requested(
+                        str(marker), str(helper)
+                    )
+                )
+            finally:
+                if previous is None:
+                    WATCHDOG.os.environ.pop("STACKCHAN_TEST_RESULT", None)
+                else:
+                    WATCHDOG.os.environ["STACKCHAN_TEST_RESULT"] = previous
+
+            self.assertEqual(result.read_text(encoding="ascii"), "start\n")
+
+    def test_reports_missing_helper_for_active_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "local-runtime.active"
+            marker.write_text("running\n", encoding="ascii")
+            helper = Path(directory) / "missing-helper"
+            self.assertFalse(
+                WATCHDOG.restore_local_runtime_if_requested(
+                    str(marker), str(helper)
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

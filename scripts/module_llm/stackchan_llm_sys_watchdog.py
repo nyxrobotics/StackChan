@@ -29,6 +29,8 @@ OPENJTALK_PROCESS_MARKERS = (
     b"/tmp/stackchan-openjtalk/",
 )
 LOCAL_CONVERSATION_MARKER = "/run/stackchan-local-turn.active"
+LOCAL_RUNTIME_MARKER = "/run/stackchan-local-runtime.active"
+LOCAL_RUNTIME_HELPER = "/opt/stackchan/stackchan_local_runtime.sh"
 
 
 @dataclass(frozen=True)
@@ -143,18 +145,42 @@ def run_systemctl(*arguments: str, timeout: float = 20.0) -> bool:
     return True
 
 
-def unit_exists(unit: str) -> bool:
+def restore_local_runtime_if_requested(
+    activity_marker: str = LOCAL_RUNTIME_MARKER,
+    runtime_helper: str = LOCAL_RUNTIME_HELPER,
+) -> bool:
+    """Restore the inference services only when CoreS3 requested them."""
+    if not os.path.exists(activity_marker):
+        logging.info("local inference remains stopped after llm-sys recovery")
+        return True
+
+    if not os.access(runtime_helper, os.X_OK):
+        logging.error("local runtime helper is unavailable: %s", runtime_helper)
+        return False
+
     try:
         result = subprocess.run(
-            ["systemctl", "cat", unit],
+            [runtime_helper, "start"],
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logging.error("local runtime restore failed: %s", error)
         return False
-    return result.returncode == 0
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        logging.error(
+            "local runtime restore failed: %s",
+            detail or f"exit {result.returncode}",
+        )
+        return False
+
+    logging.info("local inference restored after llm-sys recovery")
+    return True
 
 
 class LlmSysWatchdog:
@@ -192,9 +218,9 @@ class LlmSysWatchdog:
             logging.error("llm-sys did not recover")
             return False
 
-        bridge = "stackchan-vad-pcm-bridge.service"
-        if unit_exists(bridge) and not run_systemctl("restart", bridge, timeout=20):
-            logging.warning("llm-sys recovered, but the VAD PCM bridge restart failed")
+        if not restore_local_runtime_if_requested():
+            logging.warning("llm-sys recovered, but local inference did not")
+            return False
 
         logging.info("llm-sys recovery completed")
         return True
