@@ -445,6 +445,7 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
     if (GetHAL().getWarmRebootTarget() >= 0) {
         auto app_index = GetHAL().getWarmRebootTarget();
         mclog::tagInfo(_tag, "warm boot was requested, app index: {}", app_index);
+        lv_indev_wait_release(GetHAL().lvTouchpad);
         app_index = uitk::clamp(app_index, 0, static_cast<int>(appPorps.size()) - 1);
 
         // Restore to center set
