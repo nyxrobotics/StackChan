@@ -3,7 +3,8 @@
 > **Current setup procedure:** Module LLMの環境構築・検証・復旧は、リポジトリ
 > ルートの[LLM_Module_Setup.md](../../LLM_Module_Setup.md)を参照してください。
 > この文書のパッケージコマンドは初期設計時の参考情報であり、現在必要なVAD
-> PCM bridge、Open JTalk helper、watchdogまでは構築しません。
+> PCM bridge、Open JTalk helper、watchdog、S3制御の推論サービス開始・停止
+> までは構築しません。
 
 > **対象ハードウェア:** M5Stack CoreS3 + Module LLM  
 > **対象ファームウェア:** [StackChan](https://github.com/m5stack/StackChan) (official)  

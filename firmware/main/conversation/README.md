@@ -7,6 +7,11 @@
 オンライン（Xiaozhi）とローカル（Module LLM）を自動切替するハイブリッド会話バックエンドです。  
 ネットワーク断時は自動でローカル推論（VAD → Whisper → Qwen3 → Open JTalk）にフォールバックします。
 
+Module LLMの推論サービスはCoreS3がUART経由で開始・停止します。`Auto`の既定は
+省電力動作で、オンライン利用中は停止、フォールバック時だけ起動、オンライン
+復帰後は再び停止します。SETUPの`Module LLM Settings > Auto: fast fallback`を
+ONにした場合だけ、切替時間を優先してローカルpipelineを予熱します。
+
 ```
 Xiaozhi Online  →  Module LLM Local  →  Static Fallback
    (優先)              (オフライン)           (最終手段)
@@ -89,7 +94,7 @@ watchdogを含むStackChan環境を再構築できません。
 ./scripts/provision_module_llm.sh
 ```
 
-このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、補助スクリプト、`llm-sys` 自動復旧サービスの配置まで行います。
+このスクリプトは `scripts/module_llm/` 以下のセットアップスクリプトをADBでModule LLMへ転送し、Module LLM上で `setup_llm_module.sh` を実行します。apt ソース登録、StackFlow機能モジュール、モデル、Open JTalk、tohoku-f01 neutral voice、補助スクリプト、`llm-sys` 自動復旧サービス、S3用runtime制御helperの配置まで行います。セットアップ完了時は制御サービスだけを起動し、推論サービスは起動時無効にします。
 
 個別に実行したい場合も、PC側から同じ入口を使います。
 
@@ -281,7 +286,7 @@ dpkg -s lib-llm llm-sys llm-audio \
 
 ### 2-11. 必要な場合だけModule LLMを電源再投入
 
-セットアップスクリプトは必要なサービスをその場で有効化・起動するため、通常は再起動不要です。Module LLM全体を再起動したい場合は、本体の電源スイッチをOFF/ONしてください。ハードウェアリビジョンによってはLinuxの `reboot` や `adb reboot` で電源断したまま戻らないため、自動セットアップでは再起動を必須にしていません。
+セットアップスクリプトは`llm-sys`とwatchdogを有効化し、推論サービスを起動時無効にするため、通常は再起動不要です。Module LLM全体を再起動したい場合は、本体の電源スイッチをOFF/ONしてください。ハードウェアリビジョンによってはLinuxの `reboot` や `adb reboot` で電源断したまま戻らないため、自動セットアップでは再起動を必須にしていません。
 
 > ここまで完了したら、以下のファームウェアセットアップ手順に進んでください。
 

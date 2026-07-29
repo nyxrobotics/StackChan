@@ -38,3 +38,7 @@ Qwen3 response generation, and Open JTalk speech output. Initial package and
 model provisioning is automated over ADB; conversation works offline after
 setup. See [LLM_Module_Setup.md](LLM_Module_Setup.md) for the complete hardware,
 provisioning, firmware, verification, and recovery procedure.
+
+Module inference services are controlled on demand by CoreS3. `Online Only`
+keeps them stopped, while `Auto` defaults to a power-saving policy that starts
+them only for local fallback and stops them again after online recovery.

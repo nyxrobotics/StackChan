@@ -19,6 +19,10 @@ VAD有効時、Whisperが受け取る音声はVADで確定した区間だけで�
 `sys.pcm`を直接読む経路とは併用しません。MeloTTSは日本語Open JTalkが利用
 できない場合と、追加言語を選択した場合のフォールバックです。
 
+通常起動では`llm-sys`と監視サービスだけが待機し、音声、VAD、Whisper、
+Qwen3、MeloTTS、PCM bridgeのサービスは起動しません。必要になった時点で
+CoreS3がUART経由で一括起動し、不要になれば一括停止します。
+
 ## 1. 必要なもの
 
 - M5Stack CoreS3とModule LLM
@@ -68,7 +72,7 @@ Linuxで`no permissions`になる場合は、udevルールを設定するか、A
 Module LLM上で機能別セットアップを依存順に実行します。
 
 1. StackFlow apt repository
-2. `lib-llm`, `llm-sys`, `llm-audio`
+2. `lib-llm`, `llm-sys`, `llm-audio`とS3用runtime制御helper
 3. Whisper tiny
 4. Qwen3 0.6Bとtokenizer互換リンク
 5. Silero VADとVAD PCM bridge
@@ -100,13 +104,15 @@ Module LLM上で機能別セットアップを依存順に実行します。
 - 必須パッケージとモデルがインストール済みで、apt候補版と一致すること
 - Open JTalkがtohoku-f01 neutral voiceを選択していること
 - Qwen3 tokenizer互換リンクとSilero VAD設定が有効なこと
-- PCM probe、VAD PCM bridge、watchdogが実行可能なこと
-- 必須systemdサービスがすべて`enabled`かつ`active`であること
+- PCM probe、VAD PCM bridge、watchdog、runtime制御helperが実行可能なこと
+- `llm-sys`とwatchdogが`enabled`かつ`active`であること
+- 推論系systemdサービスが起動時`disabled`で、全起動または全停止の一貫した
+  状態にあること
 
-通常はLinuxの再起動を必要としません。サービスはセットアップ中に有効化・
-起動されます。一部のModule LLMでは`reboot`や`adb reboot`を実行すると電源が
-切れたまま戻らないため、完全な電源再投入が必要な場合は本体の物理スイッチを
-OFF/ONしてください。
+セットアップ完了時は制御サービスだけが動作し、推論系は停止しています。
+通常はLinuxの再起動を必要としません。一部のModule LLMでは`reboot`や
+`adb reboot`を実行すると電源が切れたまま戻らないため、完全な電源再投入が
+必要な場合は本体の物理スイッチをOFF/ONしてください。
 
 ## 5. CoreS3ファームウェアを書き込む
 
@@ -134,6 +140,13 @@ idf.py -p /dev/ttyACM0 -b 115200 app-flash
 `Local Only (Module LLM)`を選び、`Module LLM Settings`でVADを有効にします。
 同じ画面の`Open JTalk volume`では、日本語音声の出力ゲインを`-60`から
 `0 dB`まで調整できます。既定値は静かな連続試験向けの`-36 dB`です。
+
+`Module LLM Settings`の`Auto: fast fallback`は既定でOFFです。OFFの
+`Power Save`動作では、Autoモード中もオンライン利用中は推論系を停止し、
+オンライン障害時だけ起動します。オンライン復帰後はオンラインbackendへ
+戻して推論系を停止します。ONにすると、オンライン接続後にローカルpipelineも
+予熱して、消費電力より切替時間を優先します。`Online Only`では常に推論系を
+停止し、`Local Only`ではAI Agent開始時に起動します。
 
 ## 6. オフライン動作を確認する
 
@@ -193,11 +206,14 @@ adb shell systemctl status stackchan-llm-sys-watchdog.service
 adb shell journalctl -u stackchan-vad-pcm-bridge.service -n 100 --no-pager
 adb shell journalctl -u stackchan-llm-sys-watchdog.service -n 100 --no-pager
 adb shell /opt/stackchan/stackchan_llm_sys_watchdog.py --check
+adb shell /opt/stackchan/stackchan_local_runtime.sh status
 ```
 
 CoreS3はUARTの応答停止を検出するとStaticFallbackへ退避し、5秒後からModule
 LLMへの再接続を試します。Module側watchdogはローカルStackFlow pingの連続失敗
-またはUART RXだけが進む停止状態を検出し、`llm-sys`とPCM bridgeを復旧します。
+またはUART RXだけが進む停止状態を検出し、`llm-sys`を復旧します。S3が
+ローカル推論を要求中の場合だけ、`/run`上のruntime markerに従って推論系も
+復旧します。停止中の推論系をwatchdogが勝手に起動することはありません。
 Qwen推論からOpen JTalk再生までの会話処理中はUART応答が長時間止まり得るため、
 専用のlocal-turnマーカーがある間はwatchdogのUART停止判定を保留します。
 セットアップ時のVAD停止とは区別され、保留時間にも上限があるため、マーカーが
